@@ -18,11 +18,10 @@ uso_usuarios = {}
 bot = telebot.TeleBot(TOKEN_TELEGRAM)
 sdk = mercadopago.SDK(MP_ACCESS_TOKEN)
 
-# --- LISTA DE DISFARCES (USER-AGENTS) ---
+# Agentes de navegação atualizados para parecer um celular real
 AGENTES = [
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+    'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1',
+    'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36'
 ]
 
 def gerar_pix_mp(valor, descricao):
@@ -43,7 +42,13 @@ def exibir_menu_planos(user_id):
     if user_id not in uso_usuarios or uso_usuarios.get(user_id, {}).get('last_date') != hoje:
         uso_usuarios[user_id] = {'count': 0, 'last_date': hoje}
     saldo = LIMITE_GRATIS - uso_usuarios[user_id]['count']
-    texto = f"👏 **Bot de Downloads VIP**\n\n📊 Plano: {'VIP Ilimitado' if user_id in MEMBROS_VIP else 'Gratuito'}\n📅 Validade: {'Vitalícia' if user_id in MEMBROS_VIP else 'Nunca'}\n💡 Saldo: {'∞' if user_id in MEMBROS_VIP else saldo} hoje."
+    
+    status = "VIP Ilimitado" if user_id in MEMBROS_VIP else "Gratuito"
+    validade = "Vitalícia" if user_id in MEMBROS_VIP else "Nunca"
+    saldo_txt = "∞" if user_id in MEMBROS_VIP else saldo
+
+    texto = f"👏 **Bot de Downloads VIP**\n\n📊 Plano: {status}\n📅 Validade: {validade}\n💡 Saldo: {saldo_txt} hoje."
+    
     markup = types.InlineKeyboardMarkup(row_width=1)
     markup.add(
         types.InlineKeyboardButton("💳 Mensal - R$10,00", callback_data="pay_10.00"),
@@ -79,24 +84,26 @@ def handle_download(message):
             bot.reply_to(message, "🚫 **Limite diário atingido! Use /planos.**")
             return
 
-    msg_status = bot.reply_to(message, "⏳ **Analisando link com segurança...**")
+    msg_status = bot.reply_to(message, "⏳ **Processando vídeo...**")
 
-    # CONFIGURAÇÃO DE ALTA PERFORMANCE
+    # Opções reforçadas para Instagram e TikTok
     ydl_opts = {
-        'format': 'bestvideo+bestaudio/best',
+        'format': 'best',
         'outtmpl': 'video_%(id)s.%(ext)s',
         'quiet': True,
         'no_warnings': True,
         'nocheckcertificate': True,
+        'add_header': [
+            'Referer:https://www.instagram.com/',
+            'Accept:text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+        ],
         'http_headers': {'User-Agent': random.choice(AGENTES)},
-        'socket_timeout': 20,
-        'retries': 10,
-        'fragment_retries': 10,
+        'retries': 3,
     }
 
     try:
-        # Delay anti-bot aleatório (0.5 a 1.5 segundos)
-        time.sleep(random.uniform(0.5, 1.5))
+        # Pausa tática para não parecer robô
+        time.sleep(1)
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(message.text, download=True)
@@ -104,7 +111,8 @@ def handle_download(message):
             
             if user_id not in MEMBROS_VIP:
                 uso_usuarios[user_id]['count'] += 1
-                legenda = f"✅ **Baixado!**\n\n💡 Saldo atual: {uso_usuarios[user_id]['count']}/{LIMITE_GRATIS} hoje."
+                saldo_atual = uso_usuarios[user_id]['count']
+                legenda = f"✅ **Baixado!**\n\n💡 Saldo atual: {saldo_atual}/{LIMITE_GRATIS} hoje."
             else:
                 legenda = "✅ **Baixado (VIP Ilimitado)!**"
 
@@ -113,19 +121,7 @@ def handle_download(message):
             
             os.remove(filename)
             bot.delete_message(message.chat.id, msg_status.message_id)
-
-    except Exception:
-        # SEGUNDA TENTATIVA - MODO ULTRA COMPATIBILIDADE
-        try:
-            ydl_opts['format'] = 'best'
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(message.text, download=True)
-                filename = ydl.prepare_filename(info)
-                with open(filename, 'rb') as video:
-                    bot.send_video(message.chat.id, video, caption="✅ Enviado via Rota Alternativa.")
-                os.remove(filename)
-                bot.delete_message(message.chat.id, msg_status.message_id)
-        except:
-            bot.edit_message_text(f"❌ O Instagram/TikTok impôs uma trava temporária ao servidor. Tente novamente em 2 minutos ou use outro link.", message.chat.id, msg_status.message_id)
+    except:
+        bot.edit_message_text(f"❌ Erro ao baixar link do Instagram/TikTok. Tente novamente em 1 minuto.", message.chat.id, msg_status.message_id)
 
 bot.infinity_polling()
