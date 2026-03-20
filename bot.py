@@ -5,20 +5,18 @@ import mercadopago
 from datetime import datetime
 from telebot import types
 
-# --- CONFIGURAÇÕES ATUALIZADAS DO TIAGO ---
+# --- CONFIGURAÇÕES DO TIAGO (PRESERVADAS) ---
 TOKEN_TELEGRAM = "8629536333:AAEV4IcvFt5CTRqQVz5yYXmNOXvcgaZygGE"
-# NOVO TOKEN DO MERCADO PAGO ENVIADO AGORA
 MP_ACCESS_TOKEN = "APP_USR-8179041093511853-031916-7364f07318b6c464600a781433c743f7-384532659"
 
 MEMBROS_VIP = [5130704403] 
 LIMITE_GRATIS = 5
+uso_usuarios = {}
 
 bot = telebot.TeleBot(TOKEN_TELEGRAM)
 sdk = mercadopago.SDK(MP_ACCESS_TOKEN)
 
-# Controle de uso na memória (Reset diário)
-uso_usuarios = {}
-
+# --- FUNÇÃO DO MERCADO PAGO (CORRIGIDA) ---
 def gerar_pix_mp(valor, descricao):
     payment_data = {
         "transaction_amount": float(valor),
@@ -32,18 +30,14 @@ def gerar_pix_mp(valor, descricao):
         }
     }
     result = sdk.payment().create(payment_data)
-    
-    # Validação da resposta do Mercado Pago
     if "response" in result and "point_of_interaction" in result["response"]:
         return result["response"]["point_of_interaction"]["transaction_data"]["qr_code"]
-    
-    # Log de erro interno para depuração
-    print(f"DEBUG MP: {result}")
     return None
 
+# --- INTERFACE VISUAL (EXATAMENTE COMO VOCÊ CONFIGUROU) ---
 def exibir_menu_planos(user_id):
     hoje = datetime.now().strftime('%Y-%m-%d')
-    if user_id not in uso_usuarios or uso_usuarios[user_id]['last_date'] != hoye:
+    if user_id not in uso_usuarios or uso_usuarios.get(user_id, {}).get('last_date') != hoje:
         uso_usuarios[user_id] = {'count': 0, 'last_date': hoje}
     
     saldo = LIMITE_GRATIS - uso_usuarios[user_id]['count']
@@ -83,14 +77,13 @@ def handle_payment(call):
         )
         bot.send_message(call.message.chat.id, msg, parse_mode="Markdown")
     else:
-        bot.send_message(call.message.chat.id, "❌ **Erro ao gerar Pix.**\nVerifique se o novo token do Mercado Pago está ativo e com permissões de checkout.")
+        bot.send_message(call.message.chat.id, "❌ **Erro ao gerar Pix.**\nVerifique se o token do Mercado Pago está ativo.")
 
 @bot.message_handler(func=lambda message: "http" in message.text)
 def handle_download(message):
     user_id = message.from_user.id
     hoje = datetime.now().strftime('%Y-%m-%d')
     
-    # Checagem de Limite
     if user_id not in MEMBROS_VIP:
         if user_id not in uso_usuarios or uso_usuarios[user_id]['last_date'] != hoje:
             uso_usuarios[user_id] = {'count': 0, 'last_date': hoje}
@@ -114,4 +107,5 @@ def handle_download(message):
     except:
         bot.edit_message_text("❌ Erro ao baixar. O link pode ser privado ou inválido.", message.chat.id, msg_status.message_id)
 
+print("✅ Bot de Downloads VIP Online!")
 bot.infinity_polling()
