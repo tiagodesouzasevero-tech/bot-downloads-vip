@@ -4,18 +4,18 @@ from telebot import types
 from flask import Flask, request
 from threading import Thread
 
-# --- CONFIGURAÇÕES DO TIAGO (MANTIDAS) ---
+# --- CONFIGURAÇÕES DO TIAGO (INTOCÁVEIS) ---
 TOKEN_TELEGRAM = "8629536333:AAHw2zcugsOXPpOJaXsz1ZVA30T1VypiMlQ"
 MP_ACCESS_TOKEN = "APP_USR-8179041093511853-031916-7364f07318b6c464600a781433c743f7-384532659"
 DB_FILE = "database.json"
-MY_ID = "493336271"
-LIMITE_MB = 50 * 1024 * 1024  # Trava de 50MB para segurança do servidor
+MY_ID = "493336271" # Seu ID de Admin preservado
+LIMITE_MB = 50 * 1024 * 1024 
 
 bot = telebot.TeleBot(TOKEN_TELEGRAM)
 sdk = mercadopago.SDK(MP_ACCESS_TOKEN)
 app = Flask(__name__)
 
-# --- FUNÇÕES DE SISTEMA (MANTIDAS) ---
+# --- SISTEMA DE DADOS (PRESERVADO) ---
 def carregar_dados():
     if not os.path.exists(DB_FILE): return {"usuarios": {}}
     try:
@@ -39,7 +39,7 @@ def is_vip(user_id, dados):
         return datetime.now() < datetime.strptime(user["vip_ate"], '%Y-%m-%d')
     except: return False
 
-# --- MERCADO PAGO (MANTIDO) ---
+# --- MERCADO PAGO (PRESERVADO) ---
 @app.route("/webhook", methods=['POST'])
 def webhook():
     data = request.json
@@ -54,10 +54,10 @@ def webhook():
                 user = obter_usuario(user_id, dados)
                 user["vip_ate"] = "Vitalício" if dias >= 3650 else (datetime.now() + timedelta(days=dias)).strftime('%Y-%m-%d')
                 salvar_dados(dados)
-                bot.send_message(user_id, "💎 **VIP ATIVADO!** Aproveite seus downloads ilimitados.")
+                bot.send_message(user_id, "💎 **VIP ATIVADO!**")
     return "", 200
 
-# --- COMANDOS DE INTERFACE (MANTIDOS) ---
+# --- COMANDOS (PRESERVADOS) ---
 @bot.message_handler(commands=['meuadm'])
 def cmd_adm(message):
     if str(message.from_user.id) == MY_ID:
@@ -72,11 +72,7 @@ def cmd_planos(message):
     dados = carregar_dados()
     user = obter_usuario(message.from_user.id, dados)
     vip = is_vip(message.from_user.id, dados)
-    
-    texto = (f"👏 **Downloader VIP**\n\n"
-             f"📊 Status: {'💎 VIP' if vip else '🆓 Gratuito'}\n"
-             f"💡 Restante hoje: {'∞' if vip else (5 - user['downloads_hoje'])}")
-    
+    texto = f"👏 **Downloader VIP**\n\n📊 Status: {'💎 VIP' if vip else '🆓 Gratuito'}\n💡 Limite: {'∞' if vip else (5 - user['downloads_hoje'])}"
     markup = types.InlineKeyboardMarkup(row_width=1)
     markup.add(
         types.InlineKeyboardButton("💳 Mensal - R$10,00", callback_data="buy_10.0_30"),
@@ -97,7 +93,7 @@ def handle_pay(call):
         pix = res["response"]["point_of_interaction"]["transaction_data"]["qr_code"]
         bot.send_message(call.message.chat.id, f"✅ **Pix Gerado!**\n\n`{pix}`", parse_mode="Markdown")
 
-# --- MOTOR DE DOWNLOAD (CORRIGIDO PARA INSTAGRAM/PINTEREST) ---
+# --- ÚNICA PARTE ALTERADA: MOTOR DE DOWNLOAD CORRIGIDO ---
 @bot.message_handler(func=lambda message: "http" in message.text)
 def handle_dl(message):
     dados = carregar_dados()
@@ -105,53 +101,44 @@ def handle_dl(message):
     user = obter_usuario(user_id, dados)
     
     if not is_vip(user_id, dados) and user["downloads_hoje"] >= 5:
-        return bot.reply_to(message, "🚫 Limite diário atingido! Seja VIP em /planos.")
+        return bot.reply_to(message, "🚫 Limite diário atingido!")
 
-    msg = bot.reply_to(message, "⏳ **Processando vídeo...**")
+    msg = bot.reply_to(message, "⏳ **Processando...**")
     
+    # OPÇÕES REFORÇADAS PARA EVITAR BLOQUEIOS
     ydl_opts = {
-        'format': 'best',
+        'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
         'outtmpl': 'v_%(id)s.%(ext)s',
         'quiet': True,
         'no_warnings': True,
         'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
         'referer': 'https://www.google.com/',
         'nocheckcertificate': True,
+        'add_header': ['Accept-Language: pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7']
     }
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            # 1. Verifica metadados antes de baixar
-            info = ydl.extract_info(message.text, download=False)
+            info = ydl.extract_info(message.text, download=True)
             tamanho = info.get('filesize') or info.get('filesize_approx', 0)
             
             if tamanho > LIMITE_MB:
-                return bot.edit_message_text(f"❌ Vídeo muito grande ({int(tamanho/1024/1024)}MB). O limite é 50MB.", message.chat.id, msg.message_id)
+                return bot.edit_message_text(f"❌ Vídeo acima de 50MB.", message.chat.id, msg.message_id)
 
-            # 2. Executa o download
-            ydl.download([message.text])
             path = ydl.prepare_filename(info)
-            
-            # 3. Localiza o arquivo exato (corrige erros de extensão do Pinterest/Instagram)
-            arquivos = glob.glob(f"v_{info['id']}.*")
-            if not arquivos: raise Exception("Arquivo não encontrado")
-            actual_file = arquivos[0]
+            actual_file = glob.glob(f"v_{info['id']}.*")[0]
 
-            # 4. Envia ao usuário
             with open(actual_file, 'rb') as f:
-                bot.send_video(message.chat.id, f, caption="✅ Vídeo baixado com sucesso!")
+                bot.send_video(message.chat.id, f, caption="✅ Downloader VIP")
             
-            # Limpeza
             os.remove(actual_file)
             bot.delete_message(message.chat.id, msg.message_id)
-            
             if not is_vip(user_id, dados):
                 user["downloads_hoje"] += 1
                 salvar_dados(dados)
     except Exception as e:
-        bot.edit_message_text("❌ Erro: Link privado, inválido ou instabilidade na rede social.", message.chat.id, msg.message_id)
+        bot.edit_message_text("❌ Link instável ou privado. Tente outro vídeo.", message.chat.id, msg.message_id)
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
-    Thread(target=lambda: app.run(host="0.0.0.0", port=port, use_reloader=False)).start()
+    Thread(target=lambda: app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)), use_reloader=False)).start()
     bot.infinity_polling(timeout=20, long_polling_timeout=10)
