@@ -9,6 +9,7 @@ TOKEN_TELEGRAM = "8629536333:AAHw2zcugsOXPpOJaXsz1ZVA30T1VypiMlQ"
 MP_ACCESS_TOKEN = "APP_USR-8179041093511853-031916-7364f07318b6c464600a781433c743f7-384532659"
 DB_FILE = "database.json"
 MY_ID = "493336271"
+SUPORTE_USER = "@suportebotvip01" # 👈 Atualizado!
 
 bot = telebot.TeleBot(TOKEN_TELEGRAM, threaded=False)
 sdk = mercadopago.SDK(MP_ACCESS_TOKEN)
@@ -41,7 +42,7 @@ def is_vip(user_id, dados):
     try: return datetime.now() < datetime.strptime(user["vip_ate"], '%Y-%m-%d')
     except: return False
 
-# --- INTERFACE DE PLANOS ---
+# --- INTERFACE ---
 def enviar_menu_planos(chat_id, texto_extra=""):
     markup = types.InlineKeyboardMarkup(row_width=1)
     markup.add(
@@ -51,7 +52,6 @@ def enviar_menu_planos(chat_id, texto_extra=""):
     )
     bot.send_message(chat_id, f"{texto_extra}\n\nEscolha um plano para baixar sem limites:", reply_markup=markup, parse_mode="Markdown")
 
-# --- COMANDOS ---
 @bot.message_handler(commands=['start', 'planos'])
 def cmd_start(message):
     dados = carregar_dados()
@@ -62,9 +62,10 @@ def cmd_start(message):
     texto = f"👏 **Bem-vindo ao Downloader!**\n(TikTok, Pinterest e Rednote)\n\n📊 Status: {status}\n💡 Restantes hoje: {restantes}"
     enviar_menu_planos(message.chat.id, texto)
 
-# --- MOTOR DE DOWNLOAD (FOCO: TIKTOK, PINTEREST, REDNOTE) ---
+# --- DOWNLOADER REFORÇADO ---
 @bot.message_handler(func=lambda message: "http" in message.text and not message.text.startswith('/'))
 def handle_dl(message):
+    # Trava rigorosa: ignora se for o próprio bot ou mensagens de contagem
     if message.from_user.is_bot or "baixado hoje" in message.text:
         return
 
@@ -76,13 +77,19 @@ def handle_dl(message):
     if not vip and user["downloads_hoje"] >= 5:
         return enviar_menu_planos(message.chat.id, "🚫 **Limite diário atingido!**")
 
-    msg = bot.reply_to(message, "⏳ **Processando mídia...**")
-    url = message.text.split()[0]
-    file_id = f"vid_{message.message_id}"
+    msg = bot.reply_to(message, "⏳ **Processando...**")
+    
+    # Extrai apenas o link limpo
+    try:
+        url = [word for word in message.text.split() if word.startswith("http")][0]
+    except:
+        return
+
+    # Nome de arquivo único para evitar conflitos de download
+    file_id = f"vid_{user_id}_{message.message_id}"
     sucesso = False
 
     try:
-        # Configuração universal para as 3 redes
         ydl_opts = {
             'format': 'best',
             'outtmpl': f'{file_id}.%(ext)s',
@@ -96,7 +103,8 @@ def handle_dl(message):
             files = glob.glob(f"{file_id}.*")
             if files:
                 with open(files[0], 'rb') as f:
-                    bot.send_video(message.chat.id, f, caption="✅ @Tss_Downloader_bot")
+                    # Legenda com seu @ de suporte atualizado
+                    bot.send_video(message.chat.id, f, caption=f"✅ Suporte: {SUPORTE_USER}")
                 os.remove(files[0])
                 sucesso = True
 
@@ -105,14 +113,16 @@ def handle_dl(message):
             if not vip:
                 user["downloads_hoje"] += 1
                 salvar_dados(dados)
+                
+                # Oferece planos imediatamente no 5º download
                 if user["downloads_hoje"] >= 5:
-                    enviar_menu_planos(message.chat.id, "📊 **Vídeo 5 de 5 baixado hoje!**")
+                    enviar_menu_planos(message.chat.id, f"📊 **Vídeo 5 de 5 baixado hoje!**")
                 else:
                     bot.send_message(message.chat.id, f"📊 **Vídeo {user['downloads_hoje']} de 5 baixado hoje!**")
     except:
-        bot.edit_message_text("❌ Não consegui baixar desse link.", message.chat.id, msg.message_id)
+        bot.edit_message_text("❌ Link instável ou não suportado.", message.chat.id, msg.message_id)
 
-# --- COMANDOS ADM E PAGAMENTO ---
+# --- PAGAMENTOS E ADM ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith("buy_"))
 def handle_pay(call):
     _, valor, dias = call.data.split("_")
