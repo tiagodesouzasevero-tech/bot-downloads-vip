@@ -42,7 +42,7 @@ def is_vip(user_id, dados):
     try: return datetime.now() < datetime.strptime(user["vip_ate"], '%Y-%m-%d')
     except: return False
 
-# --- MENU DE PLANOS ---
+# --- INTERFACE DE PLANOS ---
 def enviar_menu_planos(chat_id, texto_extra=""):
     markup = types.InlineKeyboardMarkup(row_width=1)
     markup.add(
@@ -52,7 +52,7 @@ def enviar_menu_planos(chat_id, texto_extra=""):
     )
     bot.send_message(chat_id, f"{texto_extra}\n\nEscolha um plano para baixar sem limites:", reply_markup=markup, parse_mode="Markdown")
 
-# --- COMANDOS (ORDEM DE PRIORIDADE) ---
+# --- COMANDOS ---
 @bot.message_handler(commands=['start', 'planos'])
 def cmd_start(message):
     dados = carregar_dados()
@@ -70,12 +70,11 @@ def cmd_adm(message):
         user = obter_usuario(MY_ID, dados)
         user["vip_ate"] = "Vitalício"
         salvar_dados(dados)
-        bot.reply_to(message, "👑 **Acesso Vitalício Ativado, Tiago!**")
+        bot.reply_to(message, "👑 **Acesso Vitalício Ativado!**")
 
-# --- MOTOR DE DOWNLOAD (TRAVA DE LOOP E INSTAGRAM) ---
+# --- MOTOR DE DOWNLOAD ---
 @bot.message_handler(func=lambda message: "http" in message.text and not message.text.startswith('/'))
 def handle_dl(message):
-    # IGNORA SE FOR O PRÓPRIO BOT OU TEXTO DE CONTADOR
     if message.from_user.is_bot or "baixado hoje" in message.text:
         return
 
@@ -88,20 +87,25 @@ def handle_dl(message):
         return enviar_menu_planos(message.chat.id, "🚫 **Limite diário atingido!**")
 
     msg = bot.reply_to(message, "⏳ **Processando...**")
-    url = message.text.split()[0] # Pega apenas o link, ignora textos extras
+    
+    try:
+        url = [word for word in message.text.split() if word.startswith("http")][0]
+    except:
+        bot.delete_message(message.chat.id, msg.message_id)
+        return
+
     file_id = f"vid_{message.message_id}"
     sucesso = False
 
     try:
         if "instagram.com" in url:
-            # Limpeza rigorosa do link do Instagram
-            clean_url = url.split('?')[0]
-            shortcode = clean_url.split("/")[-2] if clean_url.endswith("/") else clean_url.split("/")[-1]
+            clean_url = url.split('?')[0].rstrip('/')
+            shortcode = clean_url.split("/")[-1]
             post = instaloader.Post.from_shortcode(L.context, shortcode)
             bot.send_video(message.chat.id, post.video_url, caption="✅ @Tss_Downloader_bot")
             sucesso = True
         else:
-            ydl_opts = {'format': 'best', 'outtmpl': f'{file_id}.%(ext)s', 'quiet': True, 'nocheckcertificate': True}
+            ydl_opts = {'format': 'best', 'outtmpl': f'{file_id}.%(ext)s', 'quiet': True}
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.download([url])
                 files = glob.glob(f"{file_id}.*")
@@ -116,13 +120,16 @@ def handle_dl(message):
             if not vip:
                 user["downloads_hoje"] += 1
                 salvar_dados(dados)
-                bot.send_message(message.chat.id, f"📊 **Vídeo {user['downloads_hoje']} de 5 baixado hoje!**")
+                
+                if user["downloads_hoje"] >= 5:
+                    enviar_menu_planos(message.chat.id, "📊 **Vídeo 5 de 5 baixado hoje!**\n\nAproveite sua última mídia gratuita do dia.")
+                else:
+                    bot.send_message(message.chat.id, f"📊 **Vídeo {user['downloads_hoje']} de 5 baixado hoje!**")
         else:
-            bot.edit_message_text("❌ Não consegui baixar. O perfil é público?", message.chat.id, msg.message_id)
+            bot.edit_message_text("❌ Link instável ou privado.", message.chat.id, msg.message_id)
 
     except Exception as e:
-        print(f"Erro: {e}")
-        bot.edit_message_text("❌ Erro ao processar link.", message.chat.id, msg.message_id)
+        bot.edit_message_text("❌ Erro ao processar. Tente outro link.", message.chat.id, msg.message_id)
 
 # --- PAGAMENTOS E WEBHOOK ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith("buy_"))
