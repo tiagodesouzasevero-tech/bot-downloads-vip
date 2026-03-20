@@ -3,6 +3,7 @@ import telebot
 import yt_dlp
 import mercadopago
 import time
+import random
 from datetime import datetime
 from telebot import types
 
@@ -17,17 +18,20 @@ uso_usuarios = {}
 bot = telebot.TeleBot(TOKEN_TELEGRAM)
 sdk = mercadopago.SDK(MP_ACCESS_TOKEN)
 
+# --- LISTA DE DISFARCES (USER-AGENTS) ---
+AGENTES = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+]
+
 def gerar_pix_mp(valor, descricao):
     payment_data = {
         "transaction_amount": float(valor),
         "description": descricao,
         "payment_method_id": "pix",
         "installments": 1,
-        "payer": {
-            "email": "tiago_afiliados@email.com",
-            "first_name": "Assinante",
-            "last_name": "VIP"
-        }
+        "payer": {"email": "tiago_afiliados@email.com", "first_name": "Assinante", "last_name": "VIP"}
     }
     result = sdk.payment().create(payment_data)
     if "response" in result and "point_of_interaction" in result["response"]:
@@ -75,28 +79,26 @@ def handle_download(message):
             bot.reply_to(message, "🚫 **Limite diário atingido! Use /planos.**")
             return
 
-    msg_status = bot.reply_to(message, "⏳ **Processando vídeo original...**")
+    msg_status = bot.reply_to(message, "⏳ **Analisando link com segurança...**")
 
-    # CONFIGURAÇÃO ULTRA REFORÇADA
+    # CONFIGURAÇÃO DE ALTA PERFORMANCE
     ydl_opts = {
         'format': 'bestvideo+bestaudio/best',
         'outtmpl': 'video_%(id)s.%(ext)s',
         'quiet': True,
         'no_warnings': True,
         'nocheckcertificate': True,
-        'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.5',
-            'Sec-Fetch-Mode': 'navigate',
-        },
-        'socket_timeout': 30,
-        'retries': 5, # Tenta 5 vezes se der erro de conexão
+        'http_headers': {'User-Agent': random.choice(AGENTES)},
+        'socket_timeout': 20,
+        'retries': 10,
+        'fragment_retries': 10,
     }
 
     try:
+        # Delay anti-bot aleatório (0.5 a 1.5 segundos)
+        time.sleep(random.uniform(0.5, 1.5))
+        
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            # Tenta extrair info
             info = ydl.extract_info(message.text, download=True)
             filename = ydl.prepare_filename(info)
             
@@ -112,19 +114,18 @@ def handle_download(message):
             os.remove(filename)
             bot.delete_message(message.chat.id, msg_status.message_id)
 
-    except Exception as e:
-        # Se falhar, dá um tempo e tenta uma última vez com formato simplificado
-        time.sleep(2)
+    except Exception:
+        # SEGUNDA TENTATIVA - MODO ULTRA COMPATIBILIDADE
         try:
-            ydl_opts['format'] = 'best' # Tenta formato mais leve
+            ydl_opts['format'] = 'best'
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(message.text, download=True)
                 filename = ydl.prepare_filename(info)
                 with open(filename, 'rb') as video:
-                    bot.send_video(message.chat.id, video, caption="✅ Baixado (Modo de Compatibilidade)")
+                    bot.send_video(message.chat.id, video, caption="✅ Enviado via Rota Alternativa.")
                 os.remove(filename)
                 bot.delete_message(message.chat.id, msg_status.message_id)
         except:
-            bot.edit_message_text(f"❌ Erro persistente. O Instagram/TikTok bloqueou a conexão. Tente novamente em alguns minutos.", message.chat.id, msg_status.message_id)
+            bot.edit_message_text(f"❌ O Instagram/TikTok impôs uma trava temporária ao servidor. Tente novamente em 2 minutos ou use outro link.", message.chat.id, msg_status.message_id)
 
 bot.infinity_polling()
