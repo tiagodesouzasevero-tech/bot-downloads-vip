@@ -5,7 +5,7 @@ import mercadopago
 from datetime import datetime
 from telebot import types
 
-# --- CONFIGURAÇÕES DO TIAGO (PRESERVADAS) ---
+# --- CONFIGURAÇÕES PRESERVADAS ---
 TOKEN_TELEGRAM = "8629536333:AAEV4IcvFt5CTRqQVz5yYXmNOXvcgaZygGE"
 MP_ACCESS_TOKEN = "APP_USR-8179041093511853-031916-7364f07318b6c464600a781433c743f7-384532659"
 
@@ -16,7 +16,6 @@ uso_usuarios = {}
 bot = telebot.TeleBot(TOKEN_TELEGRAM)
 sdk = mercadopago.SDK(MP_ACCESS_TOKEN)
 
-# --- FUNÇÃO DO MERCADO PAGO (CORRIGIDA) ---
 def gerar_pix_mp(valor, descricao):
     payment_data = {
         "transaction_amount": float(valor),
@@ -34,7 +33,6 @@ def gerar_pix_mp(valor, descricao):
         return result["response"]["point_of_interaction"]["transaction_data"]["qr_code"]
     return None
 
-# --- INTERFACE VISUAL (EXATAMENTE COMO VOCÊ CONFIGUROU) ---
 def exibir_menu_planos(user_id):
     hoje = datetime.now().strftime('%Y-%m-%d')
     if user_id not in uso_usuarios or uso_usuarios.get(user_id, {}).get('last_date') != hoje:
@@ -45,6 +43,7 @@ def exibir_menu_planos(user_id):
     if user_id in MEMBROS_VIP:
         texto = "👏 **Bot de Downloads VIP**\n\n📊 Plano: VIP Ilimitado\n📅 Validade: Vitalícia\n💡 Saldo: ∞ hoje."
     else:
+        # Visual corrigido conforme o print
         texto = f"👏 **Bot de Downloads VIP**\n\n📊 Plano: Gratuito\n📅 Validade: Nunca\n💡 Saldo: {saldo} hoje."
 
     markup = types.InlineKeyboardMarkup(row_width=1)
@@ -77,7 +76,7 @@ def handle_payment(call):
         )
         bot.send_message(call.message.chat.id, msg, parse_mode="Markdown")
     else:
-        bot.send_message(call.message.chat.id, "❌ **Erro ao gerar Pix.**\nVerifique se o token do Mercado Pago está ativo.")
+        bot.send_message(call.message.chat.id, "❌ **Erro ao gerar Pix.**\nVerifique o token MP.")
 
 @bot.message_handler(func=lambda message: "http" in message.text)
 def handle_download(message):
@@ -87,6 +86,7 @@ def handle_download(message):
     if user_id not in MEMBROS_VIP:
         if user_id not in uso_usuarios or uso_usuarios[user_id]['last_date'] != hoje:
             uso_usuarios[user_id] = {'count': 0, 'last_date': hoje}
+        
         if uso_usuarios[user_id]['count'] >= LIMITE_GRATIS:
             bot.reply_to(message, "🚫 **Limite diário atingido! Use /planos para baixar ilimitado.**")
             return
@@ -98,14 +98,22 @@ def handle_download(message):
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(message.text, download=True)
             filename = ydl.prepare_filename(info)
-            with open(filename, 'rb') as video:
-                bot.send_video(message.chat.id, video, caption="✅ **Vídeo Original Baixado!**")
-            os.remove(filename)
-            bot.delete_message(message.chat.id, msg_status.message_id)
+            
+            # Atualiza contador antes de enviar
             if user_id not in MEMBROS_VIP:
                 uso_usuarios[user_id]['count'] += 1
+                saldo_atual = LIMITE_GRATIS - uso_usuarios[user_id]['count']
+                legenda = f"✅ **Baixado!**\n\n💡 Saldo atual: {uso_usuarios[user_id]['count']}/{LIMITE_GRATIS} hoje."
+            else:
+                legenda = "✅ **Baixado (VIP Ilimitado)!**"
+
+            with open(filename, 'rb') as video:
+                bot.send_video(message.chat.id, video, caption=legenda, parse_mode="Markdown")
+            
+            os.remove(filename)
+            bot.delete_message(message.chat.id, msg_status.message_id)
+
     except:
         bot.edit_message_text("❌ Erro ao baixar. O link pode ser privado ou inválido.", message.chat.id, msg_status.message_id)
 
-print("✅ Bot de Downloads VIP Online!")
 bot.infinity_polling()
