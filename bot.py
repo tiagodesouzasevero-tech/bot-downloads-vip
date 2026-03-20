@@ -3,6 +3,7 @@ import yt_dlp
 import os
 import sqlite3
 import mercadopago
+import random
 from datetime import datetime, timedelta
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
@@ -12,6 +13,13 @@ TOKEN_MERCADO_PAGO = "APP_USR-8179041093511853-031916-7364f07318b6c464600a781433
 
 bot = telebot.TeleBot(TOKEN_TELEGRAM)
 sdk = mercadopago.SDK(TOKEN_MERCADO_PAGO)
+
+# Lista de identidades para evitar bloqueios
+USER_AGENTS = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+]
 
 # --- BANCO DE DADOS ---
 def init_db():
@@ -59,7 +67,7 @@ def menu_principal(message):
     texto = (f"👋 **Bem-vindo ao Bot de Downloads!**\n\n"
              f"📊 Seu plano: **{plano}**\n"
              f"💡 Saldo: **{restantes}** downloads gratuitos hoje.\n\n"
-             f"🔥 Escolha um plano para baixar sem limites:")
+             f"🔥 Assine para baixar sem limites:")
     bot.send_message(message.chat.id, texto, reply_markup=markup, parse_mode="Markdown")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("buy_"))
@@ -72,16 +80,15 @@ def gerar_pagamento(call):
         "transaction_amount": valor,
         "description": f"Plano {plano_nome} - Usuário {call.from_user.id}",
         "payment_method_id": "pix",
-        "payer": {"email": "contato@bot.com"}
+        "payer": {"email": "contato@tiago.com"}
     }
     pagamento = sdk.payment().create(payment_data)
     info = pagamento["response"]
     copia_e_cola = info['point_of_interaction']['transaction_data']['qr_code']
     pay_id = info['id']
     
-    msg = (f"⚠️ **PIX de R${valor:.2f} Gerado!**\n\n"
-           f"Copia e cola:\n`{copia_e_cola}`\n\n"
-           f"O sistema libera seu acesso **automaticamente** após o pagamento.")
+    msg = (f"⚠️ **PIX Gerado!**\n\nCopia e cola:\n`{copia_e_cola}`\n\n"
+           f"O sistema libera o acesso **automaticamente** após o pagamento.")
     
     markup = InlineKeyboardMarkup()
     markup.add(InlineKeyboardButton("✅ Já paguei! Verificar", callback_data=f"check_{pay_id}_{plano_nome}"))
@@ -100,11 +107,11 @@ def validar_pix(call):
         cursor.execute("UPDATE users SET plano = ?, expira = ? WHERE id = ?", (plano_nome, expira, call.from_user.id))
         conn.commit()
         conn.close()
-        bot.edit_message_text(f"✅ **PAGAMENTO CONFIRMADO!**\nPlano {plano_nome} ativado!", call.message.chat.id, call.message.id)
+        bot.edit_message_text(f"✅ **PAGAMENTO CONFIRMADO!**\nPlano {plano_nome} liberado!", call.message.chat.id, call.message.id)
     else:
-        bot.answer_callback_query(call.id, "❌ Pagamento não detectado ainda.", show_alert=True)
+        bot.answer_callback_query(call.id, "❌ Pagamento não detectado. Tente novamente em instantes.", show_alert=True)
 
-# --- DOWNLOAD REFORÇADO ---
+# --- DOWNLOAD BLINDADO ---
 @bot.message_handler(func=lambda message: True)
 def baixar(message):
     plano, downloads, _ = obter_dados(message.from_user.id)
@@ -113,17 +120,17 @@ def baixar(message):
 
     if any(site in url for site in sites):
         if plano == 'Gratuito' and downloads >= 5:
-            bot.reply_to(message, "🚫 Limite de 5 downloads atingido! Use /planos.")
+            bot.reply_to(message, "🚫 Limite diário atingido! Use /planos para assinar.")
             return
 
         msg_wait = bot.reply_to(message, "⚡ Baixando vídeo, aguarde...")
-        file_name = f"video_{message.from_user.id}.mp4"
+        file_name = f"video_{message.from_user.id}_{random.randint(1,1000)}.mp4"
         
         ydl_opts = {
             'format': 'best',
             'outtmpl': file_name,
             'quiet': True,
-            'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+            'user_agent': random.choice(USER_AGENTS),
             'referer': 'https://www.google.com/',
             'nocheckcertificate': True,
         }
@@ -140,12 +147,12 @@ def baixar(message):
                 cursor.execute("UPDATE users SET downloads_hoje = downloads_hoje + 1 WHERE id = ?", (message.from_user.id,))
                 conn.commit()
                 conn.close()
-                bot.send_message(message.chat.id, f"✅ Restam **{4 - downloads}** downloads grátis hoje.")
+                bot.send_message(message.chat.id, f"✅ Vídeo entregue! Restam **{4 - downloads}** downloads gratuitos hoje.")
             
             os.remove(file_name)
             bot.delete_message(message.chat.id, msg_wait.message_id)
         except:
-            bot.edit_message_text("❌ Erro ao baixar. Tente enviar o link novamente.", message.chat.id, msg_wait.message_id)
+            bot.edit_message_text("❌ Erro ao baixar. O link pode ser privado ou instável no momento.", message.chat.id, msg_wait.message_id)
             if os.path.exists(file_name): os.remove(file_name)
 
 if __name__ == "__main__":
