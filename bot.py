@@ -8,7 +8,7 @@ from telebot import types
 from flask import Flask, request
 from threading import Thread
 
-# --- CONFIGURAÇÕES DO TIAGO ---
+# --- CONFIGURAÇÕES DO TIAGO (MANTIDAS) ---
 TOKEN_TELEGRAM = "8629536333:AAHw2zcugsOXPpOJaXsz1ZVA30T1VypiMlQ"
 MP_ACCESS_TOKEN = "APP_USR-8179041093511853-031916-7364f07318b6c464600a781433c743f7-384532659"
 DB_FILE = "database.json"
@@ -17,7 +17,7 @@ bot = telebot.TeleBot(TOKEN_TELEGRAM)
 sdk = mercadopago.SDK(MP_ACCESS_TOKEN)
 app = Flask(__name__)
 
-# --- BANCO DE DADOS ---
+# --- BANCO DE DADOS (MANTIDO) ---
 def carregar_dados():
     if not os.path.exists(DB_FILE):
         return {"usuarios": {}}
@@ -140,7 +140,7 @@ def handle_pay(call):
     else:
         bot.send_message(call.message.chat.id, "❌ Erro ao gerar Pix. Tente novamente.")
 
-# --- SISTEMA DE DOWNLOAD ---
+# --- SISTEMA DE DOWNLOAD (TikTok, Instagram, Pinterest) ---
 @bot.message_handler(func=lambda message: "http" in message.text)
 def handle_dl(message):
     dados = carregar_dados()
@@ -152,13 +152,30 @@ def handle_dl(message):
         return
 
     msg = bot.reply_to(message, "⏳ **Baixando vídeo...**")
+    
+    ydl_opts = {
+        'format': 'best',
+        'outtmpl': 'v_%(id)s.%(ext)s',
+        'quiet': True,
+        'no_warnings': True,
+        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'referer': 'https://www.google.com/',
+        'nocheckcertificate': True,
+    }
+
     try:
-        # Opções básicas para download
-        ydl_opts = {'format': 'best', 'outtmpl': 'v_%(id)s.%(ext)s', 'quiet': True}
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(message.text, download=True)
             path = ydl.prepare_filename(info)
             
+            # Garante que encontrou o arquivo mesmo se o nome mudar levemente
+            if not os.path.exists(path):
+                import glob
+                base_name = f"v_{info['id']}.*"
+                files = glob.glob(base_name)
+                if files:
+                    path = files[0]
+
             if not is_vip(user_id, dados):
                 user["downloads_hoje"] += 1
             salvar_dados(dados)
@@ -169,10 +186,11 @@ def handle_dl(message):
             os.remove(path)
             bot.delete_message(message.chat.id, msg.message_id)
     except Exception as e:
-        bot.edit_message_text(f"❌ Erro: Link inválido ou instabilidade no servidor.", message.chat.id, msg.message_id)
+        print(f"Erro: {e}")
+        bot.edit_message_text(f"❌ Erro no download. Verifique se o link é público.", message.chat.id, msg.message_id)
 
 if __name__ == "__main__":
-    # Flask para Webhook em porta dinâmica da Railway
     port = int(os.environ.get("PORT", 8080))
+    # Rodar o bot e o flask juntos
     Thread(target=lambda: app.run(host="0.0.0.0", port=port, use_reloader=False)).start()
     bot.infinity_polling()
