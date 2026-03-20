@@ -10,7 +10,7 @@ from telebot import types
 from flask import Flask, request
 from threading import Thread
 
-# --- CONFIGURAÇÕES DO TIAGO ---
+# --- CONFIGURAÇÕES ---
 TOKEN_TELEGRAM = "8629536333:AAEV4IcvFt5CTRqQVz5yYXmNOXvcgaZygGE"
 MP_ACCESS_TOKEN = "APP_USR-8179041093511853-031916-7364f07318b6c464600a781433c743f7-384532659"
 DB_FILE = "database.json"
@@ -19,7 +19,7 @@ bot = telebot.TeleBot(TOKEN_TELEGRAM)
 sdk = mercadopago.SDK(MP_ACCESS_TOKEN)
 app = Flask(__name__)
 
-# --- SISTEMA DE BANCO DE DADOS (MEMÓRIA DO BOT) ---
+# --- SISTEMA DE BANCO DE DADOS ---
 def carregar_dados():
     if not os.path.exists(DB_FILE):
         return {"usuarios": {}}
@@ -57,30 +57,36 @@ def is_vip(user_id, dados):
     except:
         return False
 
-# --- WEBHOOK: RECEBER AVISO DE PAGAMENTO DO MERCADO PAGO ---
+# --- WEBHOOK (AUTOMAÇÃO DE PAGAMENTO) ---
 @app.route("/webhook", methods=['POST'])
 def webhook():
     data = request.json
     if data and data.get("type") == "payment":
         payment_id = data.get("data", {}).get("id")
         payment_info = sdk.payment().get(payment_id)
-        
-        if payment_info["status"] == 200 or payment_info["status"] == 201:
+        if payment_info["status"] in [200, 201]:
             res = payment_info["response"]
             if res["status"] == "approved":
                 user_id = res["external_reference"]
                 dias = res["metadata"]["dias"]
-                
                 dados = carregar_dados()
                 user = obter_usuario(user_id, dados)
-                
                 nova_data = datetime.now() + timedelta(days=int(dias))
                 user["vip_ate"] = "Vitalício" if int(dias) > 1000 else nova_data.strftime('%Y-%m-%d')
-                
                 salvar_dados(dados)
-                bot.send_message(user_id, "💎 **PAGAMENTO APROVADO!**\nSeu VIP foi ativado com sucesso. Aproveite downloads ilimitados! 🚀")
-            
+                bot.send_message(user_id, "💎 **PAGAMENTO APROVADO!**\nSeu VIP foi ativado. Aproveite!")
     return "", 200
+
+# --- COMANDO SECRETO PARA VOCÊ (TIAGO) ---
+@bot.message_handler(commands=['meuadm'])
+def cmd_adm(message):
+    # Este comando só funciona para o seu ID
+    if str(message.from_user.id) == "7236528892": 
+        dados = carregar_dados()
+        user = obter_usuario(message.from_user.id, dados)
+        user["vip_ate"] = "Vitalício"
+        salvar_dados(dados)
+        bot.reply_to(message, "👑 **Acesso Vitalício Ativado!**\nAgora você tem downloads ilimitados, Tiago.")
 
 # --- GERADOR DE PIX ---
 def gerar_pix_mp(valor, dias, user_id):
@@ -97,28 +103,21 @@ def gerar_pix_mp(valor, dias, user_id):
         return result["response"]["point_of_interaction"]["transaction_data"]["qr_code"]
     return None
 
-# --- COMANDOS DO BOT NO TELEGRAM ---
+# --- COMANDOS DE PLANOS ---
 @bot.message_handler(commands=['start', 'planos'])
 def cmd_planos(message):
     dados = carregar_dados()
     user_id = message.from_user.id
     user = obter_usuario(user_id, dados)
     hoje = datetime.now().strftime('%Y-%m-%d')
-    
     if user["ultima_data"] != hoje:
         user["downloads_hoje"] = 0
         user["ultima_data"] = hoje
         salvar_dados(dados)
-
     vip = is_vip(user_id, dados)
     status = "💎 VIP Ilimitado" if vip else "🆓 Gratuito"
     saldo = "∞" if vip else (5 - user["downloads_hoje"])
-    
-    texto = (f"👏 **Bot de Downloads VIP**\n\n"
-             f"📊 Status: {status}\n"
-             f"📅 Expira: {user['vip_ate'] or 'Sem plano'}\n"
-             f"💡 Restante hoje: {saldo}")
-
+    texto = (f"👏 **Bot de Downloads VIP**\n\n📊 Status: {status}\n📅 Expira: {user['vip_ate'] or 'Sem plano'}\n💡 Restante hoje: {saldo}")
     markup = types.InlineKeyboardMarkup(row_width=1)
     markup.add(
         types.InlineKeyboardButton("💳 Mensal - R$10,00", callback_data="buy_10.0_30"),
@@ -133,50 +132,33 @@ def handle_pay_click(call):
     bot.answer_callback_query(call.id, "Gerando seu Pix...")
     pix = gerar_pix_mp(valor, dias, call.from_user.id)
     if pix:
-        bot.send_message(call.message.chat.id, f"✅ **Pix Gerado!**\nCopie o código abaixo e pague no seu banco. A ativação é automática.\n\n`{pix}`", parse_mode="Markdown")
-    else:
-        bot.send_message(call.message.chat.id, "❌ Erro ao falar com o Mercado Pago. Tente novamente.")
+        bot.send_message(call.message.chat.id, f"✅ **Pix Gerado!**\nCopie o código abaixo:\n\n`{pix}`", parse_mode="Markdown")
 
+# --- SISTEMA DE DOWNLOAD ---
 @bot.message_handler(func=lambda message: "http" in message.text)
 def handle_download(message):
     dados = carregar_dados()
     user_id = message.from_user.id
     user = obter_usuario(user_id, dados)
-    
     if not is_vip(user_id, dados) and user["downloads_hoje"] >= 5:
-        bot.reply_to(message, "🚫 **Limite atingido!** Compre o VIP em /planos para continuar baixando.")
+        bot.reply_to(message, "🚫 **Limite atingido!** Adquira o VIP em /planos.")
         return
-
     msg = bot.reply_to(message, "⏳ **Baixando vídeo...**")
-
-    ydl_opts = {
-        'format': 'best',
-        'outtmpl': 'v_%(id)s.%(ext)s',
-        'socket_timeout': 60,
-        'retries': 10,
-        'http_headers': {'User-Agent': 'Mozilla/5.0'}
-    }
-
+    ydl_opts = {'format': 'best', 'outtmpl': 'v_%(id)s.%(ext)s', 'socket_timeout': 60}
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(message.text, download=True)
             path = ydl.prepare_filename(info)
-            
             if not is_vip(user_id, dados):
                 user["downloads_hoje"] += 1
             salvar_dados(dados)
-
             with open(path, 'rb') as f:
-                bot.send_video(message.chat.id, f, caption=f"✅ Baixado! Saldo: {user['downloads_hoje']}/5")
-            
+                bot.send_video(message.chat.id, f, caption=f"✅ Sucesso! Saldo: {user['downloads_hoje']}/5")
             os.remove(path)
             bot.delete_message(message.chat.id, msg.message_id)
     except:
-        bot.edit_message_text(f"❌ Erro no download. O servidor pode estar instável, tente novamente o link.", message.chat.id, msg.message_id)
+        bot.edit_message_text(f"❌ Erro no download. Tente novamente.", message.chat.id, msg.message_id)
 
-# --- INICIALIZAÇÃO DUPLA (BOT + SERVIDOR DE PAGAMENTOS) ---
 if __name__ == "__main__":
-    # Inicia o Servidor Web para o Webhook na porta que a Railway manda (PORT)
     Thread(target=lambda: app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))).start()
-    # Inicia o Bot do Telegram
     bot.infinity_polling()
