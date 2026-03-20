@@ -9,7 +9,7 @@ TOKEN_TELEGRAM = "8629536333:AAHw2zcugsOXPpOJaXsz1ZVA30T1VypiMlQ"
 MP_ACCESS_TOKEN = "APP_USR-8179041093511853-031916-7364f07318b6c464600a781433c743f7-384532659"
 DB_FILE = "database.json"
 MY_ID = "493336271"
-SUPORTE_USER = "@suportebotvip01" # 👈 Atualizado!
+SUPORTE_USER = "@suportebotvip01"
 
 bot = telebot.TeleBot(TOKEN_TELEGRAM, threaded=False)
 sdk = mercadopago.SDK(MP_ACCESS_TOKEN)
@@ -62,10 +62,9 @@ def cmd_start(message):
     texto = f"👏 **Bem-vindo ao Downloader!**\n(TikTok, Pinterest e Rednote)\n\n📊 Status: {status}\n💡 Restantes hoje: {restantes}"
     enviar_menu_planos(message.chat.id, texto)
 
-# --- DOWNLOADER REFORÇADO ---
+# --- MOTOR DE DOWNLOAD (MELHORADO PARA PINTEREST) ---
 @bot.message_handler(func=lambda message: "http" in message.text and not message.text.startswith('/'))
 def handle_dl(message):
-    # Trava rigorosa: ignora se for o próprio bot ou mensagens de contagem
     if message.from_user.is_bot or "baixado hoje" in message.text:
         return
 
@@ -77,15 +76,13 @@ def handle_dl(message):
     if not vip and user["downloads_hoje"] >= 5:
         return enviar_menu_planos(message.chat.id, "🚫 **Limite diário atingido!**")
 
-    msg = bot.reply_to(message, "⏳ **Processando...**")
+    msg = bot.reply_to(message, "⏳ **Processando mídia...**")
     
-    # Extrai apenas o link limpo
     try:
         url = [word for word in message.text.split() if word.startswith("http")][0]
     except:
         return
 
-    # Nome de arquivo único para evitar conflitos de download
     file_id = f"vid_{user_id}_{message.message_id}"
     sucesso = False
 
@@ -94,16 +91,23 @@ def handle_dl(message):
             'format': 'best',
             'outtmpl': f'{file_id}.%(ext)s',
             'quiet': True,
+            'no_warnings': True,
             'nocheckcertificate': True,
-            'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/110.0.0.0 Safari/537.36'
+            'ignoreerrors': False,
+            'logtostderr': False,
+            'add_header': [
+                'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+                'Accept-Language: pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
+            ]
         }
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
+            # Tenta resolver o link encurtador antes de baixar
+            info = ydl.extract_info(url, download=True)
             files = glob.glob(f"{file_id}.*")
             if files:
                 with open(files[0], 'rb') as f:
-                    # Legenda com seu @ de suporte atualizado
                     bot.send_video(message.chat.id, f, caption=f"✅ Suporte: {SUPORTE_USER}")
                 os.remove(files[0])
                 sucesso = True
@@ -113,14 +117,16 @@ def handle_dl(message):
             if not vip:
                 user["downloads_hoje"] += 1
                 salvar_dados(dados)
-                
-                # Oferece planos imediatamente no 5º download
                 if user["downloads_hoje"] >= 5:
-                    enviar_menu_planos(message.chat.id, f"📊 **Vídeo 5 de 5 baixado hoje!**")
+                    enviar_menu_planos(message.chat.id, "📊 **Vídeo 5 de 5 baixado hoje!**")
                 else:
                     bot.send_message(message.chat.id, f"📊 **Vídeo {user['downloads_hoje']} de 5 baixado hoje!**")
-    except:
-        bot.edit_message_text("❌ Link instável ou não suportado.", message.chat.id, msg.message_id)
+        else:
+            bot.edit_message_text("❌ Não consegui extrair o vídeo deste link.", message.chat.id, msg.message_id)
+
+    except Exception as e:
+        print(f"Erro: {e}")
+        bot.edit_message_text("❌ Link instável ou não suportado (Pinterest/TikTok/Rednote apenas).", message.chat.id, msg.message_id)
 
 # --- PAGAMENTOS E ADM ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith("buy_"))
@@ -147,4 +153,4 @@ def cmd_adm(message):
 if __name__ == "__main__":
     Thread(target=lambda: app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))).start()
     bot.remove_webhook()
-    bot.infinity_polling(timeout=20)
+    bot.infinity_polling(timeout=20, skip_pending=True)
