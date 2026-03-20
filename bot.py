@@ -5,9 +5,9 @@ import mercadopago
 from datetime import datetime
 from telebot import types
 
-# --- CONFIGURAÇÕES RECUPERADAS ---
+# --- CONFIGURAÇÕES DO TIAGO ---
 TOKEN_TELEGRAM = "8629536333:AAEV4IcvFt5CTRqQVz5yYXmNOXvcgaZygGE"
-# Recuperei seu token do Mercado Pago das nossas conversas anteriores
+# Seu Access Token que recuperamos das conversas
 MP_ACCESS_TOKEN = "APP_USR-1772439580456447-030614-2309852233f237f379893414902b7936-224424367"
 
 MEMBROS_VIP = [5130704403] 
@@ -16,7 +16,7 @@ LIMITE_GRATIS = 5
 bot = telebot.TeleBot(TOKEN_TELEGRAM)
 sdk = mercadopago.SDK(MP_ACCESS_TOKEN)
 
-# Memória de uso diário
+# Controle de uso na memória (Reset diário)
 uso_usuarios = {}
 
 def gerar_pix_mp(valor, descricao):
@@ -24,10 +24,19 @@ def gerar_pix_mp(valor, descricao):
         "transaction_amount": float(valor),
         "description": descricao,
         "payment_method_id": "pix",
-        "payer": {"email": "tiago_afiliados@email.com"}
+        "installments": 1,
+        "payer": {
+            "email": "tiago_afiliados@email.com",
+            "first_name": "Assinante",
+            "last_name": "VIP"
+        }
     }
     result = sdk.payment().create(payment_data)
-    return result["response"]["point_of_interaction"]["transaction_data"]["qr_code"]
+    
+    # Validação da resposta do Mercado Pago
+    if "response" in result and "point_of_interaction" in result["response"]:
+        return result["response"]["point_of_interaction"]["transaction_data"]["qr_code"]
+    return None
 
 def exibir_menu_planos(user_id):
     hoje = datetime.now().strftime('%Y-%m-%d')
@@ -56,21 +65,29 @@ def send_welcome(message):
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("pay_"))
 def handle_payment(call):
-    valor = call.data.split("_")[1]
-    bot.answer_callback_query(call.id, "Gerando Pix no Mercado Pago...")
+    valor_str = call.data.split("_")[1]
+    bot.answer_callback_query(call.id, "Gerando Pix...")
     
-    try:
-        pix_copia_cola = gerar_pix_mp(valor, f"Plano {valor} - Downloader Afiliados")
-        msg = f"✅ **Pix Gerado com Sucesso!**\n\nValor: R$ {valor}\n\nCopie o código abaixo para pagar no seu banco:\n\n`{pix_copia_cola}`\n\n*Após o pagamento, o acesso será liberado.*"
+    pix_copia_cola = gerar_pix_mp(valor_str, f"Plano {valor_str} - Downloader Afiliados")
+    
+    if pix_copia_cola:
+        msg = (
+            f"✅ **Pix Gerado com Sucesso!**\n\n"
+            f"Valor: R$ {valor_str}\n\n"
+            f"Copie o código abaixo para pagar:\n\n"
+            f"`{pix_copia_cola}`\n\n"
+            f"💡 *O acesso é liberado após a confirmação.*"
+        )
         bot.send_message(call.message.chat.id, msg, parse_mode="Markdown")
-    except Exception as e:
-        bot.send_message(call.message.chat.id, "❌ Erro ao gerar Pix. Verifique sua conta Mercado Pago.")
+    else:
+        bot.send_message(call.message.chat.id, "❌ **Erro ao gerar Pix.**\nVerifique se o token do Mercado Pago está ativo.")
 
 @bot.message_handler(func=lambda message: "http" in message.text)
 def handle_download(message):
     user_id = message.from_user.id
     hoje = datetime.now().strftime('%Y-%m-%d')
     
+    # Checagem de Limite
     if user_id not in MEMBROS_VIP:
         if user_id not in uso_usuarios or uso_usuarios[user_id]['last_date'] != hoje:
             uso_usuarios[user_id] = {'count': 0, 'last_date': hoje}
