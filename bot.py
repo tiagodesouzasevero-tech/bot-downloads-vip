@@ -2,6 +2,7 @@ import os
 import telebot
 import yt_dlp
 import mercadopago
+import time
 from datetime import datetime
 from telebot import types
 
@@ -37,10 +38,8 @@ def exibir_menu_planos(user_id):
     hoje = datetime.now().strftime('%Y-%m-%d')
     if user_id not in uso_usuarios or uso_usuarios.get(user_id, {}).get('last_date') != hoje:
         uso_usuarios[user_id] = {'count': 0, 'last_date': hoje}
-    
     saldo = LIMITE_GRATIS - uso_usuarios[user_id]['count']
     texto = f"👏 **Bot de Downloads VIP**\n\n📊 Plano: {'VIP Ilimitado' if user_id in MEMBROS_VIP else 'Gratuito'}\n📅 Validade: {'Vitalícia' if user_id in MEMBROS_VIP else 'Nunca'}\n💡 Saldo: {'∞' if user_id in MEMBROS_VIP else saldo} hoje."
-
     markup = types.InlineKeyboardMarkup(row_width=1)
     markup.add(
         types.InlineKeyboardButton("💳 Mensal - R$10,00", callback_data="pay_10.00"),
@@ -58,9 +57,9 @@ def send_welcome(message):
 def handle_payment(call):
     valor_str = call.data.split("_")[1]
     bot.answer_callback_query(call.id, "Gerando Pix...")
-    pix_copia_cola = gerar_pix_mp(valor_str, f"Plano {valor_str} - Downloader Afiliados")
-    if pix_copia_cola:
-        bot.send_message(call.message.chat.id, f"✅ **Pix Gerado!**\n\n`{pix_copia_cola}`", parse_mode="Markdown")
+    pix = gerar_pix_mp(valor_str, f"Plano {valor_str} - Downloader Afiliados")
+    if pix:
+        bot.send_message(call.message.chat.id, f"✅ **Pix Gerado!**\n\n`{pix}`", parse_mode="Markdown")
     else:
         bot.send_message(call.message.chat.id, "❌ Erro ao gerar Pix.")
 
@@ -76,21 +75,28 @@ def handle_download(message):
             bot.reply_to(message, "🚫 **Limite diário atingido! Use /planos.**")
             return
 
-    msg_status = bot.reply_to(message, "⏳ **Baixando vídeo original...**")
+    msg_status = bot.reply_to(message, "⏳ **Processando vídeo original...**")
 
-    # CONFIGURAÇÃO REFORÇADA PARA EVITAR ERROS DE LINKS
+    # CONFIGURAÇÃO ULTRA REFORÇADA
     ydl_opts = {
-        'format': 'best',
+        'format': 'bestvideo+bestaudio/best',
         'outtmpl': 'video_%(id)s.%(ext)s',
         'quiet': True,
         'no_warnings': True,
         'nocheckcertificate': True,
-        'ignoreerrors': False,
-        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Sec-Fetch-Mode': 'navigate',
+        },
+        'socket_timeout': 30,
+        'retries': 5, # Tenta 5 vezes se der erro de conexão
     }
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            # Tenta extrair info
             info = ydl.extract_info(message.text, download=True)
             filename = ydl.prepare_filename(info)
             
@@ -105,7 +111,20 @@ def handle_download(message):
             
             os.remove(filename)
             bot.delete_message(message.chat.id, msg_status.message_id)
+
     except Exception as e:
-        bot.edit_message_text(f"❌ Erro ao baixar. O link pode estar protegido ou ser privado.", message.chat.id, msg_status.message_id)
+        # Se falhar, dá um tempo e tenta uma última vez com formato simplificado
+        time.sleep(2)
+        try:
+            ydl_opts['format'] = 'best' # Tenta formato mais leve
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(message.text, download=True)
+                filename = ydl.prepare_filename(info)
+                with open(filename, 'rb') as video:
+                    bot.send_video(message.chat.id, video, caption="✅ Baixado (Modo de Compatibilidade)")
+                os.remove(filename)
+                bot.delete_message(message.chat.id, msg_status.message_id)
+        except:
+            bot.edit_message_text(f"❌ Erro persistente. O Instagram/TikTok bloqueou a conexão. Tente novamente em alguns minutos.", message.chat.id, msg_status.message_id)
 
 bot.infinity_polling()
