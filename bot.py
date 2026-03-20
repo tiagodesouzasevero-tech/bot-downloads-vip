@@ -10,7 +10,7 @@ from telebot import types
 from flask import Flask, request
 from threading import Thread
 
-# --- CONFIGURAÇÕES ---
+# --- CONFIGURAÇÕES DO TIAGO ---
 TOKEN_TELEGRAM = "8629536333:AAEV4IcvFt5CTRqQVz5yYXmNOXvcgaZygGE"
 MP_ACCESS_TOKEN = "APP_USR-8179041093511853-031916-7364f07318b6c464600a781433c743f7-384532659"
 DB_FILE = "database.json"
@@ -57,7 +57,7 @@ def is_vip(user_id, dados):
     except:
         return False
 
-# --- WEBHOOK (AUTOMAÇÃO DE PAGAMENTO) ---
+# --- WEBHOOK PARA PAGAMENTOS ---
 @app.route("/webhook", methods=['POST'])
 def webhook():
     data = request.json
@@ -74,36 +74,35 @@ def webhook():
                 nova_data = datetime.now() + timedelta(days=int(dias))
                 user["vip_ate"] = "Vitalício" if int(dias) > 1000 else nova_data.strftime('%Y-%m-%d')
                 salvar_dados(dados)
-                bot.send_message(user_id, "💎 **PAGAMENTO APROVADO!**\nSeu VIP foi ativado. Aproveite!")
+                bot.send_message(user_id, "💎 **PAGAMENTO APROVADO!**\nSeu acesso VIP foi liberado automaticamente! 🚀")
     return "", 200
 
-# --- COMANDO SECRETO PARA VOCÊ (TIAGO) ---
+# --- COMANDO ADM PARA O TIAGO ---
 @bot.message_handler(commands=['meuadm'])
 def cmd_adm(message):
-    # Este comando só funciona para o seu ID
-    if str(message.from_user.id) == "7236528892": 
+    if str(message.from_user.id) == "7236528892":
         dados = carregar_dados()
         user = obter_usuario(message.from_user.id, dados)
         user["vip_ate"] = "Vitalício"
         salvar_dados(dados)
-        bot.reply_to(message, "👑 **Acesso Vitalício Ativado!**\nAgora você tem downloads ilimitados, Tiago.")
+        bot.reply_to(message, "👑 **Acesso Vitalício Ativado!**\nAgora você é VIP ilimitado, Tiago.")
 
 # --- GERADOR DE PIX ---
 def gerar_pix_mp(valor, dias, user_id):
     payment_data = {
         "transaction_amount": float(valor),
-        "description": f"Plano {dias} dias - Bot Downloader",
+        "description": f"Plano {dias} dias - Downloader",
         "payment_method_id": "pix",
         "external_reference": str(user_id),
         "metadata": {"user_id": user_id, "dias": dias},
-        "payer": {"email": "cliente@afiliados.com", "first_name": "Usuario", "last_name": "Bot"}
+        "payer": {"email": "cliente@afiliados.com", "first_name": "Cliente", "last_name": "VIP"}
     }
     result = sdk.payment().create(payment_data)
     if "response" in result and "point_of_interaction" in result["response"]:
         return result["response"]["point_of_interaction"]["transaction_data"]["qr_code"]
     return None
 
-# --- COMANDOS DE PLANOS ---
+# --- COMANDOS INICIAIS ---
 @bot.message_handler(commands=['start', 'planos'])
 def cmd_planos(message):
     dados = carregar_dados()
@@ -129,10 +128,10 @@ def cmd_planos(message):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("buy_"))
 def handle_pay_click(call):
     _, valor, dias = call.data.split("_")
-    bot.answer_callback_query(call.id, "Gerando seu Pix...")
+    bot.answer_callback_query(call.id, "Gerando Pix...")
     pix = gerar_pix_mp(valor, dias, call.from_user.id)
     if pix:
-        bot.send_message(call.message.chat.id, f"✅ **Pix Gerado!**\nCopie o código abaixo:\n\n`{pix}`", parse_mode="Markdown")
+        bot.send_message(call.message.chat.id, f"✅ **Pix Gerado!**\nCopie o código:\n\n`{pix}`", parse_mode="Markdown")
 
 # --- SISTEMA DE DOWNLOAD ---
 @bot.message_handler(func=lambda message: "http" in message.text)
@@ -159,6 +158,7 @@ def handle_download(message):
     except:
         bot.edit_message_text(f"❌ Erro no download. Tente novamente.", message.chat.id, msg.message_id)
 
+# --- INICIALIZAÇÃO ---
 if __name__ == "__main__":
     Thread(target=lambda: app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))).start()
     bot.infinity_polling()
