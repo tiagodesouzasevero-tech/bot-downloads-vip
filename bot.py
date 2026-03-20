@@ -4,14 +4,13 @@ import os
 import sqlite3
 import mercadopago
 import random
-import time
 from datetime import datetime, timedelta
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 # --- CONFIGURAÇÕES ---
 TOKEN_TELEGRAM = "8629536333:AAGRHgdQYnkSagKtj2wq5jAaBi-bBsCnhBY"
 TOKEN_MERCADO_PAGO = "APP_USR-8179041093511853-031916-7364f07318b6c464600a781433c743f7-384532659"
-MEU_ID_ADMIN = 5410931534  # Seu ID para ativação automática
+ADMIN_ID = 5410931534 
 
 bot = telebot.TeleBot(TOKEN_TELEGRAM)
 sdk = mercadopago.SDK(TOKEN_MERCADO_PAGO)
@@ -35,11 +34,12 @@ def obter_dados(user_id):
     cursor = conn.cursor()
     hoje = datetime.now().strftime("%Y-%m-%d")
     
-    # Ativação automática para você (Tiago) que já pagou
-    if user_id == MEU_ID_ADMIN:
-        expira_vip = (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d")
-        cursor.execute("INSERT OR REPLACE INTO users VALUES (?, 'Mensal', ?, 0, ?)", (user_id, expira_vip, hoje))
+    if user_id == ADMIN_ID:
+        expira_dono = "2099-12-31"
+        cursor.execute("INSERT OR REPLACE INTO users VALUES (?, 'Mensal', ?, 0, ?)", (user_id, expira_dono, hoje))
         conn.commit()
+        conn.close()
+        return 'Mensal', 0, expira_dono
 
     cursor.execute("SELECT plano, expira, downloads_hoje, ultima_data FROM users WHERE id = ?", (user_id,))
     user = cursor.fetchone()
@@ -72,8 +72,8 @@ def menu_principal(message):
         markup.add(InlineKeyboardButton("💎 Vitalício - R$1.900,00", callback_data="buy_1900"))
     
     texto = (f"👋 **Bot de Downloads VIP**\n\n📊 Plano: **{plano}**\n"
-             f"📅 Expira em: **{expira}**\n"
-             f"💡 Saldo: **{restantes}** downloads hoje.")
+             f"📅 Validade: **{expira}**\n"
+             f"💡 Saldo: **{restantes}** hoje.")
     bot.send_message(message.chat.id, texto, reply_markup=markup, parse_mode="Markdown")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("buy_"))
