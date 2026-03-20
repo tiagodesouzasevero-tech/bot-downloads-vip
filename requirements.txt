@@ -2,4 +2,3 @@ pyTelegramBotAPI
 yt-dlp
 mercadopago
 flask
-instaloader
