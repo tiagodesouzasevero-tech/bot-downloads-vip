@@ -4,7 +4,7 @@ from telebot import types
 from flask import Flask, request
 from threading import Thread
 
-# --- CONFIGURAÇÕES ORIGINAIS ---
+# --- CONFIGURAÇÕES MANTIDAS ---
 TOKEN_TELEGRAM = "8629536333:AAHw2zcugsOXPpOJaXsz1ZVA30T1VypiMlQ"
 MP_ACCESS_TOKEN = "APP_USR-8179041093511853-031916-7364f07318b6c464600a781433c743f7-384532659"
 DB_FILE = "database.json"
@@ -53,15 +53,67 @@ def enviar_menu_planos(chat_id, texto_extra=""):
     )
     bot.send_message(chat_id, f"{texto_extra}\n\nEscolha um plano para baixar sem limites:", reply_markup=markup, parse_mode="Markdown")
 
-@bot.message_handler(commands=['start', 'planos'])
-def cmd_planos(message):
+# --- LÓGICA DE DOWNLOAD COM CONTADOR VISÍVEL ---
+@bot.message_handler(func=lambda message: "http" in message.text)
+def handle_dl(message):
     dados = carregar_dados()
-    user = obter_usuario(message.from_user.id, dados)
-    vip = is_vip(message.from_user.id, dados)
-    texto = f"👏 **Downloader VIP**\n\n📊 Status: {'💎 VIP' if vip else '🆓 Gratuito'}\n💡 Restantes hoje: {'∞' if vip else (5 - user['downloads_hoje'])}"
-    enviar_menu_planos(message.chat.id, texto)
+    user_id = message.from_user.id
+    user = obter_usuario(user_id, dados)
+    vip = is_vip(user_id, dados)
+    
+    if not vip and user["downloads_hoje"] >= 5:
+        return enviar_menu_planos(message.chat.id, "🚫 **Limite diário atingido!**")
 
-# --- WEBHOOK MERCADO PAGO ---
+    msg = bot.reply_to(message, "⏳ **Processando vídeo...**")
+    file_id = f"vid_{message.message_id}"
+    url = message.text
+    sucesso = False
+
+    try:
+        # TENTATIVA INSTAGRAM
+        if "instagram.com" in url:
+            try:
+                shortcode = url.split("reel/")[1].split("/")[0] if "reel/" in url else url.split("p/")[1].split("/")[0]
+                post = instaloader.Post.from_shortcode(L.context, shortcode)
+                bot.send_video(message.chat.id, post.video_url, caption="✅ @Tss_Downloader_bot")
+                sucesso = True
+            except:
+                # Segundo plano se o Instaloader falhar (via yt-dlp camuflado)
+                ydl_opts = {'format': 'best', 'outtmpl': f'{file_id}.%(ext)s', 'quiet': True}
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    ydl.download([url])
+                    files = glob.glob(f"{file_id}.*")
+                    if files:
+                        with open(files[0], 'rb') as f:
+                            bot.send_video(message.chat.id, f, caption="✅ @Tss_Downloader_bot")
+                        os.remove(files[0])
+                        sucesso = True
+        else:
+            # TIKTOK E PINTEREST
+            ydl_opts = {'format': 'best', 'outtmpl': f'{file_id}.%(ext)s', 'quiet': True}
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
+                files = glob.glob(f"{file_id}.*")
+                if files:
+                    with open(files[0], 'rb') as f:
+                        bot.send_video(message.chat.id, f, caption="✅ @Tss_Downloader_bot")
+                    os.remove(files[0])
+                    sucesso = True
+
+        if sucesso:
+            bot.delete_message(message.chat.id, msg.message_id)
+            if not vip:
+                user["downloads_hoje"] += 1
+                salvar_dados(dados)
+                # MENSAGEM DE CONTADOR QUE VOCÊ PEDIU:
+                bot.send_message(message.chat.id, f"📊 **Vídeo {user['downloads_hoje']} de 5 baixado hoje!**")
+        else:
+            bot.edit_message_text("❌ Não consegui extrair o vídeo. O perfil é público?", message.chat.id, msg.message_id)
+
+    except Exception as e:
+        bot.edit_message_text("❌ Erro técnico. Tente outro link.", message.chat.id, msg.message_id)
+
+# --- WEBHOOK E PAGAMENTOS ---
 @app.route("/webhook", methods=['POST'])
 def webhook():
     data = request.json
@@ -76,56 +128,9 @@ def webhook():
                 user = obter_usuario(user_id, dados)
                 user["vip_ate"] = "Vitalício" if dias >= 3650 else (datetime.now() + timedelta(days=dias)).strftime('%Y-%m-%d')
                 salvar_dados(dados)
-                bot.send_message(user_id, "💎 **VIP ATIVADO!**")
+                bot.send_message(user_id, "💎 **VIP ATIVADO! Aproveite!**")
     return "", 200
 
-# --- MOTOR DE DOWNLOAD (ANTIBLOQUEIO INSTAGRAM) ---
-@bot.message_handler(func=lambda message: "http" in message.text)
-def handle_dl(message):
-    dados = carregar_dados()
-    user_id = message.from_user.id
-    user = obter_usuario(user_id, dados)
-    
-    if not is_vip(user_id, dados) and user["downloads_hoje"] >= 5:
-        return enviar_menu_planos(message.chat.id, "🚫 **Limite diário atingido!**")
-
-    msg = bot.reply_to(message, "⏳ **Processando...**")
-    file_id = f"vid_{message.message_id}"
-    url = message.text
-    sucesso = False
-
-    try:
-        # Lógica especial para Instagram
-        if "instagram.com" in url:
-            shortcode = url.split("reel/")[1].split("/")[0] if "reel/" in url else url.split("p/")[1].split("/")[0]
-            post = instaloader.Post.from_shortcode(L.context, shortcode)
-            if post.is_video:
-                bot.send_video(message.chat.id, post.video_url, caption="✅ @Tss_Downloader_bot")
-                sucesso = True
-        else:
-            # Lógica para TikTok e Pinterest (yt-dlp)
-            ydl_opts = {'format': 'best', 'outtmpl': f'{file_id}.%(ext)s', 'quiet': True, 'nocheckcertificate': True}
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([url])
-                files = glob.glob(f"{file_id}.*")
-                if files:
-                    with open(files[0], 'rb') as f:
-                        bot.send_video(message.chat.id, f, caption="✅ @Tss_Downloader_bot")
-                    os.remove(files[0])
-                    sucesso = True
-
-        if sucesso:
-            bot.delete_message(message.chat.id, msg.message_id)
-            if not is_vip(user_id, dados):
-                user["downloads_hoje"] += 1
-                salvar_dados(dados)
-        else:
-            raise Exception("Erro no processamento")
-
-    except Exception as e:
-        bot.edit_message_text("❌ Link instável, privado ou inválido.", message.chat.id, msg.message_id)
-
-# --- ADM E PAGAMENTOS ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith("buy_"))
 def handle_pay(call):
     _, valor, dias = call.data.split("_")
@@ -145,7 +150,7 @@ def cmd_adm(message):
         user = obter_usuario(MY_ID, dados)
         user["vip_ate"] = "Vitalício"
         salvar_dados(dados)
-        bot.reply_to(message, "👑 **Acesso Vitalício Ativado, Tiago!**")
+        bot.reply_to(message, "👑 **Acesso Vitalício Ativado!**")
 
 if __name__ == "__main__":
     Thread(target=lambda: app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))).start()
