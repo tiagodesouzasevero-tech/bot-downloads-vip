@@ -5,10 +5,10 @@ import mercadopago
 from datetime import datetime
 from telebot import types
 
-# --- CONFIGURAÇÕES DO TIAGO ---
+# --- CONFIGURAÇÕES ATUALIZADAS DO TIAGO ---
 TOKEN_TELEGRAM = "8629536333:AAEV4IcvFt5CTRqQVz5yYXmNOXvcgaZygGE"
-# Seu Access Token que recuperamos das conversas
-MP_ACCESS_TOKEN = "APP_USR-1772439580456447-030614-2309852233f237f379893414902b7936-224424367"
+# NOVO TOKEN DO MERCADO PAGO ENVIADO AGORA
+MP_ACCESS_TOKEN = "APP_USR-8179041093511853-031916-7364f07318b6c464600a781433c743f7-384532659"
 
 MEMBROS_VIP = [5130704403] 
 LIMITE_GRATIS = 5
@@ -36,11 +36,14 @@ def gerar_pix_mp(valor, descricao):
     # Validação da resposta do Mercado Pago
     if "response" in result and "point_of_interaction" in result["response"]:
         return result["response"]["point_of_interaction"]["transaction_data"]["qr_code"]
+    
+    # Log de erro interno para depuração
+    print(f"DEBUG MP: {result}")
     return None
 
 def exibir_menu_planos(user_id):
     hoje = datetime.now().strftime('%Y-%m-%d')
-    if user_id not in uso_usuarios or uso_usuarios[user_id]['last_date'] != hoje:
+    if user_id not in uso_usuarios or uso_usuarios[user_id]['last_date'] != hoye:
         uso_usuarios[user_id] = {'count': 0, 'last_date': hoje}
     
     saldo = LIMITE_GRATIS - uso_usuarios[user_id]['count']
@@ -80,7 +83,7 @@ def handle_payment(call):
         )
         bot.send_message(call.message.chat.id, msg, parse_mode="Markdown")
     else:
-        bot.send_message(call.message.chat.id, "❌ **Erro ao gerar Pix.**\nVerifique se o token do Mercado Pago está ativo.")
+        bot.send_message(call.message.chat.id, "❌ **Erro ao gerar Pix.**\nVerifique se o novo token do Mercado Pago está ativo e com permissões de checkout.")
 
 @bot.message_handler(func=lambda message: "http" in message.text)
 def handle_download(message):
