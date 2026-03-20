@@ -39,12 +39,7 @@ def exibir_menu_planos(user_id):
         uso_usuarios[user_id] = {'count': 0, 'last_date': hoje}
     
     saldo = LIMITE_GRATIS - uso_usuarios[user_id]['count']
-    
-    if user_id in MEMBROS_VIP:
-        texto = "👏 **Bot de Downloads VIP**\n\n📊 Plano: VIP Ilimitado\n📅 Validade: Vitalícia\n💡 Saldo: ∞ hoje."
-    else:
-        # Visual corrigido conforme o print
-        texto = f"👏 **Bot de Downloads VIP**\n\n📊 Plano: Gratuito\n📅 Validade: Nunca\n💡 Saldo: {saldo} hoje."
+    texto = f"👏 **Bot de Downloads VIP**\n\n📊 Plano: {'VIP Ilimitado' if user_id in MEMBROS_VIP else 'Gratuito'}\n📅 Validade: {'Vitalícia' if user_id in MEMBROS_VIP else 'Nunca'}\n💡 Saldo: {'∞' if user_id in MEMBROS_VIP else saldo} hoje."
 
     markup = types.InlineKeyboardMarkup(row_width=1)
     markup.add(
@@ -63,20 +58,11 @@ def send_welcome(message):
 def handle_payment(call):
     valor_str = call.data.split("_")[1]
     bot.answer_callback_query(call.id, "Gerando Pix...")
-    
     pix_copia_cola = gerar_pix_mp(valor_str, f"Plano {valor_str} - Downloader Afiliados")
-    
     if pix_copia_cola:
-        msg = (
-            f"✅ **Pix Gerado com Sucesso!**\n\n"
-            f"Valor: R$ {valor_str}\n\n"
-            f"Copie o código abaixo para pagar:\n\n"
-            f"`{pix_copia_cola}`\n\n"
-            f"💡 *O acesso é liberado após a confirmação.*"
-        )
-        bot.send_message(call.message.chat.id, msg, parse_mode="Markdown")
+        bot.send_message(call.message.chat.id, f"✅ **Pix Gerado!**\n\n`{pix_copia_cola}`", parse_mode="Markdown")
     else:
-        bot.send_message(call.message.chat.id, "❌ **Erro ao gerar Pix.**\nVerifique o token MP.")
+        bot.send_message(call.message.chat.id, "❌ Erro ao gerar Pix.")
 
 @bot.message_handler(func=lambda message: "http" in message.text)
 def handle_download(message):
@@ -86,23 +72,30 @@ def handle_download(message):
     if user_id not in MEMBROS_VIP:
         if user_id not in uso_usuarios or uso_usuarios[user_id]['last_date'] != hoje:
             uso_usuarios[user_id] = {'count': 0, 'last_date': hoje}
-        
         if uso_usuarios[user_id]['count'] >= LIMITE_GRATIS:
-            bot.reply_to(message, "🚫 **Limite diário atingido! Use /planos para baixar ilimitado.**")
+            bot.reply_to(message, "🚫 **Limite diário atingido! Use /planos.**")
             return
 
     msg_status = bot.reply_to(message, "⏳ **Baixando vídeo original...**")
 
+    # CONFIGURAÇÃO REFORÇADA PARA EVITAR ERROS DE LINKS
+    ydl_opts = {
+        'format': 'best',
+        'outtmpl': 'video_%(id)s.%(ext)s',
+        'quiet': True,
+        'no_warnings': True,
+        'nocheckcertificate': True,
+        'ignoreerrors': False,
+        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+    }
+
     try:
-        ydl_opts = {'format': 'best', 'outtmpl': 'video_%(id)s.%(ext)s', 'quiet': True}
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(message.text, download=True)
             filename = ydl.prepare_filename(info)
             
-            # Atualiza contador antes de enviar
             if user_id not in MEMBROS_VIP:
                 uso_usuarios[user_id]['count'] += 1
-                saldo_atual = LIMITE_GRATIS - uso_usuarios[user_id]['count']
                 legenda = f"✅ **Baixado!**\n\n💡 Saldo atual: {uso_usuarios[user_id]['count']}/{LIMITE_GRATIS} hoje."
             else:
                 legenda = "✅ **Baixado (VIP Ilimitado)!**"
@@ -112,8 +105,7 @@ def handle_download(message):
             
             os.remove(filename)
             bot.delete_message(message.chat.id, msg_status.message_id)
-
-    except:
-        bot.edit_message_text("❌ Erro ao baixar. O link pode ser privado ou inválido.", message.chat.id, msg_status.message_id)
+    except Exception as e:
+        bot.edit_message_text(f"❌ Erro ao baixar. O link pode estar protegido ou ser privado.", message.chat.id, msg_status.message_id)
 
 bot.infinity_polling()
