@@ -4,18 +4,18 @@ from telebot import types
 from flask import Flask, request
 from threading import Thread
 
-# --- CONFIGURAÇÕES DO TIAGO (INTOCÁVEIS) ---
+# --- CONFIGURAÇÕES ORIGINAIS (PRESERVADAS) ---
 TOKEN_TELEGRAM = "8629536333:AAHw2zcugsOXPpOJaXsz1ZVA30T1VypiMlQ"
 MP_ACCESS_TOKEN = "APP_USR-8179041093511853-031916-7364f07318b6c464600a781433c743f7-384532659"
 DB_FILE = "database.json"
-MY_ID = "493336271" # Seu ID de Admin preservado
+MY_ID = "493336271"
 LIMITE_MB = 50 * 1024 * 1024 
 
-bot = telebot.TeleBot(TOKEN_TELEGRAM)
+bot = telebot.TeleBot(TOKEN_TELEGRAM, threaded=False)
 sdk = mercadopago.SDK(MP_ACCESS_TOKEN)
 app = Flask(__name__)
 
-# --- SISTEMA DE DADOS (PRESERVADO) ---
+# --- SISTEMA DE DADOS ---
 def carregar_dados():
     if not os.path.exists(DB_FILE): return {"usuarios": {}}
     try:
@@ -39,7 +39,7 @@ def is_vip(user_id, dados):
         return datetime.now() < datetime.strptime(user["vip_ate"], '%Y-%m-%d')
     except: return False
 
-# --- MERCADO PAGO (PRESERVADO) ---
+# --- WEBHOOK ---
 @app.route("/webhook", methods=['POST'])
 def webhook():
     data = request.json
@@ -57,7 +57,7 @@ def webhook():
                 bot.send_message(user_id, "💎 **VIP ATIVADO!**")
     return "", 200
 
-# --- COMANDOS (PRESERVADOS) ---
+# --- COMANDOS ---
 @bot.message_handler(commands=['meuadm'])
 def cmd_adm(message):
     if str(message.from_user.id) == MY_ID:
@@ -93,7 +93,7 @@ def handle_pay(call):
         pix = res["response"]["point_of_interaction"]["transaction_data"]["qr_code"]
         bot.send_message(call.message.chat.id, f"✅ **Pix Gerado!**\n\n`{pix}`", parse_mode="Markdown")
 
-# --- ÚNICA PARTE ALTERADA: MOTOR DE DOWNLOAD CORRIGIDO ---
+# --- MOTOR DE DOWNLOAD (CORRIGIDO PARA FORMATO MP4 ÚNICO) ---
 @bot.message_handler(func=lambda message: "http" in message.text)
 def handle_dl(message):
     dados = carregar_dados()
@@ -105,16 +105,16 @@ def handle_dl(message):
 
     msg = bot.reply_to(message, "⏳ **Processando...**")
     
-    # OPÇÕES REFORÇADAS PARA EVITAR BLOQUEIOS
+    file_id = f"vid_{message.message_id}"
+    
+    # FORMAT alterado para garantir um arquivo unificado compatível com o Telegram
     ydl_opts = {
-        'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
-        'outtmpl': 'v_%(id)s.%(ext)s',
+        'format': 'b[ext=mp4]/best', 
+        'outtmpl': f'{file_id}.%(ext)s',
         'quiet': True,
         'no_warnings': True,
         'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        'referer': 'https://www.google.com/',
         'nocheckcertificate': True,
-        'add_header': ['Accept-Language: pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7']
     }
 
     try:
@@ -125,11 +125,18 @@ def handle_dl(message):
             if tamanho > LIMITE_MB:
                 return bot.edit_message_text(f"❌ Vídeo acima de 50MB.", message.chat.id, msg.message_id)
 
-            path = ydl.prepare_filename(info)
-            actual_file = glob.glob(f"v_{info['id']}.*")[0]
+            files = glob.glob(f"{file_id}.*")
+            if not files: raise Exception("Download falhou na origem")
+            actual_file = files[0]
 
-            with open(actual_file, 'rb') as f:
-                bot.send_video(message.chat.id, f, caption="✅ Downloader VIP")
+            # Tenta enviar como vídeo, se falhar, tenta como arquivo solto
+            try:
+                with open(actual_file, 'rb') as f:
+                    bot.send_video(message.chat.id, f, caption="✅ @Tss_Downloader_bot")
+            except Exception as e:
+                print(f"Erro no send_video: {e}")
+                with open(actual_file, 'rb') as f:
+                    bot.send_document(message.chat.id, f, caption="✅ Arquivo enviado com sucesso!")
             
             os.remove(actual_file)
             bot.delete_message(message.chat.id, msg.message_id)
@@ -137,8 +144,10 @@ def handle_dl(message):
                 user["downloads_hoje"] += 1
                 salvar_dados(dados)
     except Exception as e:
+        print(f"Erro Geral: {e}")
         bot.edit_message_text("❌ Link instável ou privado. Tente outro vídeo.", message.chat.id, msg.message_id)
 
 if __name__ == "__main__":
-    Thread(target=lambda: app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)), use_reloader=False)).start()
-    bot.infinity_polling(timeout=20, long_polling_timeout=10)
+    Thread(target=lambda: app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))).start()
+    bot.remove_webhook()
+    bot.infinity_polling(timeout=20)
