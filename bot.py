@@ -4,109 +4,179 @@ import yt_dlp
 import mercadopago
 import time
 import random
-from datetime import datetime
+import json
+from datetime import datetime, timedelta
 from telebot import types
+from flask import Flask, request
+from threading import Thread
 
-# --- CONFIGURAÇÕES PRESERVADAS ---
+# --- CONFIGURAÇÕES DO TIAGO ---
 TOKEN_TELEGRAM = "8629536333:AAEV4IcvFt5CTRqQVz5yYXmNOXvcgaZygGE"
 MP_ACCESS_TOKEN = "APP_USR-8179041093511853-031916-7364f07318b6c464600a781433c743f7-384532659"
-
-MEMBROS_VIP = [5130704403] 
-LIMITE_GRATIS = 5
-uso_usuarios = {}
+DB_FILE = "database.json"
 
 bot = telebot.TeleBot(TOKEN_TELEGRAM)
 sdk = mercadopago.SDK(MP_ACCESS_TOKEN)
+app = Flask(__name__)
 
-# Disfarces atualizados para burlar instabilidade de rede
-AGENTES = [
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1'
-]
+# --- SISTEMA DE BANCO DE DADOS (MEMÓRIA DO BOT) ---
+def carregar_dados():
+    if not os.path.exists(DB_FILE):
+        return {"usuarios": {}}
+    try:
+        with open(DB_FILE, "r") as f:
+            return json.load(f)
+    except:
+        return {"usuarios": {}}
 
-def gerar_pix_mp(valor, descricao):
+def salvar_dados(dados):
+    with open(DB_FILE, "w") as f:
+        json.dump(dados, f, indent=4)
+
+def obter_usuario(user_id, dados):
+    uid = str(user_id)
+    if uid not in dados["usuarios"]:
+        dados["usuarios"][uid] = {
+            "vip_ate": None,
+            "downloads_hoje": 0,
+            "ultima_data": datetime.now().strftime('%Y-%m-%d')
+        }
+    return dados["usuarios"][uid]
+
+def is_vip(user_id, dados):
+    user = obter_usuario(user_id, dados)
+    if not user["vip_ate"]: return False
+    if user["vip_ate"] == "Vitalício": return True
+    try:
+        expira = datetime.strptime(user["vip_ate"], '%Y-%m-%d')
+        if datetime.now() > expira:
+            user["vip_ate"] = None
+            salvar_dados(dados)
+            return False
+        return True
+    except:
+        return False
+
+# --- WEBHOOK: RECEBER AVISO DE PAGAMENTO DO MERCADO PAGO ---
+@app.route("/webhook", methods=['POST'])
+def webhook():
+    data = request.json
+    if data and data.get("type") == "payment":
+        payment_id = data.get("data", {}).get("id")
+        payment_info = sdk.payment().get(payment_id)
+        
+        if payment_info["status"] == 200 or payment_info["status"] == 201:
+            res = payment_info["response"]
+            if res["status"] == "approved":
+                user_id = res["external_reference"]
+                dias = res["metadata"]["dias"]
+                
+                dados = carregar_dados()
+                user = obter_usuario(user_id, dados)
+                
+                nova_data = datetime.now() + timedelta(days=int(dias))
+                user["vip_ate"] = "Vitalício" if int(dias) > 1000 else nova_data.strftime('%Y-%m-%d')
+                
+                salvar_dados(dados)
+                bot.send_message(user_id, "💎 **PAGAMENTO APROVADO!**\nSeu VIP foi ativado com sucesso. Aproveite downloads ilimitados! 🚀")
+            
+    return "", 200
+
+# --- GERADOR DE PIX ---
+def gerar_pix_mp(valor, dias, user_id):
     payment_data = {
         "transaction_amount": float(valor),
-        "description": descricao,
+        "description": f"Plano {dias} dias - Bot Downloader",
         "payment_method_id": "pix",
-        "installments": 1,
-        "payer": {"email": "tiago_afiliados@email.com", "first_name": "Assinante", "last_name": "VIP"}
+        "external_reference": str(user_id),
+        "metadata": {"user_id": user_id, "dias": dias},
+        "payer": {"email": "cliente@afiliados.com", "first_name": "Usuario", "last_name": "Bot"}
     }
     result = sdk.payment().create(payment_data)
     if "response" in result and "point_of_interaction" in result["response"]:
         return result["response"]["point_of_interaction"]["transaction_data"]["qr_code"]
     return None
 
-def exibir_menu_planos(user_id):
+# --- COMANDOS DO BOT NO TELEGRAM ---
+@bot.message_handler(commands=['start', 'planos'])
+def cmd_planos(message):
+    dados = carregar_dados()
+    user_id = message.from_user.id
+    user = obter_usuario(user_id, dados)
     hoje = datetime.now().strftime('%Y-%m-%d')
-    if user_id not in uso_usuarios or uso_usuarios.get(user_id, {}).get('last_date') != hoje:
-        uso_usuarios[user_id] = {'count': 0, 'last_date': hoje}
-    saldo = LIMITE_GRATIS - uso_usuarios[user_id]['count']
-    status = "VIP Ilimitado" if user_id in MEMBROS_VIP else "Gratuito"
-    texto = f"👏 **Bot de Downloads VIP**\n\n📊 Plano: {status}\n📅 Validade: {'Vitalícia' if user_id in MEMBROS_VIP else 'Nunca'}\n💡 Saldo: {'∞' if user_id in MEMBROS_VIP else saldo} hoje."
+    
+    if user["ultima_data"] != hoje:
+        user["downloads_hoje"] = 0
+        user["ultima_data"] = hoje
+        salvar_dados(dados)
+
+    vip = is_vip(user_id, dados)
+    status = "💎 VIP Ilimitado" if vip else "🆓 Gratuito"
+    saldo = "∞" if vip else (5 - user["downloads_hoje"])
+    
+    texto = (f"👏 **Bot de Downloads VIP**\n\n"
+             f"📊 Status: {status}\n"
+             f"📅 Expira: {user['vip_ate'] or 'Sem plano'}\n"
+             f"💡 Restante hoje: {saldo}")
+
     markup = types.InlineKeyboardMarkup(row_width=1)
     markup.add(
-        types.InlineKeyboardButton("💳 Mensal - R$10,00", callback_data="pay_10.00"),
-        types.InlineKeyboardButton("🌟 Anual - R$69,90", callback_data="pay_69.90"),
-        types.InlineKeyboardButton("💎 Vitalício - R$1.900,00", callback_data="pay_1900.00")
+        types.InlineKeyboardButton("💳 Mensal - R$10,00", callback_data="buy_10.0_30"),
+        types.InlineKeyboardButton("🌟 Anual - R$69,90", callback_data="buy_69.9_365"),
+        types.InlineKeyboardButton("💎 Vitalício - R$1.900,00", callback_data="buy_1900.0_3650")
     )
-    return texto, markup
-
-@bot.message_handler(commands=['start', 'planos'])
-def send_welcome(message):
-    texto, markup = exibir_menu_planos(message.from_user.id)
     bot.send_message(message.chat.id, texto, reply_markup=markup, parse_mode="Markdown")
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith("pay_"))
-def handle_payment(call):
-    valor_str = call.data.split("_")[1]
-    bot.answer_callback_query(call.id, "Gerando Pix...")
-    pix = gerar_pix_mp(valor_str, f"Plano {valor_str} - Downloader Afiliados")
+@bot.callback_query_handler(func=lambda call: call.data.startswith("buy_"))
+def handle_pay_click(call):
+    _, valor, dias = call.data.split("_")
+    bot.answer_callback_query(call.id, "Gerando seu Pix...")
+    pix = gerar_pix_mp(valor, dias, call.from_user.id)
     if pix:
-        bot.send_message(call.message.chat.id, f"✅ **Pix Gerado!**\n\n`{pix}`", parse_mode="Markdown")
+        bot.send_message(call.message.chat.id, f"✅ **Pix Gerado!**\nCopie o código abaixo e pague no seu banco. A ativação é automática.\n\n`{pix}`", parse_mode="Markdown")
     else:
-        bot.send_message(call.message.chat.id, "❌ Servidor instável. Tente novamente em instantes.")
+        bot.send_message(call.message.chat.id, "❌ Erro ao falar com o Mercado Pago. Tente novamente.")
 
 @bot.message_handler(func=lambda message: "http" in message.text)
 def handle_download(message):
+    dados = carregar_dados()
     user_id = message.from_user.id
-    hoje = datetime.now().strftime('%Y-%m-%d')
+    user = obter_usuario(user_id, dados)
     
-    if user_id not in MEMBROS_VIP:
-        if user_id not in uso_usuarios or uso_usuarios[user_id]['last_date'] != hoje:
-            uso_usuarios[user_id] = {'count': 0, 'last_date': hoje}
-        if uso_usuarios[user_id]['count'] >= LIMITE_GRATIS:
-            bot.reply_to(message, "🚫 **Limite diário atingido! Use /planos.**")
-            return
+    if not is_vip(user_id, dados) and user["downloads_hoje"] >= 5:
+        bot.reply_to(message, "🚫 **Limite atingido!** Compre o VIP em /planos para continuar baixando.")
+        return
 
-    msg_status = bot.reply_to(message, "⏳ **Contornando instabilidade do servidor...**")
+    msg = bot.reply_to(message, "⏳ **Baixando vídeo...**")
 
     ydl_opts = {
         'format': 'best',
-        'outtmpl': 'video_%(id)s.%(ext)s',
-        'nocheckcertificate': True,
-        'http_headers': {'User-Agent': random.choice(AGENTES), 'Referer': 'https://www.instagram.com/'},
-        'socket_timeout': 60, # Aumentado para lidar com o atraso da Railway
-        'retries': 10 # Tenta 10 vezes antes de desistir
+        'outtmpl': 'v_%(id)s.%(ext)s',
+        'socket_timeout': 60,
+        'retries': 10,
+        'http_headers': {'User-Agent': 'Mozilla/5.0'}
     }
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(message.text, download=True)
-            filename = ydl.prepare_filename(info)
+            path = ydl.prepare_filename(info)
             
-            if user_id not in MEMBROS_VIP:
-                uso_usuarios[user_id]['count'] += 1
-                legenda = f"✅ **Baixado!**\n\n💡 Saldo atual: {uso_usuarios[user_id]['count']}/{LIMITE_GRATIS} hoje."
-            else:
-                legenda = "✅ **Baixado (VIP Ilimitado)!**"
+            if not is_vip(user_id, dados):
+                user["downloads_hoje"] += 1
+            salvar_dados(dados)
 
-            with open(filename, 'rb') as video:
-                bot.send_video(message.chat.id, video, caption=legenda, parse_mode="Markdown")
+            with open(path, 'rb') as f:
+                bot.send_video(message.chat.id, f, caption=f"✅ Baixado! Saldo: {user['downloads_hoje']}/5")
             
-            os.remove(filename)
-            bot.delete_message(message.chat.id, msg_status.message_id)
+            os.remove(path)
+            bot.delete_message(message.chat.id, msg.message_id)
     except:
-        bot.edit_message_text(f"⚠️ O servidor está oscilando agora. Se o vídeo não chegar em 1 minuto, tente enviar o link novamente.", message.chat.id, msg_status.message_id)
+        bot.edit_message_text(f"❌ Erro no download. O servidor pode estar instável, tente novamente o link.", message.chat.id, msg.message_id)
 
-bot.infinity_polling()
+# --- INICIALIZAÇÃO DUPLA (BOT + SERVIDOR DE PAGAMENTOS) ---
+if __name__ == "__main__":
+    # Inicia o Servidor Web para o Webhook na porta que a Railway manda (PORT)
+    Thread(target=lambda: app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))).start()
+    # Inicia o Bot do Telegram
+    bot.infinity_polling()
