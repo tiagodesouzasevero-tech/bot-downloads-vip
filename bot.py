@@ -11,6 +11,7 @@ from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 # --- CONFIGURAÇÕES ---
 TOKEN_TELEGRAM = "8629536333:AAGRHgdQYnkSagKtj2wq5jAaBi-bBsCnhBY"
 TOKEN_MERCADO_PAGO = "APP_USR-8179041093511853-031916-7364f07318b6c464600a781433c743f7-384532659"
+MEU_ID_ADMIN = 5410931534  # Seu ID para ativação automática
 
 bot = telebot.TeleBot(TOKEN_TELEGRAM)
 sdk = mercadopago.SDK(TOKEN_MERCADO_PAGO)
@@ -33,6 +34,13 @@ def obter_dados(user_id):
     conn = sqlite3.connect('usuarios.db', check_same_thread=False)
     cursor = conn.cursor()
     hoje = datetime.now().strftime("%Y-%m-%d")
+    
+    # Ativação automática para você (Tiago) que já pagou
+    if user_id == MEU_ID_ADMIN:
+        expira_vip = (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d")
+        cursor.execute("INSERT OR REPLACE INTO users VALUES (?, 'Mensal', ?, 0, ?)", (user_id, expira_vip, hoje))
+        conn.commit()
+
     cursor.execute("SELECT plano, expira, downloads_hoje, ultima_data FROM users WHERE id = ?", (user_id,))
     user = cursor.fetchone()
     
@@ -54,16 +62,18 @@ def obter_dados(user_id):
 # --- MENUS E PAGAMENTOS ---
 @bot.message_handler(commands=['start', 'planos'])
 def menu_principal(message):
-    plano, downloads, _ = obter_dados(message.from_user.id)
+    plano, downloads, expira = obter_dados(message.from_user.id)
     restantes = 5 - downloads if plano == 'Gratuito' else "Ilimitado"
     
     markup = InlineKeyboardMarkup()
-    markup.add(InlineKeyboardButton("💳 Mensal - R$10,00", callback_data="buy_10"))
-    markup.add(InlineKeyboardButton("🌟 Anual - R$69,90", callback_data="buy_69"))
-    markup.add(InlineKeyboardButton("💎 Vitalício - R$1.900,00", callback_data="buy_1900"))
+    if plano == 'Gratuito':
+        markup.add(InlineKeyboardButton("💳 Mensal - R$10,00", callback_data="buy_10"))
+        markup.add(InlineKeyboardButton("🌟 Anual - R$69,90", callback_data="buy_69"))
+        markup.add(InlineKeyboardButton("💎 Vitalício - R$1.900,00", callback_data="buy_1900"))
     
-    texto = (f"👋 **Bot de Downloads VIP**\n\n📊 Plano: **{plano}**\n💡 Saldo: **{restantes}** downloads hoje.\n\n"
-             "Escolha um plano para baixar sem limites:")
+    texto = (f"👋 **Bot de Downloads VIP**\n\n📊 Plano: **{plano}**\n"
+             f"📅 Expira em: **{expira}**\n"
+             f"💡 Saldo: **{restantes}** downloads hoje.")
     bot.send_message(message.chat.id, texto, reply_markup=markup, parse_mode="Markdown")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("buy_"))
@@ -106,7 +116,7 @@ def validar_pix(call):
         cursor.execute("UPDATE users SET plano = ?, expira = ? WHERE id = ?", (plano_nome, expira, call.from_user.id))
         conn.commit()
         conn.close()
-        bot.edit_message_text(f"✅ **Plano {plano_nome} ativado!** Expira em: {expira}", call.message.chat.id, call.message.id)
+        bot.edit_message_text(f"✅ **Plano {plano_nome} ativado!**", call.message.chat.id, call.message.id)
     else:
         bot.answer_callback_query(call.id, "❌ Pagamento ainda não aprovado.", show_alert=True)
 
@@ -121,7 +131,7 @@ def baixar(message):
             bot.reply_to(message, "🚫 Limite diário atingido! Use /planos.")
             return
 
-        msg_wait = bot.reply_to(message, "⏳ Baixando vídeo...")
+        msg_wait = bot.reply_to(message, "⏳ Processando download...")
         file_name = f"dl_{message.from_user.id}.mp4"
         
         ydl_opts = {
@@ -148,7 +158,7 @@ def baixar(message):
             os.remove(file_name)
             bot.delete_message(message.chat.id, msg_wait.message_id)
         except:
-            bot.edit_message_text("❌ Erro ao baixar. Tente outro link.", message.chat.id, msg_wait.message_id)
+            bot.edit_message_text("❌ Erro no link ou vídeo indisponível.", message.chat.id, msg_wait.message_id)
             if os.path.exists(file_name): os.remove(file_name)
 
 if __name__ == "__main__":
