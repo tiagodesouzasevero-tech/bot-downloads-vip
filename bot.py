@@ -10,8 +10,8 @@ from telebot import types
 from flask import Flask, request
 from threading import Thread
 
-# --- CONFIGURAÇÕES DO TIAGO ---
-TOKEN_TELEGRAM = "8629536333:AAEV4IcvFt5CTRqQVz5yYXmNOXvcgaZygGE"
+# --- CONFIGURAÇÕES DO TIAGO (TOKEN NOVO ATUALIZADO) ---
+TOKEN_TELEGRAM = "8629536333:AAFZoe mStYr_0JesPYBsTkyCZEfth85V91k"
 MP_ACCESS_TOKEN = "APP_USR-8179041093511853-031916-7364f07318b6c464600a781433c743f7-384532659"
 DB_FILE = "database.json"
 
@@ -74,7 +74,7 @@ def webhook():
                 nova_data = datetime.now() + timedelta(days=int(dias))
                 user["vip_ate"] = "Vitalício" if int(dias) > 1000 else nova_data.strftime('%Y-%m-%d')
                 salvar_dados(dados)
-                bot.send_message(user_id, "💎 **PAGAMENTO APROVADO!**\nSeu acesso VIP foi liberado automaticamente! 🚀")
+                bot.send_message(user_id, "💎 **PAGAMENTO APROVADO!**\nSeu acesso VIP foi liberado automaticamente!")
     return "", 200
 
 # --- COMANDO ADM PARA O TIAGO ---
