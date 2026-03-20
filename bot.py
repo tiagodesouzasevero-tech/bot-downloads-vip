@@ -4,7 +4,7 @@ from telebot import types
 from flask import Flask, request
 from threading import Thread
 
-# --- CONFIGURAÇÕES ORIGINAIS (MANTIDAS) ---
+# --- CONFIGURAÇÕES MANTIDAS ---
 TOKEN_TELEGRAM = "8629536333:AAHw2zcugsOXPpOJaXsz1ZVA30T1VypiMlQ"
 MP_ACCESS_TOKEN = "APP_USR-8179041093511853-031916-7364f07318b6c464600a781433c743f7-384532659"
 DB_FILE = "database.json"
@@ -15,7 +15,7 @@ bot = telebot.TeleBot(TOKEN_TELEGRAM, threaded=False)
 sdk = mercadopago.SDK(MP_ACCESS_TOKEN)
 app = Flask(__name__)
 
-# --- SISTEMA DE DADOS (PRESERVADO) ---
+# --- SISTEMA DE DADOS ---
 def carregar_dados():
     if not os.path.exists(DB_FILE): return {"usuarios": {}}
     try:
@@ -35,8 +35,7 @@ def is_vip(user_id, dados):
     user = obter_usuario(user_id, dados)
     if user["vip_ate"] == "Vitalício": return True
     if not user["vip_ate"]: return False
-    try:
-        return datetime.now() < datetime.strptime(user["vip_ate"], '%Y-%m-%d')
+    try: return datetime.now() < datetime.strptime(user["vip_ate"], '%Y-%m-%d')
     except: return False
 
 # --- WEBHOOK ---
@@ -93,7 +92,7 @@ def handle_pay(call):
         pix = res["response"]["point_of_interaction"]["transaction_data"]["qr_code"]
         bot.send_message(call.message.chat.id, f"✅ **Pix Gerado!**\n\n`{pix}`", parse_mode="Markdown")
 
-# --- MOTOR COM CAMUFLAGEM PARA INSTAGRAM/PINTEREST ---
+# --- MOTOR DE DOWNLOAD ANTIBLOQUEIO ---
 @bot.message_handler(func=lambda message: "http" in message.text)
 def handle_dl(message):
     dados = carregar_dados()
@@ -103,31 +102,30 @@ def handle_dl(message):
     if not is_vip(user_id, dados) and user["downloads_hoje"] >= 5:
         return bot.reply_to(message, "🚫 Limite diário atingido!")
 
-    msg = bot.reply_to(message, "⏳ **Processando...**")
+    msg = bot.reply_to(message, "⏳ **Baixando...**")
     file_id = f"vid_{message.message_id}"
     
-    # OPÇÕES TURBINADAS: Adicionamos headers e forçamos o formato mp4 direto
+    # O SEGREDO ESTÁ AQUI: Headers mais potentes para enganar o Instagram/Pinterest
     ydl_opts = {
-        'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+        'format': 'best',
         'outtmpl': f'{file_id}.%(ext)s',
         'quiet': True,
         'no_warnings': True,
-        'user_agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Mobile/15E148 Safari/604.1',
-        'referer': 'https://www.instagram.com/',
         'nocheckcertificate': True,
-        'geo_bypass': True,
+        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'add_header': [
+            'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language: en-us,en;q=0.5',
+            'Sec-Fetch-Mode: navigate',
+        ],
     }
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            # Tenta extrair a URL direta antes de baixar para evitar erros de conexão
             info = ydl.extract_info(message.text, download=True)
-            tamanho = info.get('filesize') or info.get('filesize_approx', 0)
-            
-            if tamanho > LIMITE_MB:
-                return bot.edit_message_text(f"❌ Vídeo muito grande.", message.chat.id, msg.message_id)
-
             files = glob.glob(f"{file_id}.*")
-            if not files: raise Exception("Arquivo não encontrado")
+            if not files: raise Exception("Download failed")
             actual_file = files[0]
 
             with open(actual_file, 'rb') as f:
@@ -139,8 +137,8 @@ def handle_dl(message):
                 user["downloads_hoje"] += 1
                 salvar_dados(dados)
     except Exception as e:
-        print(f"Erro: {e}")
-        bot.edit_message_text("❌ Link instável. Tente novamente em instantes.", message.chat.id, msg.message_id)
+        print(f"Erro detalhado: {e}")
+        bot.edit_message_text("❌ Erro: Link privado, inválido ou instabilidade na rede social.", message.chat.id, msg.message_id)
 
 if __name__ == "__main__":
     Thread(target=lambda: app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))).start()
