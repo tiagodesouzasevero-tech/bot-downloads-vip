@@ -65,13 +65,18 @@ def webhook():
                 dias = res["metadata"]["dias"]
                 dados = carregar_dados()
                 user = obter_usuario(user_id, dados)
-                nova_data = datetime.now() + timedelta(days=int(dias))
-                user["vip_ate"] = "Vitalício" if int(dias) > 1000 else nova_data.strftime('%Y-%m-%d')
+                
+                if int(dias) >= 3650:
+                    user["vip_ate"] = "Vitalício"
+                else:
+                    nova_data = datetime.now() + timedelta(days=int(dias))
+                    user["vip_ate"] = nova_data.strftime('%Y-%m-%d')
+                
                 salvar_dados(dados)
-                bot.send_message(user_id, "✅ **VIP ATIVADO COM SUCESSO!**")
+                bot.send_message(user_id, "💎 **PAGAMENTO APROVADO!** Seu VIP foi liberado.")
     return "", 200
 
-# --- COMANDO ADM (ID DO TIAGO ATUALIZADO) ---
+# --- COMANDO ADM (ID DO TIAGO: 493336271) ---
 @bot.message_handler(commands=['meuadm'])
 def cmd_adm(message):
     if str(message.from_user.id) == "493336271":
@@ -81,9 +86,9 @@ def cmd_adm(message):
         salvar_dados(dados)
         bot.reply_to(message, "👑 **Acesso Vitalício Ativado, Tiago!**")
     else:
-        bot.reply_to(message, "❌ Você não tem permissão para este comando.")
+        bot.reply_to(message, "❌ Comando restrito ao proprietário.")
 
-# --- PLANOS E START ---
+# --- COMANDOS DE PLANOS ---
 @bot.message_handler(commands=['start', 'planos'])
 def cmd_planos(message):
     dados = carregar_dados()
@@ -98,16 +103,19 @@ def cmd_planos(message):
 
     vip = is_vip(user_id, dados)
     status = "💎 VIP" if vip else "🆓 Gratuito"
+    vencimento = user["vip_ate"] if user["vip_ate"] else "Sem plano"
     limite = "∞" if vip else (5 - user["downloads_hoje"])
     
     texto = (f"👏 **Downloader VIP**\n\n"
              f"📊 Status: {status}\n"
+             f"📅 Expira em: {vencimento}\n"
              f"💡 Restante hoje: {limite}")
     
     markup = types.InlineKeyboardMarkup(row_width=1)
     markup.add(
         types.InlineKeyboardButton("💳 Mensal - R$10,00", callback_data="buy_10.0_30"),
-        types.InlineKeyboardButton("🌟 Vitalício - R$1.900,00", callback_data="buy_1900.0_3650")
+        types.InlineKeyboardButton("🌟 Anual - R$69,90", callback_data="buy_69.9_365"),
+        types.InlineKeyboardButton("💎 Vitalício - R$1.900,00", callback_data="buy_1900.0_3650")
     )
     bot.send_message(message.chat.id, texto, reply_markup=markup, parse_mode="Markdown")
 
@@ -118,7 +126,7 @@ def handle_pay(call):
     
     pay_data = {
         "transaction_amount": float(valor),
-        "description": f"Plano {dias} dias",
+        "description": f"Plano {dias} dias - Downloader",
         "payment_method_id": "pix",
         "external_reference": str(call.from_user.id),
         "metadata": {"dias": dias},
@@ -129,8 +137,10 @@ def handle_pay(call):
     if "response" in res and "point_of_interaction" in res["response"]:
         pix = res["response"]["point_of_interaction"]["transaction_data"]["qr_code"]
         bot.send_message(call.message.chat.id, f"✅ **Pix Gerado!**\n\n`{pix}`", parse_mode="Markdown")
+    else:
+        bot.send_message(call.message.chat.id, "❌ Erro ao gerar Pix. Tente novamente.")
 
-# --- DOWNLOADER ---
+# --- SISTEMA DE DOWNLOAD ---
 @bot.message_handler(func=lambda message: "http" in message.text)
 def handle_dl(message):
     dados = carregar_dados()
@@ -143,20 +153,26 @@ def handle_dl(message):
 
     msg = bot.reply_to(message, "⏳ **Baixando vídeo...**")
     try:
-        with yt_dlp.YoutubeDL({'format': 'best', 'outtmpl': 'v_%(id)s.%(ext)s'}) as ydl:
+        # Opções básicas para download
+        ydl_opts = {'format': 'best', 'outtmpl': 'v_%(id)s.%(ext)s', 'quiet': True}
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(message.text, download=True)
             path = ydl.prepare_filename(info)
             
-            if not is_vip(user_id, dados): user["downloads_hoje"] += 1
+            if not is_vip(user_id, dados):
+                user["downloads_hoje"] += 1
             salvar_dados(dados)
             
             with open(path, 'rb') as f:
-                bot.send_video(message.chat.id, f)
+                bot.send_video(message.chat.id, f, caption="✅ Vídeo baixado!")
+            
             os.remove(path)
             bot.delete_message(message.chat.id, msg.message_id)
-    except:
-        bot.edit_message_text("❌ Erro. Link inválido ou vídeo privado.", message.chat.id, msg.message_id)
+    except Exception as e:
+        bot.edit_message_text(f"❌ Erro: Link inválido ou instabilidade no servidor.", message.chat.id, msg.message_id)
 
 if __name__ == "__main__":
-    Thread(target=lambda: app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))).start()
+    # Flask para Webhook em porta dinâmica da Railway
+    port = int(os.environ.get("PORT", 8080))
+    Thread(target=lambda: app.run(host="0.0.0.0", port=port, use_reloader=False)).start()
     bot.infinity_polling()
