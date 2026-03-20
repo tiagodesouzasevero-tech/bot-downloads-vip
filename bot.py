@@ -10,7 +10,6 @@ from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 # --- CONFIGURAÇÕES ---
 TOKEN_TELEGRAM = "8629536333:AAGRHgdQYnkSagKtj2wq5jAaBi-bBsCnhBY"
-# Seu Token de produção revisado:
 TOKEN_MERCADO_PAGO = "APP_USR-8179041093511853-031916-7364f07318b6c464600a781433c743f7-384532659"
 
 bot = telebot.TeleBot(TOKEN_TELEGRAM)
@@ -36,21 +35,24 @@ def obter_dados(user_id):
     hoje = datetime.now().strftime("%Y-%m-%d")
     cursor.execute("SELECT plano, expira, downloads_hoje, ultima_data FROM users WHERE id = ?", (user_id,))
     user = cursor.fetchone()
+    
     if not user:
         cursor.execute("INSERT INTO users VALUES (?, 'Gratuito', 'Nunca', 0, ?)", (user_id, hoje))
         conn.commit()
         conn.close()
         return 'Gratuito', 0, 'Nunca'
+    
     if user[3] != hoje:
         cursor.execute("UPDATE users SET downloads_hoje = 0, ultima_data = ? WHERE id = ?", (hoje, user_id))
         conn.commit()
         conn.close()
         return user[0], 0, user[1]
+        
     conn.close()
     return user[0], user[2], user[1]
 
-# --- MENU DE PLANOS ---
-@bot.message_handler(commands=['planos', 'start'])
+# --- MENUS E PAGAMENTOS ---
+@bot.message_handler(commands=['start', 'planos'])
 def menu_principal(message):
     plano, downloads, _ = obter_dados(message.from_user.id)
     restantes = 5 - downloads if plano == 'Gratuito' else "Ilimitado"
@@ -60,54 +62,66 @@ def menu_principal(message):
     markup.add(InlineKeyboardButton("🌟 Anual - R$69,90", callback_data="buy_69"))
     markup.add(InlineKeyboardButton("💎 Vitalício - R$1.900,00", callback_data="buy_1900"))
     
-    texto = (f"👋 **Bot de Downloads VIP**\n\n📊 Plano: **{plano}**\n💡 Saldo: **{restantes}** downloads gratuitos hoje.\n\n"
-             "Escolha um plano para liberar acesso ilimitado:")
+    texto = (f"👋 **Bot de Downloads VIP**\n\n📊 Plano: **{plano}**\n💡 Saldo: **{restantes}** downloads hoje.\n\n"
+             "Escolha um plano para baixar sem limites:")
     bot.send_message(message.chat.id, texto, reply_markup=markup, parse_mode="Markdown")
 
-# --- PROCESSAMENTO DO PIX ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith("buy_"))
-def gerar_pix(call):
-    # CORREÇÃO: Isso aqui remove o carregamento infinito do botão imediatamente
-    bot.answer_callback_query(call.id, "Gerando código PIX...")
-    
+def gerar_pagamento(call):
+    bot.answer_callback_query(call.id, "Gerando PIX...")
     precos = {"buy_10": 10.0, "buy_69": 69.9, "buy_1900": 1900.0}
+    plano_nome = {"buy_10": "Mensal", "buy_69": "Anual", "buy_1900": "Vitalício"}[call.data]
     valor = precos[call.data]
     
     payment_data = {
         "transaction_amount": valor,
-        "description": f"Plano VIP Usuário {call.from_user.id}",
+        "description": f"Plano {plano_nome}",
         "payment_method_id": "pix",
-        "payer": {"email": "cliente@pagamento.com"}
+        "payer": {"email": "contato@tiago.com"}
     }
     
     try:
-        resultado = sdk.payment().create(payment_data)
-        pagamento = resultado["response"]
+        pagamento = sdk.payment().create(payment_data)
+        info = pagamento["response"]
+        pix_code = info['point_of_interaction']['transaction_data']['qr_code']
+        pay_id = info['id']
         
-        # Pega o código copia e cola
-        pix_copia_e_cola = pagamento['point_of_interaction']['transaction_data']['qr_code']
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("✅ Verificar Pagamento", callback_data=f"check_{pay_id}_{plano_nome}"))
         
-        msg = (f"✅ **PIX Gerado com Sucesso!**\n\n"
-               f"💰 Valor: R${valor:.2f}\n\n"
-               f"Copia e cola abaixo:\n\n`{pix_copia_e_cola}`\n\n"
-               f"💡 O acesso é liberado assim que o pagamento for confirmado.")
+        bot.send_message(call.message.chat.id, f"⚠️ **PIX de R${valor:.2f} Gerado!**\n\nCopia e cola:\n`{pix_code}`", reply_markup=markup, parse_mode="Markdown")
+    except:
+        bot.send_message(call.message.chat.id, "❌ Erro ao conectar com Mercado Pago.")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("check_"))
+def validar_pix(call):
+    _, pay_id, plano_nome = call.data.split("_")
+    res = sdk.payment().get(pay_id)
+    if res["response"]["status"] == "approved":
+        dias = {"Mensal": 30, "Anual": 365, "Vitalício": 99999}[plano_nome]
+        expira = (datetime.now() + timedelta(days=dias)).strftime("%Y-%m-%d")
         
-        bot.send_message(call.message.chat.id, msg, parse_mode="Markdown")
-    except Exception as e:
-        bot.send_message(call.message.chat.id, "❌ Erro ao gerar PIX. Verifique se o Token está ativo no Mercado Pago.")
+        conn = sqlite3.connect('usuarios.db')
+        cursor = conn.cursor()
+        cursor.execute("UPDATE users SET plano = ?, expira = ? WHERE id = ?", (plano_nome, expira, call.from_user.id))
+        conn.commit()
+        conn.close()
+        bot.edit_message_text(f"✅ **Plano {plano_nome} ativado!** Expira em: {expira}", call.message.chat.id, call.message.id)
+    else:
+        bot.answer_callback_query(call.id, "❌ Pagamento ainda não aprovado.", show_alert=True)
 
 # --- MOTOR DE DOWNLOAD ---
 @bot.message_handler(func=lambda message: True)
-def handle_download(message):
+def baixar(message):
     plano, downloads, _ = obter_dados(message.from_user.id)
     url = message.text
     
     if "http" in url:
         if plano == 'Gratuito' and downloads >= 5:
-            bot.reply_to(message, "🚫 Limite diário atingido! Digite /planos para assinar.")
+            bot.reply_to(message, "🚫 Limite diário atingido! Use /planos.")
             return
 
-        wait = bot.reply_to(message, "⚡ Processando... aguarde.")
+        msg_wait = bot.reply_to(message, "⏳ Baixando vídeo...")
         file_name = f"dl_{message.from_user.id}.mp4"
         
         ydl_opts = {
@@ -115,14 +129,14 @@ def handle_download(message):
             'outtmpl': file_name,
             'quiet': True,
             'user_agent': random.choice(USER_AGENTS),
-            'referer': 'https://www.google.com/'
+            'nocheckcertificate': True
         }
 
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.download([url])
-            with open(file_name, 'rb') as vid:
-                bot.send_video(message.chat.id, vid)
+            with open(file_name, 'rb') as video:
+                bot.send_video(message.chat.id, video)
             
             if plano == 'Gratuito':
                 conn = sqlite3.connect('usuarios.db')
@@ -132,9 +146,9 @@ def handle_download(message):
                 conn.close()
             
             os.remove(file_name)
-            bot.delete_message(message.chat.id, wait.message_id)
+            bot.delete_message(message.chat.id, msg_wait.message_id)
         except:
-            bot.edit_message_text("❌ Erro ao baixar vídeo. Verifique o link.", message.chat.id, wait.message_id)
+            bot.edit_message_text("❌ Erro ao baixar. Tente outro link.", message.chat.id, msg_wait.message_id)
             if os.path.exists(file_name): os.remove(file_name)
 
 if __name__ == "__main__":
