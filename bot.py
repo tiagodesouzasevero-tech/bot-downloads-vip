@@ -1,4 +1,4 @@
-import os, telebot, yt_dlp, mercadopago, json, glob, instaloader
+import os, telebot, yt_dlp, mercadopago, json, glob
 from datetime import datetime, timedelta
 from telebot import types
 from flask import Flask, request
@@ -13,7 +13,6 @@ MY_ID = "493336271"
 bot = telebot.TeleBot(TOKEN_TELEGRAM, threaded=False)
 sdk = mercadopago.SDK(MP_ACCESS_TOKEN)
 app = Flask(__name__)
-L = instaloader.Instaloader()
 
 # --- SISTEMA DE DADOS ---
 def carregar_dados():
@@ -60,19 +59,10 @@ def cmd_start(message):
     vip = is_vip(message.from_user.id, dados)
     status = "💎 VIP" if vip else "🆓 Gratuito"
     restantes = "∞" if vip else (5 - user['downloads_hoje'])
-    texto = f"👏 **Bem-vindo ao Downloader!**\n\n📊 Status: {status}\n💡 Restantes hoje: {restantes}"
+    texto = f"👏 **Bem-vindo ao Downloader!**\n(TikTok, Pinterest e Rednote)\n\n📊 Status: {status}\n💡 Restantes hoje: {restantes}"
     enviar_menu_planos(message.chat.id, texto)
 
-@bot.message_handler(commands=['meuadm'])
-def cmd_adm(message):
-    if str(message.from_user.id) == MY_ID:
-        dados = carregar_dados()
-        user = obter_usuario(MY_ID, dados)
-        user["vip_ate"] = "Vitalício"
-        salvar_dados(dados)
-        bot.reply_to(message, "👑 **Acesso Vitalício Ativado!**")
-
-# --- MOTOR DE DOWNLOAD ---
+# --- MOTOR DE DOWNLOAD (FOCO: TIKTOK, PINTEREST, REDNOTE) ---
 @bot.message_handler(func=lambda message: "http" in message.text and not message.text.startswith('/'))
 def handle_dl(message):
     if message.from_user.is_bot or "baixado hoje" in message.text:
@@ -86,52 +76,43 @@ def handle_dl(message):
     if not vip and user["downloads_hoje"] >= 5:
         return enviar_menu_planos(message.chat.id, "🚫 **Limite diário atingido!**")
 
-    msg = bot.reply_to(message, "⏳ **Processando...**")
-    
-    try:
-        url = [word for word in message.text.split() if word.startswith("http")][0]
-    except:
-        bot.delete_message(message.chat.id, msg.message_id)
-        return
-
+    msg = bot.reply_to(message, "⏳ **Processando mídia...**")
+    url = message.text.split()[0]
     file_id = f"vid_{message.message_id}"
     sucesso = False
 
     try:
-        if "instagram.com" in url:
-            clean_url = url.split('?')[0].rstrip('/')
-            shortcode = clean_url.split("/")[-1]
-            post = instaloader.Post.from_shortcode(L.context, shortcode)
-            bot.send_video(message.chat.id, post.video_url, caption="✅ @Tss_Downloader_bot")
-            sucesso = True
-        else:
-            ydl_opts = {'format': 'best', 'outtmpl': f'{file_id}.%(ext)s', 'quiet': True}
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([url])
-                files = glob.glob(f"{file_id}.*")
-                if files:
-                    with open(files[0], 'rb') as f:
-                        bot.send_video(message.chat.id, f, caption="✅ @Tss_Downloader_bot")
-                    os.remove(files[0])
-                    sucesso = True
+        # Configuração universal para as 3 redes
+        ydl_opts = {
+            'format': 'best',
+            'outtmpl': f'{file_id}.%(ext)s',
+            'quiet': True,
+            'nocheckcertificate': True,
+            'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/110.0.0.0 Safari/537.36'
+        }
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+            files = glob.glob(f"{file_id}.*")
+            if files:
+                with open(files[0], 'rb') as f:
+                    bot.send_video(message.chat.id, f, caption="✅ @Tss_Downloader_bot")
+                os.remove(files[0])
+                sucesso = True
 
         if sucesso:
             bot.delete_message(message.chat.id, msg.message_id)
             if not vip:
                 user["downloads_hoje"] += 1
                 salvar_dados(dados)
-                
                 if user["downloads_hoje"] >= 5:
-                    enviar_menu_planos(message.chat.id, "📊 **Vídeo 5 de 5 baixado hoje!**\n\nAproveite sua última mídia gratuita do dia.")
+                    enviar_menu_planos(message.chat.id, "📊 **Vídeo 5 de 5 baixado hoje!**")
                 else:
                     bot.send_message(message.chat.id, f"📊 **Vídeo {user['downloads_hoje']} de 5 baixado hoje!**")
-        else:
-            bot.edit_message_text("❌ Link instável ou privado.", message.chat.id, msg.message_id)
+    except:
+        bot.edit_message_text("❌ Não consegui baixar desse link.", message.chat.id, msg.message_id)
 
-    except Exception as e:
-        bot.edit_message_text("❌ Erro ao processar. Tente outro link.", message.chat.id, msg.message_id)
-
-# --- PAGAMENTOS E WEBHOOK ---
+# --- COMANDOS ADM E PAGAMENTO ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith("buy_"))
 def handle_pay(call):
     _, valor, dias = call.data.split("_")
@@ -144,22 +125,14 @@ def handle_pay(call):
         pix = res["response"]["point_of_interaction"]["transaction_data"]["qr_code"]
         bot.send_message(call.message.chat.id, f"✅ **Pix Gerado!**\n\n`{pix}`", parse_mode="Markdown")
 
-@app.route("/webhook", methods=['POST'])
-def webhook():
-    data = request.json
-    if data and data.get("type") == "payment":
-        payment_info = sdk.payment().get(data.get("data", {}).get("id"))
-        if payment_info["status"] in [200, 201]:
-            res = payment_info["response"]
-            if res["status"] == "approved":
-                user_id = res["external_reference"]
-                dias = int(res["metadata"]["dias"])
-                dados = carregar_dados()
-                user = obter_usuario(user_id, dados)
-                user["vip_ate"] = "Vitalício" if dias >= 3650 else (datetime.now() + timedelta(days=dias)).strftime('%Y-%m-%d')
-                salvar_dados(dados)
-                bot.send_message(user_id, "💎 **VIP ATIVADO!**")
-    return "", 200
+@bot.message_handler(commands=['meuadm'])
+def cmd_adm(message):
+    if str(message.from_user.id) == MY_ID:
+        dados = carregar_dados()
+        user = obter_usuario(MY_ID, dados)
+        user["vip_ate"] = "Vitalício"
+        salvar_dados(dados)
+        bot.reply_to(message, "👑 **Acesso Vitalício Ativado!**")
 
 if __name__ == "__main__":
     Thread(target=lambda: app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))).start()
