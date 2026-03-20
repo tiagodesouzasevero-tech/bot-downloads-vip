@@ -15,7 +15,7 @@ sdk = mercadopago.SDK(TOKEN_MERCADO_PAGO)
 
 # --- BANCO DE DADOS ---
 def init_db():
-    conn = sqlite3.connect('usuarios.db', check_same_thread=False)
+    conn = sqlite3.connect('usuarios.db', check_same_thread=False, timeout=20)
     cursor = conn.cursor()
     cursor.execute('''CREATE TABLE IF NOT EXISTS users 
                       (id INTEGER PRIMARY KEY, plano TEXT, expira TEXT, downloads_hoje INTEGER, ultima_data TEXT)''')
@@ -23,7 +23,7 @@ def init_db():
     conn.close()
 
 def obter_dados(user_id):
-    conn = sqlite3.connect('usuarios.db', check_same_thread=False)
+    conn = sqlite3.connect('usuarios.db', check_same_thread=False, timeout=20)
     cursor = conn.cursor()
     hoje = datetime.now()
     data_hoje = hoje.strftime("%Y-%m-%d")
@@ -33,13 +33,16 @@ def obter_dados(user_id):
     if not user:
         cursor.execute("INSERT INTO users VALUES (?, 'Gratuito', 'Nunca', 0, ?)", (user_id, data_hoje))
         conn.commit()
+        conn.close()
         return 'Gratuito', 0, 'Nunca'
     
     if user[3] != data_hoje:
         cursor.execute("UPDATE users SET downloads_hoje = 0, ultima_data = ? WHERE id = ?", (data_hoje, user_id))
         conn.commit()
+        conn.close()
         return user[0], 0, user[1]
         
+    conn.close()
     return user[0], user[2], user[1]
 
 # --- MENSAGENS E PAGAMENTO ---
@@ -92,16 +95,16 @@ def validar_pix(call):
         dias = {"Mensal": 30, "Anual": 365, "Vitalício": 99999}[plano_nome]
         expira = (datetime.now() + timedelta(days=dias)).strftime("%Y-%m-%d")
         
-        conn = sqlite3.connect('usuarios.db', check_same_thread=False)
+        conn = sqlite3.connect('usuarios.db', check_same_thread=False, timeout=20)
         cursor = conn.cursor()
         cursor.execute("UPDATE users SET plano = ?, expira = ? WHERE id = ?", (plano_nome, expira, call.from_user.id))
         conn.commit()
         conn.close()
-        bot.edit_message_text(f"✅ **PAGAMENTO CONFIRMADO!**\nPlano {plano_nome} ativado com sucesso!", call.message.chat.id, call.message.id)
+        bot.edit_message_text(f"✅ **PAGAMENTO CONFIRMADO!**\nPlano {plano_nome} ativado!", call.message.chat.id, call.message.id)
     else:
         bot.answer_callback_query(call.id, "❌ Pagamento não detectado ainda.", show_alert=True)
 
-# --- DOWNLOAD (ESTÁVEL) ---
+# --- DOWNLOAD REFORÇADO ---
 @bot.message_handler(func=lambda message: True)
 def baixar(message):
     plano, downloads, _ = obter_dados(message.from_user.id)
@@ -113,7 +116,7 @@ def baixar(message):
             bot.reply_to(message, "🚫 Limite de 5 downloads atingido! Use /planos.")
             return
 
-        msg_wait = bot.reply_to(message, "⚡ Baixando seu vídeo, aguarde um instante...")
+        msg_wait = bot.reply_to(message, "⚡ Baixando vídeo, aguarde...")
         file_name = f"video_{message.from_user.id}.mp4"
         
         ydl_opts = {
@@ -122,6 +125,7 @@ def baixar(message):
             'quiet': True,
             'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
             'referer': 'https://www.google.com/',
+            'nocheckcertificate': True,
         }
 
         try:
@@ -131,17 +135,17 @@ def baixar(message):
                 bot.send_video(message.chat.id, video)
             
             if plano == 'Gratuito':
-                conn = sqlite3.connect('usuarios.db', check_same_thread=False)
+                conn = sqlite3.connect('usuarios.db', check_same_thread=False, timeout=20)
                 cursor = conn.cursor()
                 cursor.execute("UPDATE users SET downloads_hoje = downloads_hoje + 1 WHERE id = ?", (message.from_user.id,))
                 conn.commit()
                 conn.close()
-                bot.send_message(message.chat.id, f"✅ Restam **{4 - downloads}** downloads gratuitos hoje.")
+                bot.send_message(message.chat.id, f"✅ Restam **{4 - downloads}** downloads grátis hoje.")
             
             os.remove(file_name)
             bot.delete_message(message.chat.id, msg_wait.message_id)
         except:
-            bot.edit_message_text("❌ Erro. Link privado ou instável.", message.chat.id, msg_wait.message_id)
+            bot.edit_message_text("❌ Erro ao baixar. Tente enviar o link novamente.", message.chat.id, msg_wait.message_id)
             if os.path.exists(file_name): os.remove(file_name)
 
 if __name__ == "__main__":
