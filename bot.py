@@ -17,7 +17,7 @@ def init_db():
     conn.commit()
     conn.close()
 
-def verificar_limite(user_id):
+def obter_dados_utilizador(user_id):
     conn = sqlite3.connect('usuarios.db', check_same_thread=False)
     cursor = conn.cursor()
     hoje = datetime.now().strftime("%Y-%m-%d")
@@ -28,22 +28,14 @@ def verificar_limite(user_id):
     if not user:
         cursor.execute("INSERT INTO users VALUES (?, 'Gratuito', 0, ?)", (user_id, hoje))
         conn.commit()
-        conn.close()
-        return True # Liberado (novo usuário)
-
-    plano, downloads, ultima_data = user
-
-    # Reset diário se mudou o dia
-    if ultima_data != hoje:
+        user = ('Gratuito', 0, hoje)
+    elif user[2] != hoje:
         cursor.execute("UPDATE users SET downloads_hoje = 0, ultima_data = ? WHERE id = ?", (hoje, user_id))
         conn.commit()
-        downloads = 0
-
-    conn.close()
+        user = (user[0], 0, hoje)
     
-    if plano != 'Gratuito': return True # VIP não tem limite
-    if downloads < 5: return True # Grátis ainda tem saldo
-    return False # Bloqueado
+    conn.close()
+    return user
 
 def registrar_download(user_id):
     conn = sqlite3.connect('usuarios.db', check_same_thread=False)
@@ -55,24 +47,27 @@ def registrar_download(user_id):
 # --- COMANDOS ---
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
-    bot.reply_to(message, "👋 Bem-vindo ao Bot de Downloads!\nBaixe vídeos do Instagram, Pinterest, TikTok ou Rednote.\n\n💡 Você tem 5 downloads grátis por dia.")
+    plano, downloads, _ = obter_dados_utilizador(message.from_user.id)
+    restantes = 5 - downloads if plano == 'Gratuito' else "Ilimitado"
+    bot.reply_to(message, f"👋 **Bem-vindo ao Bot de Downloads!**\n\n📥 Envie links do Instagram, Pinterest, TikTok ou Rednote.\n\n💡 Seu saldo: **{restantes}** downloads grátis hoje.")
 
 @bot.message_handler(func=lambda message: True)
 def download_video(message):
     url = message.text
     user_id = message.from_user.id
+    plano, downloads, _ = obter_dados_utilizador(user_id)
+    
     sites = ["instagram.com", "tiktok.com", "pin.it", "pinterest.com", "rednote", "xiaohongshu"]
     
     if any(site in url for site in sites):
-        # TESTA O LIMITE ANTES DE TUDO
-        if not verificar_limite(user_id):
-            bot.reply_to(message, "🚫 Você atingiu seu limite de 5 downloads hoje!\nPara baixar sem limites, assine o Premium.")
+        # TESTA O LIMITE
+        if plano == 'Gratuito' and downloads >= 5:
+            bot.reply_to(message, "🚫 **Limite atingido!**\nVocê já usou os seus 5 downloads de hoje.\n\n🔥 Assine o Premium para ter acesso ilimitado!")
             return
 
         msg = bot.reply_to(message, "⚡ Baixando seu vídeo, aguarde um instante...")
         file_name = f"video_{user_id}.mp4"
         
-        # SUA CONFIGURAÇÃO QUE JÁ FUNCIONA (NÃO MEXI)
         ydl_opts = {
             'format': 'best',
             'outtmpl': file_name,
@@ -89,15 +84,23 @@ def download_video(message):
             if os.path.exists(file_name):
                 with open(file_name, 'rb') as video:
                     bot.send_video(message.chat.id, video)
+                
                 os.remove(file_name)
-                registrar_download(user_id) # SOMA +1 NO CONTADOR
+                registrar_download(user_id)
                 bot.delete_message(message.chat.id, msg.message_id)
+                
+                # MENSAGEM DE CONTAGEM APÓS O DOWNLOAD
+                novos_dados = obter_dados_utilizador(user_id)
+                restantes = 5 - novos_dados[1]
+                if plano == 'Gratuito':
+                    bot.send_message(message.chat.id, f"✅ Vídeo entregue! Restam **{restantes}** downloads gratuitos hoje.")
+            
             else:
-                bot.edit_message_text("❌ Erro ao baixar conteúdo.", message.chat.id, msg.message_id)
+                bot.edit_message_text("❌ Erro ao processar link.", message.chat.id, msg.message_id)
         except Exception:
-            bot.edit_message_text("❌ Link indisponível.", message.chat.id, msg.message_id)
+            bot.edit_message_text("❌ Link indisponível ou privado.", message.chat.id, msg.message_id)
             if os.path.exists(file_name): os.remove(file_name)
 
 if __name__ == "__main__":
-    init_db() # INICIA O BANCO
+    init_db()
     bot.infinity_polling()
