@@ -62,7 +62,7 @@ def cmd_start(message):
     texto = f"👏 **Bem-vindo ao Downloader!**\n(TikTok, Pinterest e Rednote)\n\n📊 Status: {status}\n💡 Restantes hoje: {restantes}"
     enviar_menu_planos(message.chat.id, texto)
 
-# --- MOTOR DE DOWNLOAD (MELHORADO PARA PINTEREST) ---
+# --- MOTOR DE DOWNLOAD (CORREÇÃO PINTEREST) ---
 @bot.message_handler(func=lambda message: "http" in message.text and not message.text.startswith('/'))
 def handle_dl(message):
     if message.from_user.is_bot or "baixado hoje" in message.text:
@@ -88,23 +88,19 @@ def handle_dl(message):
 
     try:
         ydl_opts = {
-            'format': 'best',
+            'format': 'bestvideo+bestaudio/best',
             'outtmpl': f'{file_id}.%(ext)s',
             'quiet': True,
             'no_warnings': True,
             'nocheckcertificate': True,
-            'ignoreerrors': False,
-            'logtostderr': False,
-            'add_header': [
-                'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-                'Accept-Language: pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
-            ]
+            'http_headers': {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+                'Referer': 'https://www.pinterest.com/',
+            }
         }
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            # Tenta resolver o link encurtador antes de baixar
-            info = ydl.extract_info(url, download=True)
+            ydl.extract_info(url, download=True)
             files = glob.glob(f"{file_id}.*")
             if files:
                 with open(files[0], 'rb') as f:
@@ -122,11 +118,10 @@ def handle_dl(message):
                 else:
                     bot.send_message(message.chat.id, f"📊 **Vídeo {user['downloads_hoje']} de 5 baixado hoje!**")
         else:
-            bot.edit_message_text("❌ Não consegui extrair o vídeo deste link.", message.chat.id, msg.message_id)
+            bot.edit_message_text("❌ Falha na extração. Tente outro link.", message.chat.id, msg.message_id)
 
     except Exception as e:
-        print(f"Erro: {e}")
-        bot.edit_message_text("❌ Link instável ou não suportado (Pinterest/TikTok/Rednote apenas).", message.chat.id, msg.message_id)
+        bot.edit_message_text("❌ Link instável ou não suportado.", message.chat.id, msg.message_id)
 
 # --- PAGAMENTOS E ADM ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith("buy_"))
@@ -153,4 +148,5 @@ def cmd_adm(message):
 if __name__ == "__main__":
     Thread(target=lambda: app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))).start()
     bot.remove_webhook()
+    # skip_pending=True ignora mensagens antigas ao ligar, evitando duplicar lixo do log
     bot.infinity_polling(timeout=20, skip_pending=True)
