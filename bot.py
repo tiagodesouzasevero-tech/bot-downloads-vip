@@ -46,7 +46,7 @@ def gerar_pix(valor, descricao, user_id, plano):
         "description": descricao,
         "payment_method_id": "pix",
         "payer": {"email": f"user_{user_id}@bot.com"},
-        "external_reference": f"{user_id}:{plano}" # Vincula ID e Plano ao pagamento
+        "external_reference": f"{user_id}:{plano}"
     }
     result = sdk.payment().create(payment_data)
     if result["status"] == 201:
@@ -55,6 +55,8 @@ def gerar_pix(valor, descricao, user_id, plano):
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
+    # O Mercado Pago envia notificações para vários eventos. 
+    # Filtramos apenas para quando um PAGAMENTO for atualizado.
     if request.args.get("type") == "payment":
         payment_id = request.args.get("data.id")
         payment_info = sdk.payment().get(payment_id)
@@ -64,21 +66,24 @@ def webhook():
             user_id, plano = ref.split(":")
             
             dados = carregar_dados()
-            user = obter_usuario(user_id, dados)
-            hoje = datetime.now()
-
-            # Lógica de ativação conforme o plano
-            if plano == "Mensal":
-                nova_data = (hoje + timedelta(days=30)).strftime('%Y-%m-%d')
-            elif plano == "Anual":
-                nova_data = (hoje + timedelta(days=365)).strftime('%Y-%m-%d')
-            else: # Vitalício
-                nova_data = "Vitalício"
-
-            user["vip_ate"] = nova_data
-            salvar_dados(dados)
             
-            bot.send_message(user_id, f"✅ **Pagamento Confirmado!**\n\nSeu plano **{plano}** foi ativado com sucesso. Agora você é um usuário **VIP**!\n\nAproveite os downloads ilimitados! 🚀")
+            # --- TRAVA ANTI-REPETIÇÃO ---
+            # Se o usuário já for VIP, ignoramos a segunda notificação de 'approved'
+            if not is_vip(user_id, dados):
+                user = obter_usuario(user_id, dados)
+                hoje = datetime.now()
+
+                if plano == "Mensal":
+                    nova_data = (hoje + timedelta(days=30)).strftime('%Y-%m-%d')
+                elif plano == "Anual":
+                    nova_data = (hoje + timedelta(days=365)).strftime('%Y-%m-%d')
+                else: # Vitalício
+                    nova_data = "Vitalício"
+
+                user["vip_ate"] = nova_data
+                salvar_dados(dados)
+                
+                bot.send_message(user_id, f"✅ **Pagamento Confirmado!**\n\nSeu plano **{plano}** foi ativado com sucesso. Agora você é um usuário **VIP**!\n\nAproveite os downloads ilimitados! 🚀")
             
     return "OK", 200
 
@@ -146,7 +151,6 @@ def handle_dl(message):
     user = obter_usuario(message.from_user.id, dados)
     vip = is_vip(message.from_user.id, dados)
     
-    # Reset diário de downloads
     hoje = datetime.now().strftime('%Y-%m-%d')
     if user["ultima_data"] != hoje:
         user["downloads_hoje"] = 0
