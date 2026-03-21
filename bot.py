@@ -39,7 +39,20 @@ def is_vip(user_id, dados):
         return datetime.now() < datetime.strptime(user["vip_ate"], '%Y-%m-%d')
     except: return False
 
-# --- MERCADO PAGO (PIX + WEBHOOK) ---
+# --- MENUS PROFISSIONAIS ---
+def menu_planos():
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("💳 Mensal - R$10,00", callback_data="buy_10_Mensal"))
+    markup.add(types.InlineKeyboardButton("🌟 Anual - R$69,90", callback_data="buy_69.9_Anual"))
+    markup.add(types.InlineKeyboardButton("💎 Vitalício - R$499,00", callback_data="buy_499_Vitalicio"))
+    return markup
+
+def menu_vip_ativo():
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("🛠️ Falar com Suporte", url=f"https://t.me/{SUPORTE_USER[1:]}"))
+    return markup
+
+# --- MERCADO PAGO E WEBHOOK ---
 def gerar_pix(valor, descricao, user_id, plano):
     payment_data = {
         "transaction_amount": float(valor),
@@ -55,149 +68,110 @@ def gerar_pix(valor, descricao, user_id, plano):
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    # O Mercado Pago envia notificações para vários eventos. 
-    # Filtramos apenas para quando um PAGAMENTO for atualizado.
     if request.args.get("type") == "payment":
         payment_id = request.args.get("data.id")
         payment_info = sdk.payment().get(payment_id)
-        
         if payment_info["response"]["status"] == "approved":
             ref = payment_info["response"]["external_reference"]
             user_id, plano = ref.split(":")
-            
             dados = carregar_dados()
-            
-            # --- TRAVA ANTI-REPETIÇÃO ---
-            # Se o usuário já for VIP, ignoramos a segunda notificação de 'approved'
             if not is_vip(user_id, dados):
                 user = obter_usuario(user_id, dados)
                 hoje = datetime.now()
-
-                if plano == "Mensal":
-                    nova_data = (hoje + timedelta(days=30)).strftime('%Y-%m-%d')
-                elif plano == "Anual":
-                    nova_data = (hoje + timedelta(days=365)).strftime('%Y-%m-%d')
-                else: # Vitalício
-                    nova_data = "Vitalício"
-
+                if plano == "Mensal": nova_data = (hoje + timedelta(days=30)).strftime('%Y-%m-%d')
+                elif plano == "Anual": nova_data = (hoje + timedelta(days=365)).strftime('%Y-%m-%d')
+                else: nova_data = "Vitalício"
                 user["vip_ate"] = nova_data
                 salvar_dados(dados)
-                
-                bot.send_message(user_id, f"✅ **Pagamento Confirmado!**\n\nSeu plano **{plano}** foi ativado com sucesso. Agora você é um usuário **VIP**!\n\nAproveite os downloads ilimitados! 🚀")
-            
+                bot.send_message(user_id, f"🌟 **ACESSO LIBERADO!**\n\nSeu plano **{plano}** foi ativado com sucesso. Agora você tem acesso ilimitado às nossas ferramentas! 🚀", reply_markup=menu_vip_ativo())
     return "OK", 200
 
 @app.route('/')
 def health(): return "Bot Online", 200
 
-# --- MENUS ---
-def menu_planos():
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("💳 Mensal - R$10,00", callback_data="buy_10_Mensal"))
-    markup.add(types.InlineKeyboardButton("🌟 Anual - R$69,90", callback_data="buy_69.9_Anual"))
-    markup.add(types.InlineKeyboardButton("💎 Vitalício - R$499,00", callback_data="buy_499_Vitalicio"))
-    return markup
-
-# --- COMANDOS E CALLBACKS ---
-@bot.callback_query_handler(func=lambda call: call.data.startswith("buy_"))
-def handle_payment(call):
-    _, valor, plano = call.data.split("_")
-    bot.answer_callback_query(call.id, "Gerando PIX...")
-    pix = gerar_pix(valor, f"Plano {plano} - Bot VIP", call.from_user.id, plano)
-    
-    if pix:
-        texto = (
-            f"✅ **PIX Gerado com Sucesso!**\n\n"
-            f"📦 **Plano:** {plano}\n"
-            f"💰 **Valor:** R$ {valor}\n\n"
-            f"Copie o código abaixo e pague no seu banco:\n\n"
-            f"`{pix}`\n\n"
-            f"⚡ **A ativação é automática logo após o pagamento!**"
-        )
-        bot.send_message(call.message.chat.id, texto, parse_mode="Markdown")
-    else:
-        bot.send_message(call.message.chat.id, "❌ Erro ao gerar PIX. Tente novamente.")
-
-@bot.message_handler(commands=['start', 'planos'])
+# --- COMANDOS ---
+@bot.message_handler(commands=['start', 'perfil'])
 def cmd_start(message):
     dados = carregar_dados()
     user = obter_usuario(message.from_user.id, dados)
     vip = is_vip(message.from_user.id, dados)
     
-    status = "💎 VIP" if vip else "🆓 Gratuito"
-    restantes = "∞" if vip else (5 - user["downloads_hoje"])
-    
-    texto = (
-        f"👋 **Bem-vindo ao Downloader VIP!**\n\n"
-        f"📊 **Status:** {status}\n"
-        f"💡 **Downloads hoje:** {restantes}/5\n\n"
-        f"Escolha um plano abaixo para liberar acesso ilimitado:"
-    )
-    bot.reply_to(message, texto, reply_markup=menu_planos(), parse_mode="Markdown")
+    if vip:
+        if user["vip_ate"] == "Vitalício":
+            validade_txt = "💎 **Eterno (Vitalício)**"
+        else:
+            dias_restantes = (datetime.strptime(user["vip_ate"], '%Y-%m-%d') - datetime.now()).days
+            validade_txt = f"⏳ **{dias_restantes} dias restantes**"
+        
+        texto = (
+            f"👋 **Olá, {message.from_user.first_name}!**\n\n"
+            f"👑 **Status:** Usuário VIP\n"
+            f"{validade_txt}\n"
+            f"🚀 **Downloads:** Ilimitados\n\n"
+            f"Pode enviar seus links à vontade! Se precisar de algo, use o botão abaixo."
+        )
+        bot.reply_to(message, texto, reply_markup=menu_vip_ativo(), parse_mode="Markdown")
+    else:
+        restantes = 5 - user["downloads_hoje"]
+        texto = (
+            f"👋 **Bem-vindo ao Downloader VIP!**\n\n"
+            f"📊 **Status:** Plano Gratuito\n"
+            f"💡 **Limite Diário:** {restantes}/5 restantes\n\n"
+            f"Escolha um plano para remover todas as restrições:"
+        )
+        bot.reply_to(message, texto, reply_markup=menu_planos(), parse_mode="Markdown")
 
-@bot.message_handler(commands=['meuadm'])
-def cmd_adm(message):
-    if str(message.from_user.id) == MY_ID:
-        dados = carregar_dados()
-        user = obter_usuario(MY_ID, dados)
-        user["vip_ate"] = "Vitalício"
-        salvar_dados(dados)
-        bot.reply_to(message, "👑 **Admin Ativado!**")
+@bot.callback_query_handler(func=lambda call: call.data.startswith("buy_"))
+def handle_payment(call):
+    _, valor, plano = call.data.split("_")
+    bot.answer_callback_query(call.id, "Gerando PIX...")
+    pix = gerar_pix(valor, f"Plano {plano} - Bot VIP", call.from_user.id, plano)
+    if pix:
+        texto = (
+            f"✅ **PIX Gerado!**\n\n"
+            f"📦 **Plano:** {plano}\n"
+            f"💰 **Valor:** R$ {valor}\n\n"
+            f"Cliquem no código abaixo para copiar:\n\n"
+            f"`{pix}`\n\n"
+            f"⚡ **A ativação será automática após o pagamento.**"
+        )
+        bot.send_message(call.message.chat.id, texto, parse_mode="Markdown")
 
-# --- DOWNLOADER (TikTok, Pinterest, Rednote) ---
+# --- DOWNLOADER (REUTILIZADO DO ANTERIOR) ---
 @bot.message_handler(func=lambda message: "http" in message.text)
 def handle_dl(message):
     dados = carregar_dados()
     user = obter_usuario(message.from_user.id, dados)
     vip = is_vip(message.from_user.id, dados)
-    
     hoje = datetime.now().strftime('%Y-%m-%d')
     if user["ultima_data"] != hoje:
         user["downloads_hoje"] = 0
         user["ultima_data"] = hoje
         salvar_dados(dados)
-
     if not vip and user["downloads_hoje"] >= 5:
-        return bot.reply_to(message, "🚫 **Limite de 5 downloads diários atingido!**", reply_markup=menu_planos())
-
-    msg = bot.reply_to(message, "⏳ **Processando vídeo...**")
+        return bot.reply_to(message, "🚫 **Limite atingido!**", reply_markup=menu_planos())
+    msg = bot.reply_to(message, "⏳ **Processando...**")
     url = message.text.split()[0]
     file_id = f"dl_{message.from_user.id}_{message.message_id}"
-
     try:
-        ydl_opts = {
-            'format': 'best',
-            'outtmpl': f'{file_id}.%(ext)s',
-            'quiet': True,
-            'no_warnings': True,
-            'nocheckcertificate': True,
-            'http_headers': {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-            }
-        }
-        
+        ydl_opts = {'format': 'best', 'outtmpl': f'{file_id}.%(ext)s', 'quiet': True}
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
             files = glob.glob(f"{file_id}.*")
             if files:
                 with open(files[0], 'rb') as f:
-                    bot.send_video(message.chat.id, f, caption=f"✅ **Baixado com sucesso!**\n💬 Suporte: {SUPORTE_USER}")
+                    bot.send_video(message.chat.id, f, caption=f"✅ **Sucesso!**\n💬 Suporte: {SUPORTE_USER}")
                 os.remove(files[0])
                 if not vip:
                     user["downloads_hoje"] += 1
                     salvar_dados(dados)
                 bot.delete_message(message.chat.id, msg.message_id)
-            else:
-                bot.edit_message_text("❌ Não consegui baixar este vídeo.", message.chat.id, msg.message_id)
-    except Exception:
-        bot.edit_message_text("❌ Link inválido ou não suportado.", message.chat.id, msg.message_id)
+            else: bot.edit_message_text("❌ Falha no download.", message.chat.id, msg.message_id)
+    except: bot.edit_message_text("❌ Link inválido.", message.chat.id, msg.message_id)
 
-# --- EXECUÇÃO ---
-def run_flask():
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+def run_flask(): app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
 
 if __name__ == "__main__":
     Thread(target=run_flask).start()
     bot.remove_webhook()
-    print("Bot rodando...")
     bot.infinity_polling(skip_pending=True)
