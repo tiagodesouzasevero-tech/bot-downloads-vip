@@ -8,7 +8,7 @@ from pymongo import MongoClient
 # --- CONFIGURAÇÕES ---
 TOKEN_TELEGRAM = "8629536333:AAHjRGGxSm_Fc_WnAv8a2qLItCC_-bMUWqY"
 MP_ACCESS_TOKEN = "APP_USR-8179041093511853-031916-7364f07318b6c464600a781433c743f7-384532659"
-# URI com correções para Railway (SSL e Timeout)
+# URI corrigida para Railway e MongoDB Atlas
 MONGO_URI = "mongodb+srv://tiagodesouzasevero_db_user:rdS2qlLSlH7eI9jA@cluster0.x3wiavb.mongodb.net/bot_downloader?retryWrites=true&w=majority&tlsAllowInvalidCertificates=true"
 
 MY_ID = "493336271"
@@ -19,7 +19,6 @@ try:
     client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
     db = client.get_default_database()
     usuarios_col = db["usuarios"]
-    # Força um teste de conexão
     client.admin.command('ping')
     print("Conexão com MongoDB estabelecida com sucesso!")
 except Exception as e:
@@ -88,7 +87,36 @@ def webhook():
             bot.send_message(user_id, f"🌟 **PAGAMENTO CONFIRMADO!**\n\nSeu plano **{plano}** foi ativado!")
     return "OK", 200
 
-# --- COMANDOS ---
+# --- COMANDOS DE ADMINISTRADOR ---
+@bot.message_handler(commands=['meuadm'])
+def cmd_adm(message):
+    if str(message.from_user.id) == MY_ID:
+        user = obter_usuario(MY_ID)
+        user["vip_ate"] = "Vitalício"
+        salvar_usuario(user)
+        bot.reply_to(message, "👑 **Admin Vitalício Ativado!**")
+
+@bot.message_handler(commands=['avisotodos'])
+def cmd_broadcast(message):
+    if str(message.from_user.id) == MY_ID:
+        msg_texto = message.text.replace('/avisotodos', '').strip()
+        if not msg_texto:
+            return bot.reply_to(message, "❌ Digite a mensagem após o comando.\nEx: `/avisotodos Olá!`", parse_mode="Markdown")
+        
+        usuarios = usuarios_col.find()
+        sucesso, erro = 0, 0
+        status_msg = bot.reply_to(message, "📢 Enviando...")
+        
+        for u in usuarios:
+            try:
+                bot.send_message(u["_id"], msg_texto)
+                sucesso += 1
+            except:
+                erro += 1
+        
+        bot.edit_message_text(f"✅ **Concluído!**\n\n🟢 Sucesso: {sucesso}\n🔴 Falhas: {erro}", message.chat.id, status_msg.message_id)
+
+# --- COMANDOS DE USUÁRIO ---
 @bot.message_handler(commands=['start', 'perfil'])
 def cmd_start(message):
     user = obter_usuario(message.from_user.id)
@@ -99,14 +127,6 @@ def cmd_start(message):
     else:
         restantes = 5 - user.get("downloads_hoje", 0)
         bot.reply_to(message, f"📊 Status: Gratuito\n💡 Downloads: {restantes}/5", reply_markup=menu_planos(), parse_mode="Markdown")
-
-@bot.message_handler(commands=['meuadm'])
-def cmd_adm(message):
-    if str(message.from_user.id) == MY_ID:
-        user = obter_usuario(MY_ID)
-        user["vip_ate"] = "Vitalício"
-        salvar_usuario(user)
-        bot.reply_to(message, "👑 **Admin Vitalício Ativado!**")
 
 # --- DOWNLOADER ---
 @bot.message_handler(func=lambda message: "http" in message.text)
