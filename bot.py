@@ -5,13 +5,14 @@ from threading import Thread
 from telebot import types
 from pymongo import MongoClient
 
-# --- CONFIGURAÇÕES ---
+# --- CONFIGURAÇÕES ESSENCIAIS (MANTIDAS) ---
 TOKEN_TELEGRAM = "8629536333:AAHjRGGxSm_Fc_WnAv8a2qLItCC_-bMUWqY"
 MP_ACCESS_TOKEN = "APP_USR-8179041093511853-031916-7364f07318b6c464600a781433c743f7-384532659"
 MONGO_URI = "mongodb+srv://tiagodesouzasevero_db_user:rdS2qlLSlH7eI9jA@cluster0.x3wiavb.mongodb.net/bot_downloader?retryWrites=true&w=majority&tlsAllowInvalidCertificates=true"
 
 MY_ID = "493336271"
 
+# Conexão com Banco de Dados (Garante que ninguém perca o VIP)
 client = MongoClient(MONGO_URI)
 db = client.get_default_database()
 usuarios_col = db["usuarios"]
@@ -20,21 +21,18 @@ bot = telebot.TeleBot(TOKEN_TELEGRAM, threaded=False)
 app = Flask(__name__)
 sdk = mercadopago.SDK(MP_ACCESS_TOKEN)
 
-# --- FUNÇÕES DE USUÁRIO (VIP PERSISTENTE) ---
+# --- GESTÃO DE USUÁRIOS ---
 def obter_usuario(user_id):
     uid = str(user_id)
     hoje = datetime.now().strftime('%Y-%m-%d')
     user = usuarios_col.find_one({"_id": uid})
-    
     if not user:
         user = {"_id": uid, "vip_ate": None, "downloads_hoje": 0, "ultima_data": hoje}
         usuarios_col.insert_one(user)
-    
     if user.get("ultima_data") != hoje:
         user["downloads_hoje"] = 0
         user["ultima_data"] = hoje
         salvar_usuario(user)
-        
     return user
 
 def salvar_usuario(user):
@@ -44,10 +42,8 @@ def is_vip(user_id):
     user = obter_usuario(user_id)
     if user.get("vip_ate") == "Vitalício": return True
     if not user.get("vip_ate"): return False
-    try: 
-        return datetime.now() < datetime.strptime(user["vip_ate"], '%Y-%m-%d')
-    except: 
-        return False
+    try: return datetime.now() < datetime.strptime(user["vip_ate"], '%Y-%m-%d')
+    except: return False
 
 # --- MENUS ---
 def menu_planos():
@@ -64,24 +60,22 @@ def cmd_adm(message):
         user = obter_usuario(MY_ID)
         user["vip_ate"] = "Vitalício"
         salvar_usuario(user)
-        bot.reply_to(message, "👑 **Admin: Plano Vitalício Ativado!**")
+        bot.reply_to(message, "👑 <b>Admin: Plano Vitalício Ativado!</b>", parse_mode="HTML")
 
 @bot.message_handler(commands=['start', 'perfil'])
 def cmd_start(message):
     user = obter_usuario(message.from_user.id)
     vip = is_vip(message.from_user.id)
     nome = message.from_user.first_name
-    
     if vip:
         expira = user["vip_ate"]
-        texto = f"👋 Olá, {nome}!\n💎 **Status: VIP ({expira})**\n✨ Qualidade: **HD 720p Liberada!**\n\nEnvie o link abaixo 👇"
+        texto = f"👋 Olá, {nome}!\n💎 <b>Status: VIP ({expira})</b>\n✨ Qualidade HD Liberada!\n\nEnvie o link abaixo 👇"
         markup = None
     else:
         restantes = 5 - user.get("downloads_hoje", 0)
-        texto = f"👋 Olá, {nome}!\n📊 **Status: Gratuito**\n📥 Restantes: {restantes}/5 hoje\n\nEnvie o link abaixo ou assine o VIP para HD e downloads ilimitados! 👇"
+        texto = f"👋 Olá, {nome}!\n📊 <b>Status: Gratuito</b>\n📥 Restantes: {restantes}/5 hoje\n\nEnvie o link abaixo ou assine o VIP para HD ilimitado!"
         markup = menu_planos()
-
-    bot.reply_to(message, texto, reply_markup=markup, parse_mode="Markdown")
+    bot.reply_to(message, texto, reply_markup=markup, parse_mode="HTML")
 
 # --- WEBHOOK (AUTOMAÇÃO DE PAGAMENTO) ---
 @app.route('/webhook', methods=['POST'])
@@ -90,23 +84,16 @@ def webhook():
     if data and data.get("type") == "payment":
         payment_id = data["data"]["id"]
         payment_info = sdk.payment().get(payment_id)
-        
         if payment_info["response"]["status"] == "approved":
             user_id = payment_info["response"]["external_reference"]
             plano = payment_info["response"]["description"]
-            
             user = obter_usuario(user_id)
-            if "Mensal" in plano:
-                nova_data = (datetime.now() + timedelta(days=30)).strftime('%Y-%m-%d')
-            elif "Anual" in plano:
-                nova_data = (datetime.now() + timedelta(days=365)).strftime('%Y-%m-%d')
-            else:
-                nova_data = "Vitalício"
-                
+            if "Mensal" in plano: nova_data = (datetime.now() + timedelta(days=30)).strftime('%Y-%m-%d')
+            elif "Anual" in plano: nova_data = (datetime.now() + timedelta(days=365)).strftime('%Y-%m-%d')
+            else: nova_data = "Vitalício"
             user["vip_ate"] = nova_data
             salvar_usuario(user)
-            bot.send_message(user_id, f"🎉 **PAGAMENTO APROVADO!**\n\nPlano: {plano}\nValidade: {nova_data}\n\nAproveite seus downloads em HD! 🚀")
-            
+            bot.send_message(user_id, f"🎉 <b>PAGAMENTO APROVADO!</b>\nPlano: {plano}\nValidade: {nova_data}", parse_mode="HTML")
     return "OK", 200
 
 # --- COMPRA ---
@@ -114,30 +101,26 @@ def webhook():
 def callback_buy(call):
     _, valor, plano = call.data.split("_")
     user_id = str(call.from_user.id)
-    
-    preference_data = {
+    pref_data = {
         "items": [{"title": f"Plano {plano}", "quantity": 1, "unit_price": float(valor), "currency_id": "BRL"}],
         "external_reference": user_id,
         "notification_url": "https://bot-downloads-vip-production.up.railway.app/webhook"
     }
-    
-    result = sdk.preference().create(preference_data)
-    url_pagamento = result["response"]["init_point"]
-    
+    result = sdk.preference().create(pref_data)
+    url_pag = result["response"]["init_point"]
     markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("🔗 Pagar no PIX/Cartão", url=url_pagamento))
-    bot.edit_message_text(f"💳 **Assinatura {plano}**\nValor: R$ {valor}\n\nClique no botão abaixo para concluir:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+    markup.add(types.InlineKeyboardButton("🔗 Pagar Agora", url=url_pag))
+    bot.edit_message_text(f"💳 <b>Assinatura {plano}</b>\nValor: R$ {valor}", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="HTML")
 
-# --- DOWNLOADER (LIMITADO A 90 SEGUNDOS) ---
+# --- DOWNLOADER (CORREÇÃO HD + HTML + TRAVA 90s) ---
 @bot.message_handler(func=lambda message: "http" in message.text)
 def handle_dl(message):
     user = obter_usuario(message.from_user.id)
     vip = is_vip(message.from_user.id)
-    
     if not vip and user.get("downloads_hoje", 0) >= 5:
-        return bot.reply_to(message, "🚫 **Limite atingido!**\nVolte amanhã ou assine o VIP.", reply_markup=menu_planos())
+        return bot.reply_to(message, "🚫 <b>Limite atingido!</b>", reply_markup=menu_planos(), parse_mode="HTML")
 
-    msg = bot.reply_to(message, "⏳ **Processando em HD...**")
+    msg = bot.reply_to(message, "⏳ <b>Processando em HD...</b>", parse_mode="HTML")
     url = message.text.split()[0]
     file_id = f"dl_{message.from_user.id}_{message.message_id}"
     
@@ -153,32 +136,34 @@ def handle_dl(message):
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
-            
-            # TRAVA DE 90 SEGUNDOS (Economia de recursos)
+            # Trava de 90 segundos
             if info.get('duration', 0) > 90:
-                bot.edit_message_text("⚠️ **Vídeo muito longo!** O limite permitido é de **90 segundos**.", message.chat.id, msg.message_id, parse_mode="Markdown")
+                bot.edit_message_text("⚠️ <b>Vídeo muito longo!</b> O limite é 90 segundos.", message.chat.id, msg.message_id, parse_mode="HTML")
                 for f in glob.glob(f"{file_id}.*"): os.remove(f)
                 return
 
             files = glob.glob(f"{file_id}.*")
             if files:
                 with open(files[0], 'rb') as f:
-                    bot.send_video(message.chat.id, f, caption="🛍️ **Vídeo pronto em HD!**\nGerado por @AfiliadoClipPro_bot", parse_mode="Markdown")
-                
+                    # Uso de HTML para evitar erro de parsing com caracteres especiais
+                    bot.send_video(
+                        message.chat.id, 
+                        f, 
+                        caption="🛍 <b>Vídeo pronto em HD!</b>\nGerado por @AfiliadoClipPro_bot", 
+                        parse_mode="HTML"
+                    )
                 for f in files: os.remove(f)
-                
                 if not vip:
                     user["downloads_hoje"] += 1
                     salvar_usuario(user)
                 bot.delete_message(message.chat.id, msg.message_id)
             else:
-                raise Exception("Erro no arquivo")
-
+                raise Exception("Arquivo não encontrado")
     except Exception as e:
         print(f"Erro: {e}")
-        bot.edit_message_text("❌ Erro ao processar. Verifique se o link é público.", message.chat.id, msg.message_id)
+        bot.edit_message_text("❌ <b>Erro ao baixar.</b> Verifique o link.", message.chat.id, msg.message_id, parse_mode="HTML")
 
-# --- INICIALIZAÇÃO ---
+# --- SERVIDOR ---
 @app.route('/')
 def health(): return "Online", 200
 
