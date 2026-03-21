@@ -12,20 +12,20 @@ MONGO_URI = "mongodb+srv://tiagodesouzasevero_db_user:rdS2qlLSlH7eI9jA@cluster0.
 
 MY_ID = "493336271"
 
-# Conexão com o Banco de Dados (Mantendo usuários atuais)
+# Conexão com o Banco de Dados
 try:
     client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
     db = client.get_default_database()
     usuarios_col = db["usuarios"]
-    print("Conexão com MongoDB: OK")
+    print("Conexão com MongoDB estabelecida com sucesso!")
 except Exception as e:
-    print(f"Erro MongoDB: {e}")
+    print(f"Erro na conexão com Banco de Dados: {e}")
 
 bot = telebot.TeleBot(TOKEN_TELEGRAM, threaded=False)
 app = Flask(__name__)
 sdk = mercadopago.SDK(MP_ACCESS_TOKEN)
 
-# --- FUNÇÕES DE APOIO E VIP ---
+# --- FUNÇÕES DE BANCO DE DADOS ---
 def obter_usuario(user_id):
     uid = str(user_id)
     user = usuarios_col.find_one({"_id": uid})
@@ -73,7 +73,7 @@ def cmd_broadcast(message):
                 bot.send_message(u["_id"], msg_texto)
                 sucesso += 1
             except: erro += 1
-        bot.edit_message_text(f"✅ **Concluído!**\n🟢 Sucesso: {sucesso} | 🔴 Falhas: {erro}", message.chat.id, status_msg.message_id)
+        bot.edit_message_text(f"✅ **Concluído!**\n\n🟢 Sucesso: {sucesso}\n🔴 Falhas: {erro}", message.chat.id, status_msg.message_id)
 
 # --- COMANDOS USUÁRIO ---
 @bot.message_handler(commands=['start', 'perfil'])
@@ -90,7 +90,7 @@ def cmd_start(message):
             "💎 **Plano VIP Ativo**\n"
             f"✅ {expira}\n\n"
             f"🚀 **Acesso liberado para:**\n{plataformas}\n\n"
-            "• Resolução: **HD (720p)**\n"
+            "• Qualidade: **HD Otimizado**\n"
             "• Limite: Vídeos de até **90 segundos**\n\n"
             "Cole o link do seu achadinho abaixo! 👇"
         )
@@ -102,14 +102,14 @@ def cmd_start(message):
             "🎯 **O bot nº 1 para Afiliados de Achadinhos.**\n"
             f"Baixe vídeos do {plataformas} prontos para vender!\n\n"
             "⚙️ **Especificações:**\n"
-            "• Vídeos em **HD (720p)**\n"
+            "• Vídeos em **Qualidade HD**\n"
             "• Duração máxima de **90 segundos**\n\n"
             f"📊 **Status:** Gratuito | **Restantes:** {restantes}/5 hoje\n\n"
             "Cole o link do vídeo abaixo! 👇"
         )
         bot.reply_to(message, texto, reply_markup=menu_planos(), parse_mode="Markdown")
 
-# --- DOWNLOADER (90s / 720p) ---
+# --- DOWNLOADER (REFORÇADO) ---
 @bot.message_handler(func=lambda message: "http" in message.text)
 def handle_dl(message):
     user = obter_usuario(message.from_user.id)
@@ -123,16 +123,25 @@ def handle_dl(message):
     file_id = f"dl_{message.from_user.id}_{message.message_id}"
     
     try:
-        # Checagem de duração antes do download
-        with yt_dlp.YoutubeDL({'quiet': True}) as ydl:
+        # Analisa duração primeiro com bypass de segurança
+        ydl_info_opts = {'quiet': True, 'nocheckcertificate': True}
+        with yt_dlp.YoutubeDL(ydl_info_opts) as ydl:
             info = ydl.extract_info(url, download=False)
             duracao = info.get('duration', 0)
             if duracao > 90:
                 bot.delete_message(message.chat.id, msg.message_id)
-                return bot.reply_to(message, "⚠️ **Vídeo muito longo!**\n\nNosso sistema é focado em vídeos de até **90 segundos**. Por favor, envie um link mais curto.")
+                return bot.reply_to(message, "⚠️ **Vídeo muito longo!**\n\nNosso sistema é focado em vídeos de até **90 segundos**.")
 
-        # Configuração de Download HD
-        ydl_opts = {'format': 'best[height<=720]', 'outtmpl': f'{file_id}.%(ext)s', 'quiet': True}
+        # Opções de Download Flexíveis (Resolve o erro 'format not available')
+        ydl_opts = {
+            'format': 'bestvideo[height<=720]+bestaudio/best[height<=720]/best',
+            'outtmpl': f'{file_id}.%(ext)s',
+            'quiet': True,
+            'nocheckcertificate': True,
+            'merge_output_format': 'mp4',
+            'geo_bypass': True
+        }
+        
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
             files = glob.glob(f"{file_id}.*")
@@ -144,10 +153,13 @@ def handle_dl(message):
                     user["downloads_hoje"] = user.get("downloads_hoje", 0) + 1
                     salvar_usuario(user)
                 bot.delete_message(message.chat.id, msg.message_id)
-    except:
-        bot.edit_message_text("❌ Erro ao processar. Certifique-se que o link é público e tem até 90s.", message.chat.id, msg.message_id)
+            else:
+                raise Exception("Erro ao localizar arquivo")
+    except Exception as e:
+        print(f"Erro no download: {e}")
+        bot.edit_message_text("❌ Erro ao processar. Certifique-se que o vídeo é público, tem até 90s e o link está correto.", message.chat.id, msg.message_id)
 
-# --- WEBHOOK PAGAMENTO (LIBERAÇÃO AUTOMÁTICA) ---
+# --- WEBHOOK PAGAMENTO ---
 @app.route('/webhook', methods=['POST'])
 def webhook():
     if request.args.get("type") == "payment":
