@@ -8,58 +8,42 @@ from pymongo import MongoClient
 # --- CONFIGURAÇÕES ---
 TOKEN_TELEGRAM = "8629536333:AAHjRGGxSm_Fc_WnAv8a2qLItCC_-bMUWqY"
 MP_ACCESS_TOKEN = "APP_USR-8179041093511853-031916-7364f07318b6c464600a781433c743f7-384532659"
-# URI do MongoDB Atlas (Mantenha o tlsAllowInvalidCertificates=true para a Railway)
 MONGO_URI = "mongodb+srv://tiagodesouzasevero_db_user:rdS2qlLSlH7eI9jA@cluster0.x3wiavb.mongodb.net/bot_downloader?retryWrites=true&w=majority&tlsAllowInvalidCertificates=true"
 
 MY_ID = "493336271"
-SUPORTE_USER = "@suportebotvip01"
 
-# Conexão com o Banco de Dados
+# Conexão com o Banco de Dados (Mantendo usuários atuais)
 try:
     client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
     db = client.get_default_database()
     usuarios_col = db["usuarios"]
-    client.admin.command('ping')
-    print("Conexão com MongoDB estabelecida com sucesso!")
+    print("Conexão com MongoDB: OK")
 except Exception as e:
-    print(f"Erro na conexão com Banco de Dados: {e}")
+    print(f"Erro MongoDB: {e}")
 
 bot = telebot.TeleBot(TOKEN_TELEGRAM, threaded=False)
 app = Flask(__name__)
 sdk = mercadopago.SDK(MP_ACCESS_TOKEN)
 
-# --- FUNÇÕES DE BANCO DE DADOS ---
+# --- FUNÇÕES DE APOIO E VIP ---
 def obter_usuario(user_id):
     uid = str(user_id)
-    try:
-        user = usuarios_col.find_one({"_id": uid})
-        if not user:
-            user = {
-                "_id": uid, 
-                "vip_ate": None, 
-                "downloads_hoje": 0, 
-                "ultima_data": datetime.now().strftime('%Y-%m-%d')
-            }
-            usuarios_col.insert_one(user)
-        return user
-    except:
-        return {"_id": uid, "vip_ate": None, "downloads_hoje": 0, "ultima_data": ""}
+    user = usuarios_col.find_one({"_id": uid})
+    if not user:
+        user = {"_id": uid, "vip_ate": None, "downloads_hoje": 0, "ultima_data": datetime.now().strftime('%Y-%m-%d')}
+        usuarios_col.insert_one(user)
+    return user
 
 def salvar_usuario(user):
-    try:
-        usuarios_col.replace_one({"_id": user["_id"]}, user)
-    except:
-        pass
+    usuarios_col.replace_one({"_id": user["_id"]}, user)
 
 def is_vip(user_id):
     user = obter_usuario(user_id)
     if user.get("vip_ate") == "Vitalício": return True
     if not user.get("vip_ate"): return False
-    try:
-        return datetime.now() < datetime.strptime(user["vip_ate"], '%Y-%m-%d')
+    try: return datetime.now() < datetime.strptime(user["vip_ate"], '%Y-%m-%d')
     except: return False
 
-# --- MENUS ---
 def menu_planos():
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("💳 Mensal - R$10,00", callback_data="buy_10_Mensal"))
@@ -67,7 +51,103 @@ def menu_planos():
     markup.add(types.InlineKeyboardButton("💎 Vitalício - R$499,00", callback_data="buy_499_Vitalicio"))
     return markup
 
-# --- WEBHOOK MERCADO PAGO ---
+# --- COMANDOS ADM ---
+@bot.message_handler(commands=['meuadm'])
+def cmd_adm(message):
+    if str(message.from_user.id) == MY_ID:
+        user = obter_usuario(MY_ID)
+        user["vip_ate"] = "Vitalício"
+        salvar_usuario(user)
+        bot.reply_to(message, "👑 **AfiliadoClip Pro: Admin Vitalício Ativado!**")
+
+@bot.message_handler(commands=['avisotodos'])
+def cmd_broadcast(message):
+    if str(message.from_user.id) == MY_ID:
+        msg_texto = message.text.replace('/avisotodos', '').strip()
+        if not msg_texto: return bot.reply_to(message, "❌ Digite a mensagem após o comando.")
+        usuarios = usuarios_col.find()
+        sucesso, erro = 0, 0
+        status_msg = bot.reply_to(message, "📢 Enviando transmissão...")
+        for u in usuarios:
+            try:
+                bot.send_message(u["_id"], msg_texto)
+                sucesso += 1
+            except: erro += 1
+        bot.edit_message_text(f"✅ **Concluído!**\n🟢 Sucesso: {sucesso} | 🔴 Falhas: {erro}", message.chat.id, status_msg.message_id)
+
+# --- COMANDOS USUÁRIO ---
+@bot.message_handler(commands=['start', 'perfil'])
+def cmd_start(message):
+    user = obter_usuario(message.from_user.id)
+    vip = is_vip(message.from_user.id)
+    nome = message.from_user.first_name
+    plataformas = "📌 **Pinterest, TikTok, RedNote, Reels e Shopee.**"
+
+    if vip:
+        expira = "Vitalício" if user["vip_ate"] == "Vitalício" else f"Expira em: {user['vip_ate']}"
+        texto = (
+            f"👋 **Olá, {nome}! Bem-vindo ao AfiliadoClip Pro!**\n\n"
+            "💎 **Plano VIP Ativo**\n"
+            f"✅ {expira}\n\n"
+            f"🚀 **Acesso liberado para:**\n{plataformas}\n\n"
+            "• Resolução: **HD (720p)**\n"
+            "• Limite: Vídeos de até **90 segundos**\n\n"
+            "Cole o link do seu achadinho abaixo! 👇"
+        )
+        bot.reply_to(message, texto, parse_mode="Markdown")
+    else:
+        restantes = 5 - user.get("downloads_hoje", 0)
+        texto = (
+            f"👋 **Olá, {nome}! Bem-vindo ao AfiliadoClip Pro!**\n\n"
+            "🎯 **O bot nº 1 para Afiliados de Achadinhos.**\n"
+            f"Baixe vídeos do {plataformas} prontos para vender!\n\n"
+            "⚙️ **Especificações:**\n"
+            "• Vídeos em **HD (720p)**\n"
+            "• Duração máxima de **90 segundos**\n\n"
+            f"📊 **Status:** Gratuito | **Restantes:** {restantes}/5 hoje\n\n"
+            "Cole o link do vídeo abaixo! 👇"
+        )
+        bot.reply_to(message, texto, reply_markup=menu_planos(), parse_mode="Markdown")
+
+# --- DOWNLOADER (90s / 720p) ---
+@bot.message_handler(func=lambda message: "http" in message.text)
+def handle_dl(message):
+    user = obter_usuario(message.from_user.id)
+    vip = is_vip(message.from_user.id)
+    
+    if not vip and user.get("downloads_hoje", 0) >= 5:
+        return bot.reply_to(message, "🚫 Limite diário atingido!", reply_markup=menu_planos())
+
+    msg = bot.reply_to(message, "✅ Seu link foi adicionado à fila! Aguarde alguns instantes...")
+    url = message.text.split()[0]
+    file_id = f"dl_{message.from_user.id}_{message.message_id}"
+    
+    try:
+        # Checagem de duração antes do download
+        with yt_dlp.YoutubeDL({'quiet': True}) as ydl:
+            info = ydl.extract_info(url, download=False)
+            duracao = info.get('duration', 0)
+            if duracao > 90:
+                bot.delete_message(message.chat.id, msg.message_id)
+                return bot.reply_to(message, "⚠️ **Vídeo muito longo!**\n\nNosso sistema é focado em vídeos de até **90 segundos**. Por favor, envie um link mais curto.")
+
+        # Configuração de Download HD
+        ydl_opts = {'format': 'best[height<=720]', 'outtmpl': f'{file_id}.%(ext)s', 'quiet': True}
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+            files = glob.glob(f"{file_id}.*")
+            if files:
+                with open(files[0], 'rb') as f:
+                    bot.send_video(message.chat.id, f, caption="🛍️ **Vídeo pronto! Gerado por AfiliadoClip Pro**")
+                os.remove(files[0])
+                if not vip:
+                    user["downloads_hoje"] = user.get("downloads_hoje", 0) + 1
+                    salvar_usuario(user)
+                bot.delete_message(message.chat.id, msg.message_id)
+    except:
+        bot.edit_message_text("❌ Erro ao processar. Certifique-se que o link é público e tem até 90s.", message.chat.id, msg.message_id)
+
+# --- WEBHOOK PAGAMENTO (LIBERAÇÃO AUTOMÁTICA) ---
 @app.route('/webhook', methods=['POST'])
 def webhook():
     if request.args.get("type") == "payment":
@@ -83,98 +163,12 @@ def webhook():
             else: nova_data = "Vitalício"
             user["vip_ate"] = nova_data
             salvar_usuario(user)
-            bot.send_message(user_id, f"🌟 **PAGAMENTO CONFIRMADO!**\n\nSeu plano **{plano}** foi ativado!")
+            bot.send_message(user_id, f"🌟 **PAGAMENTO CONFIRMADO!**\n\nSeu acesso **{plano}** no **AfiliadoClip Pro** foi ativado!")
     return "OK", 200
 
-# --- COMANDOS DE ADMINISTRADOR ---
-@bot.message_handler(commands=['meuadm'])
-def cmd_adm(message):
-    if str(message.from_user.id) == MY_ID:
-        user = obter_usuario(MY_ID)
-        user["vip_ate"] = "Vitalício"
-        salvar_usuario(user)
-        bot.reply_to(message, "👑 **Admin Vitalício Ativado!**")
-
-@bot.message_handler(commands=['avisotodos'])
-def cmd_broadcast(message):
-    if str(message.from_user.id) == MY_ID:
-        msg_texto = message.text.replace('/avisotodos', '').strip()
-        if not msg_texto:
-            return bot.reply_to(message, "❌ Digite a mensagem após o comando.")
-        
-        usuarios = usuarios_col.find()
-        sucesso, erro = 0, 0
-        status_msg = bot.reply_to(message, "📢 Enviando transmissão...")
-        
-        for u in usuarios:
-            try:
-                bot.send_message(u["_id"], msg_texto)
-                sucesso += 1
-            except:
-                erro += 1
-        
-        bot.edit_message_text(f"✅ **Transmissão Concluída!**\n\n🟢 Sucesso: {sucesso}\n🔴 Falhas: {erro}", message.chat.id, status_msg.message_id)
-
-# --- COMANDOS DE USUÁRIO ---
-@bot.message_handler(commands=['start', 'perfil'])
-def cmd_start(message):
-    user = obter_usuario(message.from_user.id)
-    vip = is_vip(message.from_user.id)
-    if vip:
-        status = "💎 Vitalício" if user["vip_ate"] == "Vitalício" else f"⏳ Expira em: {user['vip_ate']}"
-        bot.reply_to(message, f"👋 **Olá, {message.from_user.first_name}!**\n👑 VIP Ativo\n✅ {status}", parse_mode="Markdown")
-    else:
-        restantes = 5 - user.get("downloads_hoje", 0)
-        bot.reply_to(message, f"📊 Status: Gratuito\n💡 Downloads: {restantes}/5", reply_markup=menu_planos(), parse_mode="Markdown")
-
-# --- DOWNLOADER ---
-@bot.message_handler(func=lambda message: "http" in message.text)
-def handle_dl(message):
-    user = obter_usuario(message.from_user.id)
-    vip = is_vip(message.from_user.id)
-    
-    # Controle de Limite Gratuito
-    if not vip and user.get("downloads_hoje", 0) >= 5:
-        return bot.reply_to(message, "🚫 Limite diário atingido!", reply_markup=menu_planos())
-
-    # Mensagem de Feedback Personalizada
-    msg = bot.reply_to(message, "✅ Seu link foi adicionado à fila de download! Por favor, aguarde alguns instantes!")
-    
-    url = message.text.split()[0]
-    file_id = f"dl_{message.from_user.id}_{message.message_id}"
-    
-    try:
-        # Configuração de download (Melhor qualidade disponível)
-        ydl_opts = {'format': 'best', 'outtmpl': f'{file_id}.%(ext)s', 'quiet': True}
-        
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
-            files = glob.glob(f"{file_id}.*")
-            
-            if files:
-                with open(files[0], 'rb') as f:
-                    bot.send_video(message.chat.id, f, caption="✅ Vídeo baixado com sucesso!")
-                
-                # Limpeza de arquivo local
-                os.remove(files[0])
-                
-                # Contabilizar download se não for VIP
-                if not vip:
-                    user["downloads_hoje"] = user.get("downloads_hoje", 0) + 1
-                    salvar_usuario(user)
-                
-                # Apagar mensagem de "Aguarde"
-                bot.delete_message(message.chat.id, msg.message_id)
-            else:
-                bot.edit_message_text("❌ Não foi possível encontrar o arquivo do vídeo.", message.chat.id, msg.message_id)
-                
-    except Exception as e:
-        print(f"Erro no download: {e}")
-        bot.edit_message_text("❌ Erro ao processar o link. Verifique se o vídeo é público.", message.chat.id, msg.message_id)
-
-# --- INICIALIZAÇÃO ---
+# --- RUN ---
 @app.route('/')
-def health(): return "Bot Online", 200
+def health(): return "AfiliadoClip Pro Online", 200
 
 def run_flask():
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
