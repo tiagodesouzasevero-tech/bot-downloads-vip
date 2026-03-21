@@ -12,7 +12,6 @@ MONGO_URI = "mongodb+srv://tiagodesouzasevero_db_user:rdS2qlLSlH7eI9jA@cluster0.
 
 MY_ID = "493336271"
 
-# Conexão com Banco de Dados (Garante que ninguém perca o VIP)
 client = MongoClient(MONGO_URI)
 db = client.get_default_database()
 usuarios_col = db["usuarios"]
@@ -77,7 +76,7 @@ def cmd_start(message):
         markup = menu_planos()
     bot.reply_to(message, texto, reply_markup=markup, parse_mode="HTML")
 
-# --- WEBHOOK (AUTOMAÇÃO DE PAGAMENTO) ---
+# --- WEBHOOK (AUTOMAÇÃO MP) ---
 @app.route('/webhook', methods=['POST'])
 def webhook():
     data = request.get_json()
@@ -112,7 +111,7 @@ def callback_buy(call):
     markup.add(types.InlineKeyboardButton("🔗 Pagar Agora", url=url_pag))
     bot.edit_message_text(f"💳 <b>Assinatura {plano}</b>\nValor: R$ {valor}", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="HTML")
 
-# --- DOWNLOADER (CORREÇÃO HD + HTML + TRAVA 90s) ---
+# --- DOWNLOADER (AJUSTADO PARA TRAVAR EM 720p / 30fps) ---
 @bot.message_handler(func=lambda message: "http" in message.text)
 def handle_dl(message):
     user = obter_usuario(message.from_user.id)
@@ -125,18 +124,25 @@ def handle_dl(message):
     file_id = f"dl_{message.from_user.id}_{message.message_id}"
     
     ydl_opts = {
-        'format': 'bestvideo[height<=720]+bestaudio/best[height<=720]/best',
+        # Tenta pegar a melhor combinação possível
+        'format': 'bestvideo+bestaudio/best',
+        # Aqui está a mágica: O bot vai "filtrar" a melhor qualidade listada acima baseado nessas regras
+        'format_sort': [
+            'res:720',    # Prioriza resolução até 720p (se o original for menor, baixa menor)
+            'fps:30',     # Prioriza FPS até 30
+            'vcodec:h264' # Formato de vídeo mais amigável para o Telegram
+        ],
         'outtmpl': f'{file_id}.%(ext)s',
         'merge_output_format': 'mp4',
         'quiet': True,
         'nocheckcertificate': True,
-        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36',
+        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     }
     
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
-            # Trava de 90 segundos
+            # Trava de 90s mantida
             if info.get('duration', 0) > 90:
                 bot.edit_message_text("⚠️ <b>Vídeo muito longo!</b> O limite é 90 segundos.", message.chat.id, msg.message_id, parse_mode="HTML")
                 for f in glob.glob(f"{file_id}.*"): os.remove(f)
@@ -145,7 +151,6 @@ def handle_dl(message):
             files = glob.glob(f"{file_id}.*")
             if files:
                 with open(files[0], 'rb') as f:
-                    # Uso de HTML para evitar erro de parsing com caracteres especiais
                     bot.send_video(
                         message.chat.id, 
                         f, 
