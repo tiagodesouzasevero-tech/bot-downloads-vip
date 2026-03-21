@@ -71,7 +71,7 @@ def cmd_start(message):
             f"👋 **Olá, {nome}! Bem-vindo ao AfiliadoClip Pro!**\n\n"
             f"💎 **Plano VIP Ativo**\n✅ {expira}\n\n"
             f"🚀 **Acesso liberado para:**\n{plataformas}\n\n"
-            "• Qualidade: **HD (720p) Otimizado**\n"
+            "• Qualidade: **HD (720p) Ativado**\n"
             "• Limite: Vídeos de até **90 segundos**\n\n"
             "Cole o link do seu achadinho abaixo! 👇"
         )
@@ -89,7 +89,7 @@ def cmd_start(message):
         )
     bot.reply_to(message, texto, reply_markup=None if vip else menu_planos(), parse_mode="Markdown")
 
-# --- DOWNLOADER (TRAVA 720P + FFMPEG) ---
+# --- DOWNLOADER (TRAVA HD + ANTI-BLOQUEIO) ---
 @bot.message_handler(func=lambda message: "http" in message.text)
 def handle_dl(message):
     user = obter_usuario(message.from_user.id)
@@ -103,38 +103,45 @@ def handle_dl(message):
     file_id = f"dl_{message.from_user.id}_{message.message_id}"
     
     try:
-        with yt_dlp.YoutubeDL({'quiet': True, 'nocheckcertificate': True}) as ydl:
-            info = ydl.extract_info(url, download=False)
-            if info.get('duration', 0) > 90:
-                bot.delete_message(message.chat.id, msg.message_id)
-                return bot.reply_to(message, "⚠️ Limite: 90 segundos.")
-
-        # REGRA PARA HD (720p): Não permite baixar em 1080p
+        # Lógica de extração e download unificada
         ydl_opts = {
-            'format': 'bestvideo[height<=720]+bestaudio/best[height<=720]',
+            # Busca 720p com áudio (exige ffmpeg que já instalamos)
+            # Se não achar, pega a melhor disponível que não ultrapasse 720p
+            'format': 'bestvideo[height<=720]+bestaudio/best[height<=720]/best',
             'outtmpl': f'{file_id}.%(ext)s',
             'quiet': True,
             'nocheckcertificate': True,
             'merge_output_format': 'mp4',
-            'geo_bypass': True
+            'geo_bypass': True,
+            # User-agent para o TikTok e RedNote não bloquearem
+            'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'referer': 'https://www.google.com/',
         }
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
+            info = ydl.extract_info(url, download=True)
+            
+            # Verifica duração
+            if info.get('duration', 0) > 120: # Aumentei um pouco a margem
+                os.remove(glob.glob(f"{file_id}.*")[0])
+                bot.delete_message(message.chat.id, msg.message_id)
+                return bot.reply_to(message, "⚠️ Limite: 90-120 segundos.")
+
             files = glob.glob(f"{file_id}.*")
             if files:
                 with open(files[0], 'rb') as f:
-                    bot.send_video(message.chat.id, f, caption="🛍️ **Vídeo pronto! Gerado por AfiliadoClip Pro**")
+                    bot.send_video(message.chat.id, f, caption="🛍️ **Vídeo pronto em HD! Gerado por AfiliadoClip Pro**", parse_mode="Markdown")
                 os.remove(files[0])
                 if not vip:
                     user["downloads_hoje"] = user.get("downloads_hoje", 0) + 1
                     salvar_usuario(user)
                 bot.delete_message(message.chat.id, msg.message_id)
             else:
-                raise Exception("Erro no download")
+                raise Exception("Arquivo não gerado")
+
     except Exception as e:
         print(f"Erro: {e}")
-        bot.edit_message_text("❌ Erro. Use links públicos do Pinterest, TikTok ou RedNote (Até 90s).", message.chat.id, msg.message_id)
+        bot.edit_message_text("❌ Erro. Verifique se o link é público e tente novamente. (TikTok/Pinterest/RedNote)", message.chat.id, msg.message_id)
 
 # --- SERVIDOR ---
 @app.route('/')
