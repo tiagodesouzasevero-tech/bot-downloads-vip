@@ -8,13 +8,13 @@ from pymongo import MongoClient
 # --- CONFIGURAÇÕES ---
 TOKEN_TELEGRAM = "8629536333:AAHjRGGxSm_Fc_WnAv8a2qLItCC_-bMUWqY"
 MP_ACCESS_TOKEN = "APP_USR-8179041093511853-031916-7364f07318b6c464600a781433c743f7-384532659"
-# URI corrigida para Railway e MongoDB Atlas
+# URI do MongoDB Atlas (Mantenha o tlsAllowInvalidCertificates=true para a Railway)
 MONGO_URI = "mongodb+srv://tiagodesouzasevero_db_user:rdS2qlLSlH7eI9jA@cluster0.x3wiavb.mongodb.net/bot_downloader?retryWrites=true&w=majority&tlsAllowInvalidCertificates=true"
 
 MY_ID = "493336271"
 SUPORTE_USER = "@suportebotvip01"
 
-# Conexão Robusta com o Banco de Dados
+# Conexão com o Banco de Dados
 try:
     client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
     db = client.get_default_database()
@@ -42,15 +42,14 @@ def obter_usuario(user_id):
             }
             usuarios_col.insert_one(user)
         return user
-    except Exception as e:
-        print(f"Erro ao buscar usuário: {e}")
+    except:
         return {"_id": uid, "vip_ate": None, "downloads_hoje": 0, "ultima_data": ""}
 
 def salvar_usuario(user):
     try:
         usuarios_col.replace_one({"_id": user["_id"]}, user)
-    except Exception as e:
-        print(f"Erro ao salvar: {e}")
+    except:
+        pass
 
 def is_vip(user_id):
     user = obter_usuario(user_id)
@@ -101,11 +100,11 @@ def cmd_broadcast(message):
     if str(message.from_user.id) == MY_ID:
         msg_texto = message.text.replace('/avisotodos', '').strip()
         if not msg_texto:
-            return bot.reply_to(message, "❌ Digite a mensagem após o comando.\nEx: `/avisotodos Olá!`", parse_mode="Markdown")
+            return bot.reply_to(message, "❌ Digite a mensagem após o comando.")
         
         usuarios = usuarios_col.find()
         sucesso, erro = 0, 0
-        status_msg = bot.reply_to(message, "📢 Enviando...")
+        status_msg = bot.reply_to(message, "📢 Enviando transmissão...")
         
         for u in usuarios:
             try:
@@ -114,7 +113,7 @@ def cmd_broadcast(message):
             except:
                 erro += 1
         
-        bot.edit_message_text(f"✅ **Concluído!**\n\n🟢 Sucesso: {sucesso}\n🔴 Falhas: {erro}", message.chat.id, status_msg.message_id)
+        bot.edit_message_text(f"✅ **Transmissão Concluída!**\n\n🟢 Sucesso: {sucesso}\n🔴 Falhas: {erro}", message.chat.id, status_msg.message_id)
 
 # --- COMANDOS DE USUÁRIO ---
 @bot.message_handler(commands=['start', 'perfil'])
@@ -133,27 +132,45 @@ def cmd_start(message):
 def handle_dl(message):
     user = obter_usuario(message.from_user.id)
     vip = is_vip(message.from_user.id)
+    
+    # Controle de Limite Gratuito
     if not vip and user.get("downloads_hoje", 0) >= 5:
         return bot.reply_to(message, "🚫 Limite diário atingido!", reply_markup=menu_planos())
 
-    msg = bot.reply_to(message, "⏳ **Processando vídeo...**")
+    # Mensagem de Feedback Personalizada
+    msg = bot.reply_to(message, "✅ Seu link foi adicionado à fila de download! Por favor, aguarde alguns instantes!")
+    
     url = message.text.split()[0]
     file_id = f"dl_{message.from_user.id}_{message.message_id}"
     
     try:
-        with yt_dlp.YoutubeDL({'format': 'best', 'outtmpl': f'{file_id}.%(ext)s', 'quiet': True}) as ydl:
+        # Configuração de download (Melhor qualidade disponível)
+        ydl_opts = {'format': 'best', 'outtmpl': f'{file_id}.%(ext)s', 'quiet': True}
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
             files = glob.glob(f"{file_id}.*")
+            
             if files:
                 with open(files[0], 'rb') as f:
-                    bot.send_video(message.chat.id, f, caption="✅ Concluído!")
+                    bot.send_video(message.chat.id, f, caption="✅ Vídeo baixado com sucesso!")
+                
+                # Limpeza de arquivo local
                 os.remove(files[0])
+                
+                # Contabilizar download se não for VIP
                 if not vip:
                     user["downloads_hoje"] = user.get("downloads_hoje", 0) + 1
                     salvar_usuario(user)
+                
+                # Apagar mensagem de "Aguarde"
                 bot.delete_message(message.chat.id, msg.message_id)
-    except:
-        bot.edit_message_text("❌ Erro no download.", message.chat.id, msg.message_id)
+            else:
+                bot.edit_message_text("❌ Não foi possível encontrar o arquivo do vídeo.", message.chat.id, msg.message_id)
+                
+    except Exception as e:
+        print(f"Erro no download: {e}")
+        bot.edit_message_text("❌ Erro ao processar o link. Verifique se o vídeo é público.", message.chat.id, msg.message_id)
 
 # --- INICIALIZAÇÃO ---
 @app.route('/')
