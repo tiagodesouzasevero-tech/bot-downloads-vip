@@ -5,15 +5,17 @@ from threading import Thread
 from telebot import types
 from pymongo import MongoClient
 
-# --- CONFIGURAÇÕES ---
+# --- CONFIGURAÇÕES (MANTIDAS) ---
 TOKEN_TELEGRAM = "8629536333:AAHjRGGxSm_Fc_WnAv8a2qLItCC_-bMUWqY"
 MP_ACCESS_TOKEN = "APP_USR-8179041093511853-031916-7364f07318b6c464600a781433c743f7-384532659"
-# Seu link do MongoDB Atlas (Seguro e Permanente)
-MONGO_URI = "mongodb+srv://tiagodesouzasevero_db_user:rdS2qlLSlH7eI9jA@cluster0.x3wiavb.mongodb.net/?appName=Cluster0"
+
+# URI Ajustada com a correção para o erro de SSL da Railway
+MONGO_URI = "mongodb+srv://tiagodesouzasevero_db_user:rdS2qlLSlH7eI9jA@cluster0.x3wiavb.mongodb.net/?appName=Cluster0&tlsAllowInvalidCertificates=true"
+
 MY_ID = "493336271"
 SUPORTE_USER = "@suportebotvip01"
 
-# Conexão com o Banco de Dados
+# Conexão com o Banco de Dados (Nuvem)
 client = MongoClient(MONGO_URI)
 db = client["bot_downloader"]
 usuarios_col = db["usuarios"]
@@ -22,7 +24,7 @@ bot = telebot.TeleBot(TOKEN_TELEGRAM, threaded=False)
 app = Flask(__name__)
 sdk = mercadopago.SDK(MP_ACCESS_TOKEN)
 
-# --- FUNÇÕES DE BANCO DE DADOS (NUVEM) ---
+# --- FUNÇÕES DE BANCO DE DADOS ---
 def obter_usuario(user_id):
     uid = str(user_id)
     user = usuarios_col.find_one({"_id": uid})
@@ -82,16 +84,19 @@ def webhook():
 # --- COMANDOS ---
 @bot.message_handler(commands=['start', 'perfil'])
 def cmd_start(message):
-    user = obter_usuario(message.from_user.id)
-    vip = is_vip(message.from_user.id)
-    if vip:
-        status_txt = "💎 Eterno (Vitalício)" if user["vip_ate"] == "Vitalício" else f"⏳ Expira em: {user['vip_ate']}"
-        texto = f"👋 **Olá, {message.from_user.first_name}!**\n\n👑 **Status:** VIP\n✅ **Validade:** {status_txt}\n🚀 **Downloads:** Ilimitados"
-        bot.reply_to(message, texto, reply_markup=menu_vip_ativo(), parse_mode="Markdown")
-    else:
-        restantes = 5 - user["downloads_hoje"]
-        texto = f"👋 **Downloader VIP**\n\n📊 **Status:** Gratuito\n💡 **Restantes hoje:** {restantes}/5\n\nEscolha um plano abaixo para liberar acesso ilimitado:"
-        bot.reply_to(message, texto, reply_markup=menu_planos(), parse_mode="Markdown")
+    try:
+        user = obter_usuario(message.from_user.id)
+        vip = is_vip(message.from_user.id)
+        if vip:
+            status_txt = "💎 Eterno (Vitalício)" if user["vip_ate"] == "Vitalício" else f"⏳ Expira em: {user['vip_ate']}"
+            texto = f"👋 **Olá, {message.from_user.first_name}!**\n\n👑 **Status:** VIP\n✅ **Validade:** {status_txt}\n🚀 **Downloads:** Ilimitados"
+            bot.reply_to(message, texto, reply_markup=menu_vip_ativo(), parse_mode="Markdown")
+        else:
+            restantes = 5 - user["downloads_hoje"]
+            texto = f"👋 **Downloader VIP**\n\n📊 **Status:** Gratuito\n💡 **Restantes hoje:** {restantes}/5\n\nEscolha um plano abaixo para liberar acesso ilimitado:"
+            bot.reply_to(message, texto, reply_markup=menu_planos(), parse_mode="Markdown")
+    except Exception as e:
+        print(f"Erro no Start: {e}")
 
 @bot.message_handler(commands=['meuadm'])
 def cmd_adm(message):
