@@ -3,43 +3,51 @@ from datetime import datetime, timedelta
 from flask import Flask, request
 from threading import Thread
 from telebot import types
+from pymongo import MongoClient
 
 # --- CONFIGURAÇÕES ---
 TOKEN_TELEGRAM = "8629536333:AAHjRGGxSm_Fc_WnAv8a2qLItCC_-bMUWqY"
 MP_ACCESS_TOKEN = "APP_USR-8179041093511853-031916-7364f07318b6c464600a781433c743f7-384532659"
-DB_FILE = "database.json"
+# Seu link do MongoDB Atlas (Seguro e Permanente)
+MONGO_URI = "mongodb+srv://tiagodesouzasevero_db_user:rdS2qlLSlH7eI9jA@cluster0.x3wiavb.mongodb.net/?appName=Cluster0"
 MY_ID = "493336271"
 SUPORTE_USER = "@suportebotvip01"
+
+# Conexão com o Banco de Dados
+client = MongoClient(MONGO_URI)
+db = client["bot_downloader"]
+usuarios_col = db["usuarios"]
 
 bot = telebot.TeleBot(TOKEN_TELEGRAM, threaded=False)
 app = Flask(__name__)
 sdk = mercadopago.SDK(MP_ACCESS_TOKEN)
 
-# --- SISTEMA DE DADOS ---
-def carregar_dados():
-    if not os.path.exists(DB_FILE): return {"usuarios": {}}
-    try:
-        with open(DB_FILE, "r") as f: return json.load(f)
-    except: return {"usuarios": {}}
-
-def salvar_dados(dados):
-    with open(DB_FILE, "w") as f: json.dump(dados, f, indent=4)
-
-def obter_usuario(user_id, dados):
+# --- FUNÇÕES DE BANCO DE DADOS (NUVEM) ---
+def obter_usuario(user_id):
     uid = str(user_id)
-    if uid not in dados["usuarios"]:
-        dados["usuarios"][uid] = {"vip_ate": None, "downloads_hoje": 0, "ultima_data": datetime.now().strftime('%Y-%m-%d')}
-    return dados["usuarios"][uid]
+    user = usuarios_col.find_one({"_id": uid})
+    if not user:
+        user = {
+            "_id": uid, 
+            "vip_ate": None, 
+            "downloads_hoje": 0, 
+            "ultima_data": datetime.now().strftime('%Y-%m-%d')
+        }
+        usuarios_col.insert_one(user)
+    return user
 
-def is_vip(user_id, dados):
-    user = obter_usuario(user_id, dados)
+def salvar_usuario(user):
+    usuarios_col.replace_one({"_id": user["_id"]}, user)
+
+def is_vip(user_id):
+    user = obter_usuario(user_id)
     if user.get("vip_ate") == "Vitalício": return True
     if not user.get("vip_ate"): return False
     try:
         return datetime.now() < datetime.strptime(user["vip_ate"], '%Y-%m-%d')
     except: return False
 
-# --- MENUS PROFISSIONAIS ---
+# --- MENUS ---
 def menu_planos():
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("💳 Mensal - R$10,00", callback_data="buy_10_Mensal"))
@@ -52,20 +60,7 @@ def menu_vip_ativo():
     markup.add(types.InlineKeyboardButton("🛠️ Falar com Suporte", url=f"https://t.me/{SUPORTE_USER[1:]}"))
     return markup
 
-# --- MERCADO PAGO E WEBHOOK ---
-def gerar_pix(valor, descricao, user_id, plano):
-    payment_data = {
-        "transaction_amount": float(valor),
-        "description": descricao,
-        "payment_method_id": "pix",
-        "payer": {"email": f"user_{user_id}@bot.com"},
-        "external_reference": f"{user_id}:{plano}"
-    }
-    result = sdk.payment().create(payment_data)
-    if result["status"] == 201:
-        return result["response"]["point_of_interaction"]["transaction_data"]["qr_code"]
-    return None
-
+# --- WEBHOOK MERCADO PAGO ---
 @app.route('/webhook', methods=['POST'])
 def webhook():
     if request.args.get("type") == "payment":
@@ -74,85 +69,57 @@ def webhook():
         if payment_info["response"]["status"] == "approved":
             ref = payment_info["response"]["external_reference"]
             user_id, plano = ref.split(":")
-            dados = carregar_dados()
-            if not is_vip(user_id, dados):
-                user = obter_usuario(user_id, dados)
-                hoje = datetime.now()
-                if plano == "Mensal": nova_data = (hoje + timedelta(days=30)).strftime('%Y-%m-%d')
-                elif plano == "Anual": nova_data = (hoje + timedelta(days=365)).strftime('%Y-%m-%d')
-                else: nova_data = "Vitalício"
-                user["vip_ate"] = nova_data
-                salvar_dados(dados)
-                bot.send_message(user_id, f"🌟 **ACESSO LIBERADO!**\n\nSeu plano **{plano}** foi ativado com sucesso. Agora você tem acesso ilimitado às nossas ferramentas! 🚀", reply_markup=menu_vip_ativo())
+            user = obter_usuario(user_id)
+            hoje = datetime.now()
+            if plano == "Mensal": nova_data = (hoje + timedelta(days=30)).strftime('%Y-%m-%d')
+            elif plano == "Anual": nova_data = (hoje + timedelta(days=365)).strftime('%Y-%m-%d')
+            else: nova_data = "Vitalício"
+            user["vip_ate"] = nova_data
+            salvar_usuario(user)
+            bot.send_message(user_id, f"🌟 **PAGAMENTO CONFIRMADO!**\n\nSeu plano **{plano}** foi ativado com sucesso. Agora você é um usuário **VIP**! 🚀")
     return "OK", 200
-
-@app.route('/')
-def health(): return "Bot Online", 200
 
 # --- COMANDOS ---
 @bot.message_handler(commands=['start', 'perfil'])
 def cmd_start(message):
-    dados = carregar_dados()
-    user = obter_usuario(message.from_user.id, dados)
-    vip = is_vip(message.from_user.id, dados)
-    
+    user = obter_usuario(message.from_user.id)
+    vip = is_vip(message.from_user.id)
     if vip:
-        if user["vip_ate"] == "Vitalício":
-            validade_txt = "💎 **Eterno (Vitalício)**"
-        else:
-            dias_restantes = (datetime.strptime(user["vip_ate"], '%Y-%m-%d') - datetime.now()).days
-            validade_txt = f"⏳ **{dias_restantes} dias restantes**"
-        
-        texto = (
-            f"👋 **Olá, {message.from_user.first_name}!**\n\n"
-            f"👑 **Status:** Usuário VIP\n"
-            f"{validade_txt}\n"
-            f"🚀 **Downloads:** Ilimitados\n\n"
-            f"Pode enviar seus links à vontade! Se precisar de algo, use o botão abaixo."
-        )
+        status_txt = "💎 Eterno (Vitalício)" if user["vip_ate"] == "Vitalício" else f"⏳ Expira em: {user['vip_ate']}"
+        texto = f"👋 **Olá, {message.from_user.first_name}!**\n\n👑 **Status:** VIP\n✅ **Validade:** {status_txt}\n🚀 **Downloads:** Ilimitados"
         bot.reply_to(message, texto, reply_markup=menu_vip_ativo(), parse_mode="Markdown")
     else:
         restantes = 5 - user["downloads_hoje"]
-        texto = (
-            f"👋 **Bem-vindo ao Downloader VIP!**\n\n"
-            f"📊 **Status:** Plano Gratuito\n"
-            f"💡 **Limite Diário:** {restantes}/5 restantes\n\n"
-            f"Escolha um plano para remover todas as restrições:"
-        )
+        texto = f"👋 **Downloader VIP**\n\n📊 **Status:** Gratuito\n💡 **Restantes hoje:** {restantes}/5\n\nEscolha um plano abaixo para liberar acesso ilimitado:"
         bot.reply_to(message, texto, reply_markup=menu_planos(), parse_mode="Markdown")
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith("buy_"))
-def handle_payment(call):
-    _, valor, plano = call.data.split("_")
-    bot.answer_callback_query(call.id, "Gerando PIX...")
-    pix = gerar_pix(valor, f"Plano {plano} - Bot VIP", call.from_user.id, plano)
-    if pix:
-        texto = (
-            f"✅ **PIX Gerado!**\n\n"
-            f"📦 **Plano:** {plano}\n"
-            f"💰 **Valor:** R$ {valor}\n\n"
-            f"Cliquem no código abaixo para copiar:\n\n"
-            f"`{pix}`\n\n"
-            f"⚡ **A ativação será automática após o pagamento.**"
-        )
-        bot.send_message(call.message.chat.id, texto, parse_mode="Markdown")
+@bot.message_handler(commands=['meuadm'])
+def cmd_adm(message):
+    if str(message.from_user.id) == MY_ID:
+        user = obter_usuario(MY_ID)
+        user["vip_ate"] = "Vitalício"
+        salvar_usuario(user)
+        bot.reply_to(message, "👑 **Admin Vitalício Ativado com Sucesso!**")
 
-# --- DOWNLOADER (REUTILIZADO DO ANTERIOR) ---
+# --- DOWNLOADER ---
 @bot.message_handler(func=lambda message: "http" in message.text)
 def handle_dl(message):
-    dados = carregar_dados()
-    user = obter_usuario(message.from_user.id, dados)
-    vip = is_vip(message.from_user.id, dados)
+    user = obter_usuario(message.from_user.id)
+    vip = is_vip(message.from_user.id)
     hoje = datetime.now().strftime('%Y-%m-%d')
+    
     if user["ultima_data"] != hoje:
         user["downloads_hoje"] = 0
         user["ultima_data"] = hoje
-        salvar_dados(dados)
+        salvar_usuario(user)
+
     if not vip and user["downloads_hoje"] >= 5:
-        return bot.reply_to(message, "🚫 **Limite atingido!**", reply_markup=menu_planos())
-    msg = bot.reply_to(message, "⏳ **Processando...**")
+        return bot.reply_to(message, "🚫 **Limite diário atingido!**", reply_markup=menu_planos())
+
+    msg = bot.reply_to(message, "⏳ **Processando seu vídeo...**")
     url = message.text.split()[0]
     file_id = f"dl_{message.from_user.id}_{message.message_id}"
+    
     try:
         ydl_opts = {'format': 'best', 'outtmpl': f'{file_id}.%(ext)s', 'quiet': True}
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -160,18 +127,26 @@ def handle_dl(message):
             files = glob.glob(f"{file_id}.*")
             if files:
                 with open(files[0], 'rb') as f:
-                    bot.send_video(message.chat.id, f, caption=f"✅ **Sucesso!**\n💬 Suporte: {SUPORTE_USER}")
+                    bot.send_video(message.chat.id, f, caption=f"✅ **Download concluído!**\n\n💬 Suporte: {SUPORTE_USER}")
                 os.remove(files[0])
                 if not vip:
                     user["downloads_hoje"] += 1
-                    salvar_dados(dados)
+                    salvar_usuario(user)
                 bot.delete_message(message.chat.id, msg.message_id)
-            else: bot.edit_message_text("❌ Falha no download.", message.chat.id, msg.message_id)
-    except: bot.edit_message_text("❌ Link inválido.", message.chat.id, msg.message_id)
+            else:
+                bot.edit_message_text("❌ Erro ao gerar arquivo.", message.chat.id, msg.message_id)
+    except Exception:
+        bot.edit_message_text("❌ Link não suportado ou erro no download.", message.chat.id, msg.message_id)
 
-def run_flask(): app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+# --- INICIALIZAÇÃO ---
+@app.route('/')
+def health(): return "Bot Online", 200
+
+def run_flask():
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
 
 if __name__ == "__main__":
     Thread(target=run_flask).start()
     bot.remove_webhook()
+    print("Bot rodando com Banco de Dados Seguro!")
     bot.infinity_polling(skip_pending=True)
