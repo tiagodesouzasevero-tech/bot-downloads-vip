@@ -12,20 +12,18 @@ MONGO_URI = "mongodb+srv://tiagodesouzasevero_db_user:rdS2qlLSlH7eI9jA@cluster0.
 
 MY_ID = "493336271"
 
-# Conexão com o Banco de Dados
 try:
     client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
     db = client.get_default_database()
     usuarios_col = db["usuarios"]
-    print("Conexão com MongoDB estabelecida com sucesso!")
 except Exception as e:
-    print(f"Erro na conexão com Banco de Dados: {e}")
+    print(f"Erro MongoDB: {e}")
 
 bot = telebot.TeleBot(TOKEN_TELEGRAM, threaded=False)
 app = Flask(__name__)
 sdk = mercadopago.SDK(MP_ACCESS_TOKEN)
 
-# --- FUNÇÕES DE BANCO DE DADOS ---
+# --- FUNÇÕES VIP ---
 def obter_usuario(user_id):
     uid = str(user_id)
     user = usuarios_col.find_one({"_id": uid})
@@ -51,65 +49,47 @@ def menu_planos():
     markup.add(types.InlineKeyboardButton("💎 Vitalício - R$499,00", callback_data="buy_499_Vitalicio"))
     return markup
 
-# --- COMANDOS ADM ---
+# --- COMANDOS ---
 @bot.message_handler(commands=['meuadm'])
 def cmd_adm(message):
     if str(message.from_user.id) == MY_ID:
         user = obter_usuario(MY_ID)
         user["vip_ate"] = "Vitalício"
         salvar_usuario(user)
-        bot.reply_to(message, "👑 **AfiliadoClip Pro: Admin Vitalício Ativado!**")
+        bot.reply_to(message, "👑 **AfiliadoClip Pro: Admin Ativado!**")
 
-@bot.message_handler(commands=['avisotodos'])
-def cmd_broadcast(message):
-    if str(message.from_user.id) == MY_ID:
-        msg_texto = message.text.replace('/avisotodos', '').strip()
-        if not msg_texto: return bot.reply_to(message, "❌ Digite a mensagem após o comando.")
-        usuarios = usuarios_col.find()
-        sucesso, erro = 0, 0
-        status_msg = bot.reply_to(message, "📢 Enviando transmissão...")
-        for u in usuarios:
-            try:
-                bot.send_message(u["_id"], msg_texto)
-                sucesso += 1
-            except: erro += 1
-        bot.edit_message_text(f"✅ **Concluído!**\n\n🟢 Sucesso: {sucesso}\n🔴 Falhas: {erro}", message.chat.id, status_msg.message_id)
-
-# --- COMANDOS USUÁRIO ---
 @bot.message_handler(commands=['start', 'perfil'])
 def cmd_start(message):
     user = obter_usuario(message.from_user.id)
     vip = is_vip(message.from_user.id)
     nome = message.from_user.first_name
-    plataformas = "📌 **Pinterest, TikTok, RedNote, Reels e Shopee.**"
+    plataformas = "📌 **Pinterest, TikTok e RedNote.**"
 
     if vip:
         expira = "Vitalício" if user["vip_ate"] == "Vitalício" else f"Expira em: {user['vip_ate']}"
         texto = (
             f"👋 **Olá, {nome}! Bem-vindo ao AfiliadoClip Pro!**\n\n"
-            "💎 **Plano VIP Ativo**\n"
-            f"✅ {expira}\n\n"
+            f"💎 **Plano VIP Ativo**\n✅ {expira}\n\n"
             f"🚀 **Acesso liberado para:**\n{plataformas}\n\n"
-            "• Qualidade: **HD Otimizado**\n"
+            "• Qualidade: **HD (720p) Otimizado**\n"
             "• Limite: Vídeos de até **90 segundos**\n\n"
             "Cole o link do seu achadinho abaixo! 👇"
         )
-        bot.reply_to(message, texto, parse_mode="Markdown")
     else:
         restantes = 5 - user.get("downloads_hoje", 0)
         texto = (
             f"👋 **Olá, {nome}! Bem-vindo ao AfiliadoClip Pro!**\n\n"
             "🎯 **O bot nº 1 para Afiliados de Achadinhos.**\n"
-            f"Baixe vídeos do {plataformas} prontos para vender!\n\n"
+            f"Baixe vídeos do {plataformas}\n\n"
             "⚙️ **Especificações:**\n"
-            "• Vídeos em **Qualidade HD**\n"
+            "• Vídeos em **HD (720p)**\n"
             "• Duração máxima de **90 segundos**\n\n"
             f"📊 **Status:** Gratuito | **Restantes:** {restantes}/5 hoje\n\n"
             "Cole o link do vídeo abaixo! 👇"
         )
-        bot.reply_to(message, texto, reply_markup=menu_planos(), parse_mode="Markdown")
+    bot.reply_to(message, texto, reply_markup=None if vip else menu_planos(), parse_mode="Markdown")
 
-# --- DOWNLOADER (REFORÇADO) ---
+# --- DOWNLOADER (TRAVA 720P + FFMPEG) ---
 @bot.message_handler(func=lambda message: "http" in message.text)
 def handle_dl(message):
     user = obter_usuario(message.from_user.id)
@@ -118,23 +98,20 @@ def handle_dl(message):
     if not vip and user.get("downloads_hoje", 0) >= 5:
         return bot.reply_to(message, "🚫 Limite diário atingido!", reply_markup=menu_planos())
 
-    msg = bot.reply_to(message, "✅ Seu link foi adicionado à fila! Aguarde alguns instantes...")
+    msg = bot.reply_to(message, "✅ Processando em HD... Aguarde.")
     url = message.text.split()[0]
     file_id = f"dl_{message.from_user.id}_{message.message_id}"
     
     try:
-        # Analisa duração primeiro com bypass de segurança
-        ydl_info_opts = {'quiet': True, 'nocheckcertificate': True}
-        with yt_dlp.YoutubeDL(ydl_info_opts) as ydl:
+        with yt_dlp.YoutubeDL({'quiet': True, 'nocheckcertificate': True}) as ydl:
             info = ydl.extract_info(url, download=False)
-            duracao = info.get('duration', 0)
-            if duracao > 90:
+            if info.get('duration', 0) > 90:
                 bot.delete_message(message.chat.id, msg.message_id)
-                return bot.reply_to(message, "⚠️ **Vídeo muito longo!**\n\nNosso sistema é focado em vídeos de até **90 segundos**.")
+                return bot.reply_to(message, "⚠️ Limite: 90 segundos.")
 
-        # Opções de Download Flexíveis (Resolve o erro 'format not available')
+        # REGRA PARA HD (720p): Não permite baixar em 1080p
         ydl_opts = {
-            'format': 'bestvideo[height<=720]+bestaudio/best[height<=720]/best',
+            'format': 'bestvideo[height<=720]+bestaudio/best[height<=720]',
             'outtmpl': f'{file_id}.%(ext)s',
             'quiet': True,
             'nocheckcertificate': True,
@@ -154,33 +131,14 @@ def handle_dl(message):
                     salvar_usuario(user)
                 bot.delete_message(message.chat.id, msg.message_id)
             else:
-                raise Exception("Erro ao localizar arquivo")
+                raise Exception("Erro no download")
     except Exception as e:
-        print(f"Erro no download: {e}")
-        bot.edit_message_text("❌ Erro ao processar. Certifique-se que o vídeo é público, tem até 90s e o link está correto.", message.chat.id, msg.message_id)
+        print(f"Erro: {e}")
+        bot.edit_message_text("❌ Erro. Use links públicos do Pinterest, TikTok ou RedNote (Até 90s).", message.chat.id, msg.message_id)
 
-# --- WEBHOOK PAGAMENTO ---
-@app.route('/webhook', methods=['POST'])
-def webhook():
-    if request.args.get("type") == "payment":
-        payment_id = request.args.get("data.id")
-        payment_info = sdk.payment().get(payment_id)
-        if payment_info["response"]["status"] == "approved":
-            ref = payment_info["response"]["external_reference"]
-            user_id, plano = ref.split(":")
-            user = obter_usuario(user_id)
-            hoje = datetime.now()
-            if plano == "Mensal": nova_data = (hoje + timedelta(days=30)).strftime('%Y-%m-%d')
-            elif plano == "Anual": nova_data = (hoje + timedelta(days=365)).strftime('%Y-%m-%d')
-            else: nova_data = "Vitalício"
-            user["vip_ate"] = nova_data
-            salvar_usuario(user)
-            bot.send_message(user_id, f"🌟 **PAGAMENTO CONFIRMADO!**\n\nSeu acesso **{plano}** no **AfiliadoClip Pro** foi ativado!")
-    return "OK", 200
-
-# --- RUN ---
+# --- SERVIDOR ---
 @app.route('/')
-def health(): return "AfiliadoClip Pro Online", 200
+def health(): return "Online", 200
 
 def run_flask():
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
