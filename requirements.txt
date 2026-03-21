@@ -2,5 +2,5 @@ pyTelegramBotAPI
 yt-dlp
 mercadopago
 flask
-pymongo
+pymongo[srv]
 dnspython
