@@ -13,12 +13,12 @@ SUPORTE_USER = "@suportebotvip01"
 bot = telebot.TeleBot(TOKEN_TELEGRAM, threaded=False)
 app = Flask(__name__)
 
-# Rota para a Railway confirmar que o bot está ativo (Health Check)
+# Rota para Health Check da Railway
 @app.route('/')
-def health_check():
-    return "Bot Downloader VIP está rodando!", 200
+def health():
+    return "Bot Online", 200
 
-# --- FUNÇÕES DE DADOS (SISTEMA VIP) ---
+# --- SISTEMA DE DADOS ---
 def carregar_dados():
     if not os.path.exists(DB_FILE): return {"usuarios": {}}
     try:
@@ -45,7 +45,7 @@ def is_vip(user_id, dados):
 # --- COMANDOS ---
 @bot.message_handler(commands=['start'])
 def cmd_start(message):
-    bot.reply_to(message, "✅ **Bot Downloader VIP Online!**\n\nEnvie links do TikTok, Pinterest ou Rednote para baixar agora.")
+    bot.reply_to(message, "✅ **Bot Downloader VIP Online!**\n\nEnvie links do TikTok, Pinterest ou Rednote para baixar.")
 
 @bot.message_handler(commands=['meuadm'])
 def cmd_adm(message):
@@ -54,9 +54,9 @@ def cmd_adm(message):
         user = obter_usuario(MY_ID, dados)
         user["vip_ate"] = "Vitalício"
         salvar_dados(dados)
-        bot.reply_to(message, "👑 **Olá, Tiago!** Você agora tem acesso Vitalício como administrador.")
+        bot.reply_to(message, "👑 Admin ativado com sucesso!")
 
-# --- DOWNLOADER (Tiktok, Pinterest, Rednote) ---
+# --- DOWNLOADER ---
 @bot.message_handler(func=lambda message: "http" in message.text)
 def handle_dl(message):
     dados = carregar_dados()
@@ -64,7 +64,7 @@ def handle_dl(message):
     vip = is_vip(user_id, dados)
     user = obter_usuario(user_id, dados)
     
-    # Reset diário de downloads para não-vips
+    # Controle de downloads diários
     hoje = datetime.now().strftime('%Y-%m-%d')
     if user["ultima_data"] != hoje:
         user["downloads_hoje"] = 0
@@ -72,9 +72,9 @@ def handle_dl(message):
         salvar_dados(dados)
 
     if not vip and user["downloads_hoje"] >= 5:
-        return bot.reply_to(message, "🚫 **Limite diário atingido!**\n\nUsuários gratuitos podem baixar 5 vídeos por dia. Digite /vip para assinar.")
+        return bot.reply_to(message, "🚫 Limite de 5 downloads atingido. Torne-se VIP!")
 
-    msg = bot.reply_to(message, "⏳ **Processando...** aguarde um instante.")
+    msg = bot.reply_to(message, "⏳ **Processando vídeo...**")
     url = message.text.split()[0]
     file_id = f"dl_{user_id}_{message.message_id}"
 
@@ -84,8 +84,7 @@ def handle_dl(message):
             'outtmpl': f'{file_id}.%(ext)s',
             'quiet': True,
             'no_warnings': True,
-            'nocheckcertificate': True,
-            'http_headers': {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0'}
+            'http_headers': {'User-Agent': 'Mozilla/5.0'}
         }
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -93,25 +92,23 @@ def handle_dl(message):
             files = glob.glob(f"{file_id}.*")
             if files:
                 with open(files[0], 'rb') as f:
-                    bot.send_video(message.chat.id, f, caption=f"✅ **Vídeo baixado com sucesso!**\n💬 Suporte: {SUPORTE_USER}")
+                    bot.send_video(message.chat.id, f, caption=f"✅ Suporte: {SUPORTE_USER}")
                 os.remove(files[0])
-                
                 if not vip:
                     user["downloads_hoje"] += 1
                     salvar_dados(dados)
                 bot.delete_message(message.chat.id, msg.message_id)
             else:
-                bot.edit_message_text("❌ Não foi possível encontrar o vídeo nesse link.", message.chat.id, msg.message_id)
-
+                bot.edit_message_text("❌ Vídeo não encontrado.", message.chat.id, msg.message_id)
     except Exception:
-        bot.edit_message_text("❌ **Erro:** Este link é privado ou não suportado no momento.", message.chat.id, msg.message_id)
+        bot.edit_message_text("❌ Erro ao processar este link.", message.chat.id, msg.message_id)
 
-# --- INICIALIZAÇÃO ---
+# --- EXECUÇÃO ---
 def run_flask():
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
 
 if __name__ == "__main__":
-    Thread(target=run_flask).start() # Inicia o servidor Flask
-    bot.remove_webhook() # Limpa conexões antigas
-    print("Bot rodando...")
-    bot.infinity_polling(skip_pending=True) # Ignora mensagens enviadas enquanto o bot estava offline
+    Thread(target=run_flask).start()
+    bot.remove_webhook()
+    print("Bot Iniciado!")
+    bot.infinity_polling(skip_pending=True)
