@@ -5,7 +5,7 @@ from threading import Thread
 from telebot import types
 from pymongo import MongoClient
 
-# --- CONFIGURAÇÕES ESSENCIAIS (MANTIDAS) ---
+# --- CONFIGURAÇÕES ESSENCIAIS (MANTIDAS v1.0.0) ---
 TOKEN_TELEGRAM = "8629536333:AAHjRGGxSm_Fc_WnAv8a2qLItCC_-bMUWqY"
 MP_ACCESS_TOKEN = "APP_USR-8179041093511853-031916-7364f07318b6c464600a781433c743f7-384532659"
 MONGO_URI = "mongodb+srv://tiagodesouzasevero_db_user:rdS2qlLSlH7eI9jA@cluster0.x3wiavb.mongodb.net/bot_downloader?retryWrites=true&w=majority&tlsAllowInvalidCertificates=true"
@@ -20,7 +20,7 @@ bot = telebot.TeleBot(TOKEN_TELEGRAM, threaded=False)
 app = Flask(__name__)
 sdk = mercadopago.SDK(MP_ACCESS_TOKEN)
 
-# --- GESTÃO DE USUÁRIOS ---
+# --- GESTÃO DE USUÁRIOS (MANTIDA v1.0.0) ---
 def obter_usuario(user_id):
     uid = str(user_id)
     hoje = datetime.now().strftime('%Y-%m-%d')
@@ -44,15 +44,16 @@ def is_vip(user_id):
     try: return datetime.now() < datetime.strptime(user["vip_ate"], '%Y-%m-%d')
     except: return False
 
-# --- MENUS ---
+# --- MENUS (VALOR VITALÍCIO ATUALIZADO v1.0.1) ---
 def menu_planos():
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("💳 Mensal - R$10,00", callback_data="buy_10_Mensal"))
     markup.add(types.InlineKeyboardButton("🌟 Anual - R$69,90", callback_data="buy_69.9_Anual"))
-    markup.add(types.InlineKeyboardButton("💎 Vitalício - R$499,00", callback_data="buy_499_Vitalicio"))
+    # Alteração de valor: 499 -> 190
+    markup.add(types.InlineKeyboardButton("💎 Vitalício - R$190,00 🔥", callback_data="buy_190_Vitalicio"))
     return markup
 
-# --- COMANDOS ---
+# --- COMANDOS (TEXTOS ATUALIZADOS v1.0.1) ---
 @bot.message_handler(commands=['meuadm'])
 def cmd_adm(message):
     if str(message.from_user.id) == MY_ID:
@@ -66,17 +67,30 @@ def cmd_start(message):
     user = obter_usuario(message.from_user.id)
     vip = is_vip(message.from_user.id)
     nome = message.from_user.first_name
+    
     if vip:
         expira = user["vip_ate"]
-        texto = f"👋 Olá, {nome}!\n💎 <b>Status: VIP ({expira})</b>\n✨ Qualidade HD Liberada!\n\nEnvie o link abaixo 👇"
+        texto = (
+            f"🚀 <b>Bem-vindo ao ViralClip Pro – Downloader HD</b>\n\n"
+            f"👋 Olá, {nome}!\n💎 <b>Status: VIP ({expira})</b>\n"
+            f"🚀 Benefícios liberados:\n• Downloads ILIMITADOS\n• Prioridade no servidor\n\n"
+            f"Pode enviar o link do vídeo e aproveitar 👇"
+        )
         markup = None
     else:
-        restantes = 5 - user.get("downloads_hoje", 0)
-        texto = f"👋 Olá, {nome}!\n📊 <b>Status: Gratuito</b>\n📥 Restantes: {restantes}/5 hoje\n\nEnvie o link abaixo ou assine o VIP para HD ilimitado!"
+        texto = (
+            f"🚀 <b>Bem-vindo ao ViralClip Pro – Downloader HD</b>\n\n"
+            f"Baixe vídeos do TikTok, Pinterest e Rednote em segundos 👇\n\n"
+            f"🎁 <b>Plano GRATUITO:</b>\n• 5 downloads por dia\n\n"
+            f"💎 <b>Plano VIP:</b>\n• Downloads ILIMITADOS\n• Sem fila\n• Alta velocidade\n\n"
+            f"💰 <b>Planos:</b>\n• Mensal: R$10,00\n• Anual: R$69,90\n"
+            f"• Vitalício: R$190,00 🔥 Oferta por tempo limitado\n\n"
+            f"👇 Escolha uma opção abaixo:"
+        )
         markup = menu_planos()
     bot.reply_to(message, texto, reply_markup=markup, parse_mode="HTML")
 
-# --- WEBHOOK (AUTOMAÇÃO MP) ---
+# --- WEBHOOK (MANTIDO + TEXTO v1.0.1) ---
 @app.route('/webhook', methods=['POST'])
 def webhook():
     data = request.get_json()
@@ -92,10 +106,20 @@ def webhook():
             else: nova_data = "Vitalício"
             user["vip_ate"] = nova_data
             salvar_usuario(user)
-            bot.send_message(user_id, f"🎉 <b>PAGAMENTO APROVADO!</b>\nPlano: {plano}\nValidade: {nova_data}", parse_mode="HTML")
+            
+            confirmacao = (
+                "✅ <b>Pagamento confirmado!</b>\n\n"
+                "Agora você é VIP 🎉\n\n"
+                "🚀 <b>Benefícios liberados:</b>\n"
+                "• Downloads ILIMITADOS\n"
+                "• Prioridade no servidor\n"
+                "• Sem restrições\n\n"
+                "Pode enviar o link do vídeo e aproveitar 👇"
+            )
+            bot.send_message(user_id, confirmacao, parse_mode="HTML")
     return "OK", 200
 
-# --- COMPRA ---
+# --- COMPRA (VALOR VITALÍCIO ATUALIZADO v1.0.1) ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith("buy_"))
 def callback_buy(call):
     _, valor, plano = call.data.split("_")
@@ -109,29 +133,41 @@ def callback_buy(call):
     url_pag = result["response"]["init_point"]
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("🔗 Pagar Agora", url=url_pag))
-    bot.edit_message_text(f"💳 <b>Assinatura {plano}</b>\nValor: R$ {valor}", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="HTML")
+    
+    texto_compra = (
+        f"💳 <b>Assinatura {plano}</b>\n"
+        f"Valor: R$ {valor}\n\n"
+        f"👉 Clique abaixo e libere agora"
+    )
+    bot.edit_message_text(texto_compra, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="HTML")
 
-# --- DOWNLOADER (AJUSTADO PARA TRAVAR EM 720p / 30fps) ---
+# --- DOWNLOADER (MANTIDO v1.0.0 + TEXTO LIMITE v1.0.1) ---
 @bot.message_handler(func=lambda message: "http" in message.text)
 def handle_dl(message):
     user = obter_usuario(message.from_user.id)
     vip = is_vip(message.from_user.id)
+    
     if not vip and user.get("downloads_hoje", 0) >= 5:
-        return bot.reply_to(message, "🚫 <b>Limite atingido!</b>", reply_markup=menu_planos(), parse_mode="HTML")
+        msg_limite = (
+            "⚠️ <b>Você atingiu o limite de 5 downloads gratuitos hoje.</b>\n\n"
+            "Mas relaxa 👇\n\n"
+            "🔥 <b>Libere acesso ILIMITADO agora mesmo:</b>\n"
+            "• Baixe quantos vídeos quiser\n"
+            "• Sem espera\n"
+            "• Muito mais rápido\n\n"
+            "💎 <b>Torne-se VIP:</b>\n• R$10/mês\n• R$69,90/ano\n"
+            "• R$190 vitalício 🔥 Oferta por tempo limitado\n\n"
+            "👉 Clique abaixo e libere agora"
+        )
+        return bot.reply_to(message, msg_limite, reply_markup=menu_planos(), parse_mode="HTML")
 
     msg = bot.reply_to(message, "⏳ <b>Processando em HD...</b>", parse_mode="HTML")
     url = message.text.split()[0]
     file_id = f"dl_{message.from_user.id}_{message.message_id}"
     
     ydl_opts = {
-        # Tenta pegar a melhor combinação possível
         'format': 'bestvideo+bestaudio/best',
-        # Aqui está a mágica: O bot vai "filtrar" a melhor qualidade listada acima baseado nessas regras
-        'format_sort': [
-            'res:720',    # Prioriza resolução até 720p (se o original for menor, baixa menor)
-            'fps:30',     # Prioriza FPS até 30
-            'vcodec:h264' # Formato de vídeo mais amigável para o Telegram
-        ],
+        'format_sort': ['res:720', 'fps:30', 'vcodec:h264'],
         'outtmpl': f'{file_id}.%(ext)s',
         'merge_output_format': 'mp4',
         'quiet': True,
@@ -142,7 +178,6 @@ def handle_dl(message):
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
-            # Trava de 90s mantida
             if info.get('duration', 0) > 90:
                 bot.edit_message_text("⚠️ <b>Vídeo muito longo!</b> O limite é 90 segundos.", message.chat.id, msg.message_id, parse_mode="HTML")
                 for f in glob.glob(f"{file_id}.*"): os.remove(f)
@@ -165,10 +200,9 @@ def handle_dl(message):
             else:
                 raise Exception("Arquivo não encontrado")
     except Exception as e:
-        print(f"Erro: {e}")
         bot.edit_message_text("❌ <b>Erro ao baixar.</b> Verifique o link.", message.chat.id, msg.message_id, parse_mode="HTML")
 
-# --- SERVIDOR ---
+# --- SERVIDOR (MANTIDO v1.0.0) ---
 @app.route('/')
 def health(): return "Online", 200
 
