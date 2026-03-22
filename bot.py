@@ -57,19 +57,24 @@ def process_video_standard(input_path, output_path):
         print(f"Erro FFmpeg: {e}")
         return False
 
-# --- COMANDO /START (CORRIGIDO) ---
+# --- COMANDO /START (ATUALIZADO CONFORME SOLICITADO) ---
 @bot.message_handler(commands=['start', 'perfil'])
 def send_welcome(message):
     user = obter_usuario(message.from_user.id)
     vip = is_vip(message.from_user.id)
     
-    status = "💎 <b>VIP PRO</b>" if vip else f"🆓 <b>Grátis</b> ({user.get('downloads_hoje', 0)}/5 hoje)"
+    if vip:
+        status_info = "💎 VIP PRO – Download ilimitado"
+    else:
+        restantes = 5 - user.get('downloads_hoje', 0)
+        restantes = max(0, restantes)
+        status_info = f"👤 Gratuito – {restantes}/5 downloads disponíveis hoje"
     
     texto = (
-        f"🚀 <b>ViralClip Pro - Downloader HD</b>\n\n"
-        f"Padronizamos seus vídeos para <b>720p (9:16)</b> prontos para postar!\n\n"
-        f"👤 Seu Status: {status}\n"
-        f"🔗 <b>Envie um link do TikTok, Pinterest ou RedNote:</b>"
+        f"🚀 <b>AfiliadoClip Pro</b>\n\n"
+        f"{status_info}\n\n"
+        f"🔗 <b>Envie um link do TikTok, Pinterest ou RedNote:</b>\n"
+        f"⚠️ É suportado vídeos com no máximo 90 segundos"
     )
     
     markup = types.InlineKeyboardMarkup()
@@ -78,19 +83,17 @@ def send_welcome(message):
     
     bot.send_message(message.chat.id, texto, parse_mode="HTML", reply_markup=markup)
 
-# --- DOWNLOADER COM CONTADOR CORRIGIDO (1/5, 2/5...) ---
+# --- DOWNLOADER (CONTADOR MANTIDO) ---
 @bot.message_handler(func=lambda message: "http" in message.text)
 def handle_dl(message):
     user = obter_usuario(message.from_user.id)
     vip = is_vip(message.from_user.id)
     
-    # Reset de contador diário
     hoje = datetime.now().strftime('%Y-%m-%d')
     if user.get("ultima_data") != hoje:
         usuarios_col.update_one({"_id": user["_id"]}, {"$set": {"downloads_hoje": 0, "ultima_data": hoje}})
         user["downloads_hoje"] = 0
         
-    # Verificação de Limite e Formatação do Contador
     if not vip:
         downloads_atuais = user.get("downloads_hoje", 0)
         if downloads_atuais >= 5:
@@ -121,7 +124,6 @@ def handle_dl(message):
             with open(final_file, 'rb') as f:
                 bot.send_video(message.chat.id, f, caption=f"Vídeo padronizado com sucesso! {exibicao_contador}")
             
-            # Incrementa contador apenas após o sucesso
             if not vip:
                 usuarios_col.update_one({"_id": user["_id"]}, {"$inc": {"downloads_hoje": 1}})
             
