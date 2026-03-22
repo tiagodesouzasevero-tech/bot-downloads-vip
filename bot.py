@@ -5,7 +5,7 @@ from threading import Thread
 from telebot import types
 from pymongo import MongoClient
 
-# --- CONFIGURAÇÕES MANTIDAS ---
+# --- CONFIGURAÇÕES MANTIDAS (NÃO ALTERAR) ---
 TOKEN_TELEGRAM = "8629536333:AAHjRGGxSm_Fc_WnAv8a2qLItCC_-bMUWqY"
 MP_ACCESS_TOKEN = "APP_USR-8179041093511853-031916-7364f07318b6c464600a781433c743f7-384532659"
 MONGO_URI = "mongodb+srv://tiagodesouzasevero_db_user:rdS2qlLSlH7eI9jA@cluster0.x3wiavb.mongodb.net/bot_downloader?retryWrites=true&w=majority&tlsAllowInvalidCertificates=true"
@@ -17,36 +17,49 @@ bot = telebot.TeleBot(TOKEN_TELEGRAM, threaded=False)
 app = Flask(__name__)
 sdk = mercadopago.SDK(MP_ACCESS_TOKEN)
 
-# --- FUNÇÃO OBRIGATÓRIA DE PROCESSAMENTO (FFMPEG DIRETO) ---
-def process_video(input_path, output_path):
-    print(f"🎬 Iniciando processamento: {input_path}")
+# --- FUNÇÃO DE PADRONIZAÇÃO VISUAL (FFMPEG) ---
+def process_video_standard(input_path, output_path):
+    print(f"🎬 Iniciando Padronização Visual: {input_path}")
     
-    # Comando FFmpeg: 
-    # if(gt(ih,720),720,ih) -> Se altura > 720, fixa em 720. Senão, mantém.
-    # -2 -> Mantém a proporção da largura automaticamente.
-    # -r 30 -> Força 30 FPS.
+    # LÓGICA DE FILTRO:
+    # 1. scale=... : Se altura > 1280 ou largura > 720, redimensiona proporcionalmente.
+    # 2. pad=720:1280... : Centraliza em um quadro preto de 720x1280 se for maior.
+    # 3. Se for MENOR que 720x1280, o filtro 'min' garante que ele NÃO faça upscale.
+    video_filter = (
+        "scale='min(720,iw)':-2," # Reduz largura para 720 se for maior, mantém proporção
+        "scale=-2:'min(1280,ih)'," # Reduz altura para 1280 se for maior, mantém proporção
+        "pad=720:1280:(ow-iw)/2:(oh-ih)/2:black," # Adiciona barras pretas se sobrar espaço
+        "fps=30" # Normaliza para 30 FPS
+    )
+    
     cmd = [
         'ffmpeg', '-y', '-i', input_path,
-        '-vf', "scale='if(gt(ih,720),-2,iw)':'if(gt(ih,720),720,ih)',fps=30",
+        '-vf', video_filter,
         '-c:v', 'libx264', '-crf', '23', '-preset', 'veryfast',
         '-c:a', 'copy', output_path
     ]
     
     try:
+        # Pega resolução original para o Debug Log
+        probe = subprocess.check_output(['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height', '-of', 'csv=s=x:p=0', input_path]).decode().strip()
+        print(f"📊 Resolução Original: {probe}")
+        
         subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        print(f"✅ Processamento concluído: {output_path}")
+        
+        # Pega resolução final para o Debug Log
+        final_probe = subprocess.check_output(['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height', '-of', 'csv=s=x:p=0', output_path]).decode().strip()
+        print(f"✅ Resolução Final: {final_probe} | Método: Proportional Resize/Padding")
         return True
-    except subprocess.CalledProcessError as e:
-        print(f"❌ Erro no FFmpeg: {e.stderr.decode()}")
+    except Exception as e:
+        print(f"❌ Erro no Processamento: {e}")
         return False
 
-# --- DOWNLOADER v1.1.5 (FLUXO SEPARADO) ---
+# --- DOWNLOADER v1.1.6 (FLUXO OBRIGATÓRIO) ---
 @bot.message_handler(func=lambda message: "http" in message.text)
 def handle_dl(message):
     user = obter_usuario(message.from_user.id)
     vip = is_vip(message.from_user.id)
     
-    # Verificação de limites e VIP (Mantido)
     hoje = datetime.now().strftime('%Y-%m-%d')
     if user.get("ultima_data") != hoje:
         usuarios_col.update_one({"_id": user["_id"]}, {"$set": {"downloads_hoje": 0, "ultima_data": hoje}})
@@ -54,13 +67,12 @@ def handle_dl(message):
     if not vip and user.get("downloads_hoje", 0) >= 5:
         return bot.reply_to(message, "⚠️ Limite diário atingido!")
 
-    msg_p = bot.reply_to(message, "✅ Seu link foi adicionado à fila! Processando vídeo...")
+    msg_p = bot.reply_to(message, "✅ Seu link foi adicionado à fila! Padronizando qualidade HD...")
     
     url = message.text.split()[0]
     raw_file = f"raw_{message.from_user.id}_{message.message_id}.mp4"
     final_file = f"final_{message.from_user.id}_{message.message_id}.mp4"
     
-    # 1. DOWNLOAD (BAIXA O ORIGINAL)
     ydl_opts = {
         'format': 'bestvideo+bestaudio/best',
         'outtmpl': raw_file,
@@ -71,19 +83,16 @@ def handle_dl(message):
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
-            duracao = info.get('duration', 0)
-            
-            if duracao and duracao > 90:
+            if info.get('duration', 0) > 90:
                 if os.path.exists(raw_file): os.remove(raw_file)
                 return bot.edit_message_text("❌ Vídeo acima de 90 segundos.", message.chat.id, msg_p.message_id)
 
-        # 2. PROCESSAMENTO OBRIGATÓRIO (RESIZE E FPS)
-        if process_video(raw_file, final_file):
-            # 3. ENVIO (APENAS O ARQUIVO PROCESSADO)
+        # PROCESSAMENTO OBRIGATÓRIO
+        if process_video_standard(raw_file, final_file):
             with open(final_file, 'rb') as f:
                 bot.send_video(message.chat.id, f, caption="Vídeo baixado com sucesso🤝")
             
-            # Limpeza
+            # Limpeza de arquivos
             if os.path.exists(raw_file): os.remove(raw_file)
             if os.path.exists(final_file): os.remove(final_file)
             
@@ -91,14 +100,13 @@ def handle_dl(message):
                 usuarios_col.update_one({"_id": user["_id"]}, {"$inc": {"downloads_hoje": 1}})
             bot.delete_message(message.chat.id, msg_p.message_id)
         else:
-            raise Exception("Erro no processamento")
+            raise Exception("Falha no FFmpeg")
                 
     except Exception as e:
-        print(f"Erro Final: {e}")
-        bot.edit_message_text("❌ Erro ao processar vídeo.", message.chat.id, msg_p.message_id)
+        bot.edit_message_text("❌ Erro ao processar. Tente outro link.", message.chat.id, msg_p.message_id)
         if os.path.exists(raw_file): os.remove(raw_file)
 
-# --- FUNÇÕES DE SUPORTE E SERVER (MANTIDAS) ---
+# --- SUPORTE, PIX E WEBHOOK (MANTIDOS 100%) ---
 def obter_usuario(user_id):
     uid = str(user_id)
     user = usuarios_col.find_one({"_id": uid})
