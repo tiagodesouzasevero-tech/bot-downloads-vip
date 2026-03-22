@@ -5,7 +5,7 @@ from threading import Thread
 from telebot import types
 from pymongo import MongoClient
 
-# --- CONFIGURAÇÕES MANTIDAS (NÃO ALTERAR) ---
+# --- CONFIGURAÇÕES CRÍTICAS (MANTIDAS) ---
 TOKEN_TELEGRAM = "8629536333:AAHjRGGxSm_Fc_WnAv8a2qLItCC_-bMUWqY"
 MP_ACCESS_TOKEN = "APP_USR-8179041093511853-031916-7364f07318b6c464600a781433c743f7-384532659"
 MONGO_URI = "mongodb+srv://tiagodesouzasevero_db_user:rdS2qlLSlH7eI9jA@cluster0.x3wiavb.mongodb.net/bot_downloader?retryWrites=true&w=majority&tlsAllowInvalidCertificates=true"
@@ -17,68 +17,92 @@ bot = telebot.TeleBot(TOKEN_TELEGRAM, threaded=False)
 app = Flask(__name__)
 sdk = mercadopago.SDK(MP_ACCESS_TOKEN)
 
-# --- FUNÇÃO DE PADRONIZAÇÃO VISUAL (FFMPEG) ---
+# --- FUNÇÕES DE SUPORTE (MANTIDAS) ---
+def obter_usuario(user_id):
+    uid = str(user_id)
+    user = usuarios_col.find_one({"_id": uid})
+    if not user:
+        hoje = datetime.now().strftime('%Y-%m-%d')
+        user = {"_id": uid, "vip_ate": None, "downloads_hoje": 0, "ultima_data": hoje}
+        usuarios_col.insert_one(user)
+    return user
+
+def is_vip(user_id):
+    user = obter_usuario(user_id)
+    if user.get("vip_ate") == "Vitalício": return True
+    if not user.get("vip_ate"): return False
+    try:
+        return datetime.now() < datetime.strptime(user["vip_ate"], '%Y-%m-%d')
+    except:
+        return False
+
+# --- PROCESSAMENTO DE VÍDEO (PADRONIZAÇÃO 9:16) ---
 def process_video_standard(input_path, output_path):
-    print(f"🎬 Iniciando Padronização Visual: {input_path}")
-    
-    # LÓGICA DE FILTRO:
-    # 1. scale=... : Se altura > 1280 ou largura > 720, redimensiona proporcionalmente.
-    # 2. pad=720:1280... : Centraliza em um quadro preto de 720x1280 se for maior.
-    # 3. Se for MENOR que 720x1280, o filtro 'min' garante que ele NÃO faça upscale.
+    print(f"🎬 Iniciando Padronização: {input_path}")
+    # Filtro: Redimensiona proporcionalmente para caber em 720x1280 e centraliza com fundo preto
     video_filter = (
-        "scale='min(720,iw)':-2," # Reduz largura para 720 se for maior, mantém proporção
-        "scale=-2:'min(1280,ih)'," # Reduz altura para 1280 se for maior, mantém proporção
-        "pad=720:1280:(ow-iw)/2:(oh-ih)/2:black," # Adiciona barras pretas se sobrar espaço
-        "fps=30" # Normaliza para 30 FPS
+        "scale='min(720,iw)':-2,"
+        "scale=-2:'min(1280,ih)',"
+        "pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,"
+        "fps=30"
     )
-    
     cmd = [
         'ffmpeg', '-y', '-i', input_path,
         '-vf', video_filter,
         '-c:v', 'libx264', '-crf', '23', '-preset', 'veryfast',
         '-c:a', 'copy', output_path
     ]
-    
     try:
-        # Pega resolução original para o Debug Log
-        probe = subprocess.check_output(['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height', '-of', 'csv=s=x:p=0', input_path]).decode().strip()
-        print(f"📊 Resolução Original: {probe}")
-        
         subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        
-        # Pega resolução final para o Debug Log
-        final_probe = subprocess.check_output(['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height', '-of', 'csv=s=x:p=0', output_path]).decode().strip()
-        print(f"✅ Resolução Final: {final_probe} | Método: Proportional Resize/Padding")
+        print(f"✅ Padronização Concluída: {output_path}")
         return True
     except Exception as e:
-        print(f"❌ Erro no Processamento: {e}")
+        print(f"❌ Erro FFmpeg: {e}")
         return False
 
-# --- DOWNLOADER v1.1.6 (FLUXO OBRIGATÓRIO) ---
+# --- COMANDO /START (CORRIGIDO) ---
+@bot.message_handler(commands=['start', 'perfil'])
+def send_welcome(message):
+    user = obter_usuario(message.from_user.id)
+    vip = is_vip(message.from_user.id)
+    
+    status = "💎 <b>VIP PRO</b>" if vip else f"🆓 <b>Grátis</b> ({user.get('downloads_hoje', 0)}/5 hoje)"
+    
+    texto = (
+        f"🚀 <b>ViralClip Pro - Downloader HD</b>\n\n"
+        f"Padronizamos seus vídeos para <b>720p (9:16)</b> prontos para postar!\n\n"
+        f"👤 Seu Status: {status}\n"
+        f"🔗 <b>Envie um link do TikTok, Pinterest ou RedNote:</b>"
+    )
+    
+    markup = types.InlineKeyboardMarkup()
+    if not vip:
+        markup.add(types.InlineKeyboardButton("💎 Ativar VIP Ilimitado", callback_data="upgrade_vip"))
+    
+    bot.send_message(message.chat.id, texto, parse_mode="HTML", reply_markup=markup)
+
+# --- DOWNLOADER (FLUXO OBRIGATÓRIO) ---
 @bot.message_handler(func=lambda message: "http" in message.text)
 def handle_dl(message):
     user = obter_usuario(message.from_user.id)
     vip = is_vip(message.from_user.id)
     
+    # Controle de Limites
     hoje = datetime.now().strftime('%Y-%m-%d')
     if user.get("ultima_data") != hoje:
         usuarios_col.update_one({"_id": user["_id"]}, {"$set": {"downloads_hoje": 0, "ultima_data": hoje}})
         user["downloads_hoje"] = 0
+        
     if not vip and user.get("downloads_hoje", 0) >= 5:
-        return bot.reply_to(message, "⚠️ Limite diário atingido!")
+        return bot.reply_to(message, "⚠️ Limite diário de 5 downloads atingido! Torne-se VIP para baixar sem limites.")
 
-    msg_p = bot.reply_to(message, "✅ Seu link foi adicionado à fila! Padronizando qualidade HD...")
+    msg_p = bot.reply_to(message, "⏳ <b>Processando e padronizando vídeo...</b>", parse_mode="HTML")
     
     url = message.text.split()[0]
     raw_file = f"raw_{message.from_user.id}_{message.message_id}.mp4"
     final_file = f"final_{message.from_user.id}_{message.message_id}.mp4"
     
-    ydl_opts = {
-        'format': 'bestvideo+bestaudio/best',
-        'outtmpl': raw_file,
-        'merge_output_format': 'mp4',
-        'quiet': True,
-    }
+    ydl_opts = {'format': 'bestvideo+bestaudio/best', 'outtmpl': raw_file, 'merge_output_format': 'mp4', 'quiet': True}
     
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -87,41 +111,26 @@ def handle_dl(message):
                 if os.path.exists(raw_file): os.remove(raw_file)
                 return bot.edit_message_text("❌ Vídeo acima de 90 segundos.", message.chat.id, msg_p.message_id)
 
-        # PROCESSAMENTO OBRIGATÓRIO
+        # Processamento Obrigatório
         if process_video_standard(raw_file, final_file):
             with open(final_file, 'rb') as f:
-                bot.send_video(message.chat.id, f, caption="Vídeo baixado com sucesso🤝")
+                bot.send_video(message.chat.id, f, caption="Vídeo padronizado com sucesso! 🤝")
             
-            # Limpeza de arquivos
-            if os.path.exists(raw_file): os.remove(raw_file)
-            if os.path.exists(final_file): os.remove(final_file)
-            
+            # Atualiza banco e limpa arquivos
             if not vip:
                 usuarios_col.update_one({"_id": user["_id"]}, {"$inc": {"downloads_hoje": 1}})
+            
+            for f in [raw_file, final_file]:
+                if os.path.exists(f): os.remove(f)
             bot.delete_message(message.chat.id, msg_p.message_id)
         else:
-            raise Exception("Falha no FFmpeg")
+            raise Exception("Erro no processamento")
                 
     except Exception as e:
-        bot.edit_message_text("❌ Erro ao processar. Tente outro link.", message.chat.id, msg_p.message_id)
+        bot.edit_message_text("❌ Erro ao processar. Tente novamente.", message.chat.id, msg_p.message_id)
         if os.path.exists(raw_file): os.remove(raw_file)
 
-# --- SUPORTE, PIX E WEBHOOK (MANTIDOS 100%) ---
-def obter_usuario(user_id):
-    uid = str(user_id)
-    user = usuarios_col.find_one({"_id": uid})
-    if not user:
-        user = {"_id": uid, "vip_ate": None, "downloads_hoje": 0, "ultima_data": datetime.now().strftime('%Y-%m-%d')}
-        usuarios_col.insert_one(user)
-    return user
-
-def is_vip(user_id):
-    user = obter_usuario(user_id)
-    if user.get("vip_ate") == "Vitalício": return True
-    if not user.get("vip_ate"): return False
-    try: return datetime.now() < datetime.strptime(user["vip_ate"], '%Y-%m-%d')
-    except: return False
-
+# --- WEBHOOK E SERVIDOR (MANTIDOS) ---
 @app.route('/webhook', methods=['POST'])
 def webhook():
     data = request.args.to_dict() or request.json or {}
@@ -134,11 +143,12 @@ def webhook():
                 desc = payment_info["response"]["description"]
                 expira = "Vitalício" if "Vitalicio" in desc else (datetime.now() + timedelta(days=30)).strftime('%Y-%m-%d')
                 usuarios_col.update_one({"_id": str(user_id)}, {"$set": {"vip_ate": expira}})
-                bot.send_message(user_id, "✅ <b>VIP Ativado!</b>")
+                bot.send_message(user_id, "✅ <b>VIP Ativado!</b> Aproveite downloads ilimitados.")
     return "OK", 200
 
 @app.route('/')
-def health(): return "Bot Online", 200
+def health(): return "ViralClip Pro Online", 200
+
 def run_flask(): app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
 
 if __name__ == "__main__":
