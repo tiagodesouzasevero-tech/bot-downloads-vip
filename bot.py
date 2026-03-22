@@ -18,7 +18,7 @@ bot = telebot.TeleBot(TOKEN_TELEGRAM, threaded=False)
 app = Flask(__name__)
 sdk = mercadopago.SDK(MP_ACCESS_TOKEN)
 
-# --- FUNÇÕES DE USUÁRIO ---
+# --- FUNÇÕES DE USUÁRIO (MANTIDAS) ---
 def obter_usuario(user_id):
     uid = str(user_id)
     user = usuarios_col.find_one({"_id": uid})
@@ -38,7 +38,7 @@ def is_vip(user_id):
     except:
         return False
 
-# --- MENUS ---
+# --- MENUS (MANTIDOS) ---
 def menu_planos():
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("💳 Mensal - R$10,00", callback_data="buy_10_Mensal"))
@@ -46,20 +46,20 @@ def menu_planos():
     markup.add(types.InlineKeyboardButton("💎 Vitalício - R$190,00 🔥", callback_data="buy_190_Vitalicio"))
     return markup
 
-# --- COMANDOS ---
+# --- COMANDOS (MANTIDOS) ---
 @bot.message_handler(commands=['start', 'perfil'])
 def cmd_start(message):
     user = obter_usuario(message.from_user.id)
     vip = is_vip(message.from_user.id)
     status = user.get("vip_ate", "Grátis") if vip else "Grátis"
-    texto = f"🚀 <b>ViralClip Pro</b>\n\n💎 Status: <b>{status}</b>\n\nEnvie o link do vídeo para baixar 👇"
-    bot.reply_to(message, texto, reply_markup=None if vip else menu_planos(), parse_mode="HTML")
+    bot.reply_to(message, f"🚀 <b>ViralClip Pro</b>\n\n💎 Status: <b>{status}</b>\n\nEnvie o link do vídeo 👇", 
+                 reply_markup=None if vip else menu_planos(), parse_mode="HTML")
 
 # --- PAGAMENTOS PIX (MANTIDO) ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith("buy_"))
 def callback_buy(call):
     try:
-        bot.answer_callback_query(call.id, "⏳ Gerando código Pix...")
+        bot.answer_callback_query(call.id, "⏳ Gerando Pix...")
         _, valor, plano = call.data.split("_")
         user_id = str(call.from_user.id)
         payment_data = {
@@ -91,13 +91,12 @@ def webhook():
                 bot.send_message(user_id, "✅ <b>VIP Ativado!</b>")
     return "OK", 200
 
-# --- DOWNLOADER (v1.0.4 - HD FIX) ---
+# --- DOWNLOADER (v1.0.5 - FORÇA BRUTA HD) ---
 @bot.message_handler(func=lambda message: "http" in message.text)
 def handle_dl(message):
     user = obter_usuario(message.from_user.id)
     vip = is_vip(message.from_user.id)
     
-    # Limite diário grátis
     hoje = datetime.now().strftime('%Y-%m-%d')
     if user.get("ultima_data") != hoje:
         usuarios_col.update_one({"_id": user["_id"]}, {"$set": {"downloads_hoje": 0, "ultima_data": hoje}})
@@ -105,41 +104,45 @@ def handle_dl(message):
     if not vip and user.get("downloads_hoje", 0) >= 5:
         return bot.reply_to(message, "⚠️ Limite diário atingido!", reply_markup=menu_planos())
 
-    msg_p = bot.reply_to(message, "⏳ Analisando e processando em HD...")
+    msg_p = bot.reply_to(message, "⏳ Processando vídeo em HD 720p...")
     url = message.text.split()[0]
     file_id = f"dl_{message.from_user.id}_{message.message_id}"
     
-    # ydl_opts REFORMULADO para forçar HD e RedNote
     ydl_opts = {
-        # Busca o melhor vídeo disponível, independente da resolução inicial
-        'format': 'bestvideo+bestaudio/best',
-        'outtmpl': f'{file_id}.%(ext)s',
-        'merge_output_format': 'mp4',
+        'format': 'best', # Pega o melhor arquivo disponível para garantir o download
+        'outtmpl': f'{file_id}_raw.%(ext)s', # Baixa um arquivo temporário bruto
         'quiet': True,
-        # O SEGREDO: FFmpeg força o redimensionamento para 720p e 30fps no final
+        'no_warnings': True,
+        # FORÇA A RE-CODIFICAÇÃO PARA 720p e 30FPS INDEPENDENTE DA FONTE
+        'postprocessors': [{
+            'key': 'FFmpegVideoConvertor',
+            'preferedformat': 'mp4',
+        }],
         'postprocessor_args': [
-            '-vf', 'scale=-2:720,fps=30', # Escala altura para 720 mantendo proporção e fixa 30fps
-            '-c:v', 'libx264',             # Garante codec compatível
-            '-preset', 'veryfast'         # Velocidade de processamento
+            '-vf', 'scale=-2:720,fps=30', # Fixa altura em 720, largura proporcional (múltiplo de 2) e 30fps
+            '-c:v', 'libx264',             # Codec de vídeo padrão
+            '-crf', '23',                 # Qualidade equilibrada
+            '-preset', 'fast'             # Velocidade de conversão
         ],
-        'postprocessors': [{'key': 'FFmpegVideoConvertor', 'preferedformat': 'mp4'}],
     }
     
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            # Pegamos a info sem baixar para checar o tempo
             info = ydl.extract_info(url, download=False)
             duracao = info.get('duration', 0)
             
-            # CORREÇÃO REDNOTE: Se a duração for 0 ou None, ignoramos a trava e tentamos baixar.
-            # Só bloqueamos se tivermos CERTEZA que é > 90.
+            # Trava de 90 segundos (Com folga para erros de metadados)
             if duracao and duracao > 90:
                 return bot.edit_message_text("❌ Vídeo acima de 90 segundos.", message.chat.id, msg_p.message_id)
 
-            # Se passar, baixa
+            # Executa o download e a conversão forçada
             ydl.download([url])
             
-            files = glob.glob(f"{file_id}.*")
+            # Procura o arquivo final (o yt-dlp converte para .mp4 conforme 'preferedformat')
+            files = glob.glob(f"{file_id}_raw.mp4")
+            if not files: # Se não achou .mp4, procura qualquer extensão do file_id
+                files = glob.glob(f"{file_id}_raw.*")
+
             if files:
                 with open(files[0], 'rb') as f:
                     bot.send_video(message.chat.id, f, caption="Vídeo pronto em HD 720p 🤝")
@@ -148,11 +151,11 @@ def handle_dl(message):
                     usuarios_col.update_one({"_id": user["_id"]}, {"$inc": {"downloads_hoje": 1}})
                 bot.delete_message(message.chat.id, msg_p.message_id)
             else:
-                raise Exception("Erro")
+                raise Exception("Erro no arquivo")
                 
     except Exception as e:
         print(f"Erro: {e}")
-        bot.edit_message_text("❌ Erro ao baixar ou vídeo acima de 90s.", message.chat.id, msg_p.message_id)
+        bot.edit_message_text("❌ Erro ou vídeo acima de 90s (RedNote/TikTok).", message.chat.id, msg_p.message_id)
 
 # --- SERVIDOR ---
 @app.route('/')
