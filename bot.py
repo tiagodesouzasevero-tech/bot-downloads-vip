@@ -57,7 +57,7 @@ def process_video_standard(input_path, output_path):
         print(f"Erro FFmpeg: {e}")
         return False
 
-# --- COMANDO /START (ATUALIZADO CONFORME SOLICITADO) ---
+# --- COMANDO /START (ATUALIZADO) ---
 @bot.message_handler(commands=['start', 'perfil'])
 def send_welcome(message):
     user = obter_usuario(message.from_user.id)
@@ -83,7 +83,7 @@ def send_welcome(message):
     
     bot.send_message(message.chat.id, texto, parse_mode="HTML", reply_markup=markup)
 
-# --- DOWNLOADER (CONTADOR MANTIDO) ---
+# --- DOWNLOADER (MENSAGENS ATUALIZADAS) ---
 @bot.message_handler(func=lambda message: "http" in message.text)
 def handle_dl(message):
     user = obter_usuario(message.from_user.id)
@@ -101,11 +101,8 @@ def handle_dl(message):
             markup.add(types.InlineKeyboardButton("💎 Ativar VIP Ilimitado", callback_data="upgrade_vip"))
             return bot.reply_to(message, "⚠️ <b>Limite atingido! (5/5)</b>\n\nVocê já usou seus 5 downloads gratuitos de hoje. Assine o VIP para continuar baixando sem limites!", parse_mode="HTML", reply_markup=markup)
         
-        exibicao_contador = f"📥 <b>Download {downloads_atuais + 1}/5</b>"
-    else:
-        exibicao_contador = "💎 <b>Download VIP Ilimitado</b>"
-
-    msg_p = bot.reply_to(message, f"{exibicao_contador}\n⏳ <b>Processando e padronizando vídeo...</b>", parse_mode="HTML")
+    # Mensagem de início de fila
+    msg_p = bot.reply_to(message, "✅ Seu link foi adicionado à fila de download! Por favor, aguarde alguns instantes!", parse_mode="HTML")
     
     url = message.text.split()[0]
     raw_file = f"raw_{message.from_user.id}_{message.message_id}.mp4"
@@ -122,7 +119,8 @@ def handle_dl(message):
 
         if process_video_standard(raw_file, final_file):
             with open(final_file, 'rb') as f:
-                bot.send_video(message.chat.id, f, caption=f"Vídeo padronizado com sucesso! {exibicao_contador}")
+                # Legenda de sucesso no envio do vídeo
+                bot.send_video(message.chat.id, f, caption="Vídeo baixado com sucesso 🤝")
             
             if not vip:
                 usuarios_col.update_one({"_id": user["_id"]}, {"$inc": {"downloads_hoje": 1}})
@@ -131,7 +129,7 @@ def handle_dl(message):
                 if os.path.exists(file): os.remove(file)
             bot.delete_message(message.chat.id, msg_p.message_id)
         else:
-            raise Exception("Falha no processamento")
+            raise Exception("Erro FFmpeg")
                 
     except Exception as e:
         bot.edit_message_text("❌ Erro ao processar. Tente outro link.", message.chat.id, msg_p.message_id)
@@ -154,7 +152,7 @@ def webhook():
     return "OK", 200
 
 @app.route('/')
-def health(): return "ViralClip Pro Online", 200
+def health(): return "AfiliadoClip Pro Online", 200
 
 def run_flask(): app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
 
