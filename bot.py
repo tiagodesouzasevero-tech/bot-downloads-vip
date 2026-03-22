@@ -38,8 +38,6 @@ def is_vip(user_id):
 
 # --- PROCESSAMENTO DE VÍDEO (PADRONIZAÇÃO 9:16) ---
 def process_video_standard(input_path, output_path):
-    print(f"🎬 Iniciando Padronização: {input_path}")
-    # Filtro: Redimensiona proporcionalmente para caber em 720x1280 e centraliza com fundo preto
     video_filter = (
         "scale='min(720,iw)':-2,"
         "scale=-2:'min(1280,ih)',"
@@ -54,10 +52,9 @@ def process_video_standard(input_path, output_path):
     ]
     try:
         subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        print(f"✅ Padronização Concluída: {output_path}")
         return True
     except Exception as e:
-        print(f"❌ Erro FFmpeg: {e}")
+        print(f"Erro FFmpeg: {e}")
         return False
 
 # --- COMANDO /START (CORRIGIDO) ---
@@ -81,22 +78,31 @@ def send_welcome(message):
     
     bot.send_message(message.chat.id, texto, parse_mode="HTML", reply_markup=markup)
 
-# --- DOWNLOADER (FLUXO OBRIGATÓRIO) ---
+# --- DOWNLOADER COM CONTADOR CORRIGIDO (1/5, 2/5...) ---
 @bot.message_handler(func=lambda message: "http" in message.text)
 def handle_dl(message):
     user = obter_usuario(message.from_user.id)
     vip = is_vip(message.from_user.id)
     
-    # Controle de Limites
+    # Reset de contador diário
     hoje = datetime.now().strftime('%Y-%m-%d')
     if user.get("ultima_data") != hoje:
         usuarios_col.update_one({"_id": user["_id"]}, {"$set": {"downloads_hoje": 0, "ultima_data": hoje}})
         user["downloads_hoje"] = 0
         
-    if not vip and user.get("downloads_hoje", 0) >= 5:
-        return bot.reply_to(message, "⚠️ Limite diário de 5 downloads atingido! Torne-se VIP para baixar sem limites.")
+    # Verificação de Limite e Formatação do Contador
+    if not vip:
+        downloads_atuais = user.get("downloads_hoje", 0)
+        if downloads_atuais >= 5:
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("💎 Ativar VIP Ilimitado", callback_data="upgrade_vip"))
+            return bot.reply_to(message, "⚠️ <b>Limite atingido! (5/5)</b>\n\nVocê já usou seus 5 downloads gratuitos de hoje. Assine o VIP para continuar baixando sem limites!", parse_mode="HTML", reply_markup=markup)
+        
+        exibicao_contador = f"📥 <b>Download {downloads_atuais + 1}/5</b>"
+    else:
+        exibicao_contador = "💎 <b>Download VIP Ilimitado</b>"
 
-    msg_p = bot.reply_to(message, "⏳ <b>Processando e padronizando vídeo...</b>", parse_mode="HTML")
+    msg_p = bot.reply_to(message, f"{exibicao_contador}\n⏳ <b>Processando e padronizando vídeo...</b>", parse_mode="HTML")
     
     url = message.text.split()[0]
     raw_file = f"raw_{message.from_user.id}_{message.message_id}.mp4"
@@ -111,23 +117,22 @@ def handle_dl(message):
                 if os.path.exists(raw_file): os.remove(raw_file)
                 return bot.edit_message_text("❌ Vídeo acima de 90 segundos.", message.chat.id, msg_p.message_id)
 
-        # Processamento Obrigatório
         if process_video_standard(raw_file, final_file):
             with open(final_file, 'rb') as f:
-                bot.send_video(message.chat.id, f, caption="Vídeo padronizado com sucesso! 🤝")
+                bot.send_video(message.chat.id, f, caption=f"Vídeo padronizado com sucesso! {exibicao_contador}")
             
-            # Atualiza banco e limpa arquivos
+            # Incrementa contador apenas após o sucesso
             if not vip:
                 usuarios_col.update_one({"_id": user["_id"]}, {"$inc": {"downloads_hoje": 1}})
             
-            for f in [raw_file, final_file]:
-                if os.path.exists(f): os.remove(f)
+            for file in [raw_file, final_file]:
+                if os.path.exists(file): os.remove(file)
             bot.delete_message(message.chat.id, msg_p.message_id)
         else:
-            raise Exception("Erro no processamento")
+            raise Exception("Falha no processamento")
                 
     except Exception as e:
-        bot.edit_message_text("❌ Erro ao processar. Tente novamente.", message.chat.id, msg_p.message_id)
+        bot.edit_message_text("❌ Erro ao processar. Tente outro link.", message.chat.id, msg_p.message_id)
         if os.path.exists(raw_file): os.remove(raw_file)
 
 # --- WEBHOOK E SERVIDOR (MANTIDOS) ---
