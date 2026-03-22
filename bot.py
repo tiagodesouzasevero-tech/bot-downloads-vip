@@ -9,7 +9,7 @@ from pymongo import MongoClient
 TOKEN_TELEGRAM = "8629536333:AAHjRGGxSm_Fc_WnAv8a2qLItCC_-bMUWqY"
 MP_ACCESS_TOKEN = "APP_USR-8179041093511853-031916-7364f07318b6c464600a781433c743f7-384532659"
 MONGO_URI = "mongodb+srv://tiagodesouzasevero_db_user:rdS2qlLSlH7eI9jA@cluster0.x3wiavb.mongodb.net/bot_downloader?retryWrites=true&w=majority&tlsAllowInvalidCertificates=true"
-ID_ADM = 6185834035  # <-- INSIRA SEU ID AQUI PARA O BOTÃO ADM APARECER
+ID_ADM = 6185834035  # Seu ID verificado
 
 client = MongoClient(MONGO_URI)
 db = client.get_default_database()
@@ -18,7 +18,7 @@ bot = telebot.TeleBot(TOKEN_TELEGRAM, threaded=False)
 app = Flask(__name__)
 sdk = mercadopago.SDK(MP_ACCESS_TOKEN)
 
-# --- FUNÇÕES DE SUPORTE ---
+# --- FUNÇÕES DE SUPORTE (MANTIDAS) ---
 def obter_usuario(user_id):
     uid = str(user_id)
     user = usuarios_col.find_one({"_id": uid})
@@ -47,52 +47,47 @@ def process_video_standard(input_path, output_path):
     except:
         return False
 
-# --- PAGAMENTO PIX ---
+# --- PAGAMENTO PIX (MANTIDO) ---
 def gerar_pix(user_id, valor, titulo):
     payment_data = {"transaction_amount": valor, "description": titulo, "payment_method_id": "pix", "external_reference": str(user_id), "payer": {"email": f"user_{user_id}@afiliadoclip.com"}}
     payment_response = sdk.payment().create(payment_data)
     return payment_response["response"].get("point_of_interaction", {}).get("transaction_data", {}).get("qr_code")
 
-# --- INTERFACE DE PLANOS (MANTIDO) ---
 def exibir_planos_vip(chat_id, texto_extra=""):
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("💎 Mensal - R$ 10,00", callback_data="pay_10"))
     markup.add(types.InlineKeyboardButton("📅 Anual - R$ 69,90", callback_data="pay_69"))
     markup.add(types.InlineKeyboardButton("🔥 Vitalício - R$ 197,00", callback_data="pay_197"))
-    
-    texto_vip = (
-        f"{texto_extra}💎 <b>Escolha seu Plano VIP</b>\n\n"
-        "✅ Downloads Ilimitados\n"
-        "✅ Sem filas de espera\n"
-        "✅ Suporte Prioritário\n"
-        "✅ Acesso Vitalício opcional\n\n"
-        "Selecione uma das opções abaixo para ativar agora via PIX:"
-    )
+    texto_vip = f"{texto_extra}💎 <b>Escolha seu Plano VIP</b>\n\n✅ Downloads Ilimitados\n✅ Sem filas de espera\n✅ Suporte Prioritário\n✅ Acesso Vitalício opcional\n\nSelecione uma opção:"
     bot.send_message(chat_id, texto_vip, parse_mode="HTML", reply_markup=markup)
 
-# --- COMANDO /START COM MENU PRINCIPAL ---
-@bot.message_handler(commands=['start', 'perfil'])
+# --- COMANDO /START E /MEUADM ---
+@bot.message_handler(commands=['start', 'perfil', 'meuadm'])
 def send_welcome(message):
     user = obter_usuario(message.from_user.id)
     vip = is_vip(message.from_user.id)
     
+    # Se for o comando /meuadm, pula direto para a função de aviso
+    if message.text == "/meuadm" and message.from_user.id == ID_ADM:
+        return admin_aviso(message)
+
     status_info = "💎 VIP PRO – Download ilimitado" if vip else f"👤 Gratuito – {max(0, 5 - user.get('downloads_hoje', 0))}/5 downloads hoje"
     
-    texto = (
-        f"🚀 <b>AfiliadoClip Pro</b>\n\n"
-        f"{status_info}\n\n"
-        f"🔗 <b>Envie um link do TikTok, Pinterest ou RedNote:</b>\n"
-        f"⚠️ É suportado vídeos com no máximo 90 segundos"
-    )
+    texto = f"🚀 <b>AfiliadoClip Pro</b>\n\n{status_info}\n\n🔗 <b>Envie um link do TikTok, Pinterest ou RedNote:</b>\n⚠️ É suportado vídeos com no máximo 90 segundos"
 
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    markup.add(types.KeyboardButton("💎 Planos VIP"), types.KeyboardButton("🛠 Suporte"))
+    btn_planos = types.KeyboardButton("💎 Planos VIP")
+    btn_suporte = types.KeyboardButton("🛠 Suporte")
+    markup.row(btn_planos, btn_suporte)
+    
+    # Adiciona o botão de aviso se for o ADM
     if message.from_user.id == ID_ADM:
-        markup.add(types.KeyboardButton("📢 Enviar Aviso (ADM)"))
+        btn_adm = types.KeyboardButton("📢 Enviar Aviso (ADM)")
+        markup.add(btn_adm)
 
     bot.send_message(message.chat.id, texto, parse_mode="HTML", reply_markup=markup)
 
-# --- HANDLERS DO MENU PRINCIPAL ---
+# --- HANDLERS DO MENU ---
 @bot.message_handler(func=lambda message: message.text == "🛠 Suporte")
 def suporte(message):
     bot.send_message(message.chat.id, "📌 Para suporte, entre em contato com o nosso atendimento oficial:\n@suporteafiliadoclippro")
@@ -104,7 +99,7 @@ def planos_menu(message):
 @bot.message_handler(func=lambda message: message.text == "📢 Enviar Aviso (ADM)")
 def admin_aviso(message):
     if message.from_user.id == ID_ADM:
-        msg = bot.reply_to(message, "📝 Digite a mensagem que deseja enviar para TODOS os usuários:")
+        msg = bot.send_message(message.chat.id, "📝 Digite a mensagem que deseja enviar para TODOS os usuários cadastrados:")
         bot.register_next_step_handler(msg, enviar_massa)
 
 def enviar_massa(message):
@@ -115,9 +110,9 @@ def enviar_massa(message):
             bot.send_message(u["_id"], message.text)
             cont += 1
         except: pass
-    bot.send_message(ID_ADM, f"✅ Aviso enviado para {cont} usuários!")
+    bot.send_message(ID_ADM, f"✅ Aviso enviado com sucesso para {cont} usuários!")
 
-# --- CALLBACKS DE PAGAMENTO ---
+# --- CALLBACKS E DOWNLOADER (MANTIDOS) ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith("pay_"))
 def processar_pagamento(call):
     valores = {"pay_10": (10.00, "VIP Mensal"), "pay_69": (69.90, "VIP Anual"), "pay_197": (197.00, "VIP Vitalicio")}
@@ -126,7 +121,6 @@ def processar_pagamento(call):
     if pix_code:
         bot.send_message(call.message.chat.id, f"✅ <b>Pagamento Gerado!</b>\n\nPlano: {titulo}\nValor: R$ {valor:.2f}\n\n<code>{pix_code}</code>\n\n👆 Clique no código para copiar.", parse_mode="HTML")
 
-# --- DOWNLOADER (CONTROLE MANTIDO) ---
 @bot.message_handler(func=lambda message: "http" in message.text)
 def handle_dl(message):
     user = obter_usuario(message.from_user.id)
