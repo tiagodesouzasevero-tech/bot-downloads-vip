@@ -5,7 +5,7 @@ from threading import Thread
 from telebot import types
 from pymongo import MongoClient
 
-# --- CONFIGURAÇÕES ORIGINAIS ---
+# --- CONFIGURAÇÕES ---
 TOKEN_TELEGRAM = "8629536333:AAHjRGGxSm_Fc_WnAv8a2qLItCC_-bMUWqY"
 MP_ACCESS_TOKEN = "APP_USR-8179041093511853-031916-7364f07318b6c464600a781433c743f7-384532659"
 MONGO_URI = "mongodb+srv://tiagodesouzasevero_db_user:rdS2qlLSlH7eI9jA@cluster0.x3wiavb.mongodb.net/bot_downloader?retryWrites=true&w=majority&tlsAllowInvalidCertificates=true"
@@ -18,7 +18,7 @@ bot = telebot.TeleBot(TOKEN_TELEGRAM, threaded=False)
 app = Flask(__name__)
 sdk = mercadopago.SDK(MP_ACCESS_TOKEN)
 
-# --- FUNÇÕES DE USUÁRIO v1.0.0 ---
+# --- FUNÇÕES DE USUÁRIO ---
 def obter_usuario(user_id):
     uid = str(user_id)
     user = usuarios_col.find_one({"_id": uid})
@@ -38,7 +38,7 @@ def is_vip(user_id):
     except:
         return False
 
-# --- MENUS ORIGINAIS ---
+# --- MENUS ---
 def menu_planos():
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("💳 Mensal - R$10,00", callback_data="buy_10_Mensal"))
@@ -46,7 +46,7 @@ def menu_planos():
     markup.add(types.InlineKeyboardButton("💎 Vitalício - R$190,00 🔥", callback_data="buy_190_Vitalicio"))
     return markup
 
-# --- COMANDOS v1.0.0 ---
+# --- COMANDOS ---
 @bot.message_handler(commands=['start', 'perfil'])
 def cmd_start(message):
     user = obter_usuario(message.from_user.id)
@@ -66,52 +66,76 @@ def cmd_start(message):
         )
         bot.reply_to(message, texto, reply_markup=menu_planos(), parse_mode="HTML")
 
-# --- PAGAMENTOS v1.0.0 (CHECKOUT EXTERNO) ---
+# --- PAGAMENTOS (PIX DIRETO NO CHAT) ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith("buy_"))
 def callback_buy(call):
-    _, valor, plano = call.data.split("_")
-    user_id = str(call.from_user.id)
-    
-    preference_data = {
-        "items": [{"title": f"Plano {plano}", "quantity": 1, "unit_price": float(valor), "currency_id": "BRL"}],
-        "external_reference": user_id,
-        "notification_url": "https://bot-downloads-vip-production.up.railway.app/webhook"
-    }
-    
-    result = sdk.preference().create(preference_data)
-    url_pagamento = result["response"]["init_point"]
-    
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("🔗 Pagar com Pix/Cartão", url=url_pagamento))
-    
-    bot.edit_message_text(f"💳 <b>Pagamento: Plano {plano}</b>\n\nClique no botão abaixo para concluir:", 
-                          call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="HTML")
+    try:
+        bot.answer_callback_query(call.id, "⏳ Gerando código Pix...", show_alert=False)
+        _, valor, plano = call.data.split("_")
+        user_id = str(call.from_user.id)
+        
+        payment_data = {
+            "transaction_amount": float(valor),
+            "description": f"Plano {plano} - ViralClip",
+            "payment_method_id": "pix",
+            "external_reference": user_id,
+            "payer": {
+                "email": f"u{user_id}@telegram.com",
+                "first_name": "Usuario"
+            }
+        }
+        
+        payment_response = sdk.payment().create(payment_data)
+        
+        if "response" in payment_response and "point_of_interaction" in payment_response["response"]:
+            pix_code = payment_response["response"]["point_of_interaction"]["transaction_data"]["qr_code"]
+            
+            texto = (
+                f"💰 <b>Pagamento via Pix</b>\n\n"
+                f"📦 <b>Plano:</b> {plano}\n"
+                f"💵 <b>Valor:</b> R$ {valor}\n\n"
+                f"📋 <b>Código Pix (Copia e Cola):</b>\n"
+                f"<code>{pix_code}</code>\n\n"
+                f"⏳ <i>Seu VIP será ativado automaticamente assim que o pagamento for confirmado.</i>"
+            )
+            bot.edit_message_text(texto, call.message.chat.id, call.message.message_id, parse_mode="HTML")
+        else:
+            bot.edit_message_text("❌ Erro ao gerar o Pix. Verifique sua conta do Mercado Pago.", call.message.chat.id, call.message.message_id)
+            
+    except Exception as e:
+        print(f"Erro no Pix: {e}")
+        bot.answer_callback_query(call.id, "❌ Erro interno. Tente novamente.")
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    # Lógica de recebimento padrão do Mercado Pago via Query Params/Body
-    payment_id = request.args.get("data.id") or request.json.get("data", {}).get("id")
-    if payment_id:
-        payment_info = sdk.payment().get(payment_id)
-        if payment_info["response"]["status"] == "approved":
-            user_id = payment_info["response"]["external_reference"]
-            desc = payment_info["response"]["description"]
-            
-            if "Mensal" in desc: expira = (datetime.now() + timedelta(days=30)).strftime('%Y-%m-%d')
-            elif "Anual" in desc: expira = (datetime.now() + timedelta(days=365)).strftime('%Y-%m-%d')
-            else: expira = "Vitalício"
-            
-            usuarios_col.update_one({"_id": str(user_id)}, {"$set": {"vip_ate": expira}})
-            bot.send_message(user_id, "✅ <b>Seu VIP foi ativado com sucesso!</b>\nAproveite os downloads ilimitados! 🚀", parse_mode="HTML")
+    # Suporta ambos os formatos de webhook do Mercado Pago (JSON ou Query Params)
+    data = request.args.to_dict() or request.json or {}
+    
+    if data.get("type") == "payment" or data.get("topic") == "payment":
+        payment_id = data.get("data.id") or (data.get("data", {}).get("id"))
+        if payment_id:
+            payment_info = sdk.payment().get(payment_id)
+            if payment_info.get("response", {}).get("status") == "approved":
+                user_id = payment_info["response"]["external_reference"]
+                desc = payment_info["response"]["description"]
+                
+                if "Mensal" in desc: expira = (datetime.now() + timedelta(days=30)).strftime('%Y-%m-%d')
+                elif "Anual" in desc: expira = (datetime.now() + timedelta(days=365)).strftime('%Y-%m-%d')
+                else: expira = "Vitalício"
+                
+                # Atualiza apenas se a data for diferente para não repetir mensagem
+                user = obter_usuario(user_id)
+                if user.get("vip_ate") != expira:
+                    usuarios_col.update_one({"_id": str(user_id)}, {"$set": {"vip_ate": expira}})
+                    bot.send_message(user_id, "✅ <b>Seu VIP foi ativado com sucesso!</b>\nAproveite os downloads ilimitados! 🚀", parse_mode="HTML")
     return "OK", 200
 
-# --- DOWNLOADER v1.0.0 ---
+# --- DOWNLOADER (90 SEGUNDOS / 720p HD) ---
 @bot.message_handler(func=lambda message: "http" in message.text)
 def handle_dl(message):
     user = obter_usuario(message.from_user.id)
     vip = is_vip(message.from_user.id)
     
-    # Verifica limite diário
     hoje = datetime.now().strftime('%Y-%m-%d')
     if user.get("ultima_data") != hoje:
         usuarios_col.update_one({"_id": user["_id"]}, {"$set": {"downloads_hoje": 0, "ultima_data": hoje}})
@@ -121,24 +145,35 @@ def handle_dl(message):
         bot.reply_to(message, "⚠️ <b>Limite atingido!</b>\nVocê já usou seus 5 downloads grátis de hoje.", reply_markup=menu_planos(), parse_mode="HTML")
         return
 
-    msg_processando = bot.reply_to(message, "⏳ Processando seu vídeo... por favor aguarde.")
+    msg_processando = bot.reply_to(message, "⏳ Analisando e processando vídeo...")
     url = message.text.split()[0]
     file_id = f"dl_{message.from_user.id}_{message.message_id}"
     
     ydl_opts = {
-        'format': 'bestvideo+bestaudio/best',
+        'format': 'bestvideo[height<=720][fps<=30]+bestaudio/best[height<=720]',
         'outtmpl': f'{file_id}.%(ext)s',
         'merge_output_format': 'mp4',
+        'match_filter': yt_dlp.utils.match_filter_func("duration <= 90"),
         'quiet': True,
+        'postprocessors': [{'key': 'FFmpegVideoConvertor', 'preferedformat': 'mp4'}],
     }
     
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            duracao = info.get('duration', 0)
+            
+            if duracao > 90:
+                bot.edit_message_text("❌ <b>Vídeo muito longo!</b>\nO limite máximo permitido é de 90 segundos.", 
+                                      message.chat.id, msg_processando.message_id, parse_mode="HTML")
+                return
+
             ydl.download([url])
             files = glob.glob(f"{file_id}.*")
+            
             if files:
                 with open(files[0], 'rb') as f:
-                    bot.send_video(message.chat.id, f, caption="Vídeo baixado com sucesso🤝")
+                    bot.send_video(message.chat.id, f, caption="Vídeo processado em 720p HD🤝")
                 for f in files: os.remove(f)
                 
                 if not vip:
@@ -146,9 +181,11 @@ def handle_dl(message):
                 
                 bot.delete_message(message.chat.id, msg_processando.message_id)
             else:
-                raise Exception("Erro no download")
-    except Exception:
-        bot.edit_message_text("❌ <b>Erro ao baixar.</b> Verifique se o link está correto.", message.chat.id, msg_processando.message_id, parse_mode="HTML")
+                raise Exception("Erro")
+                
+    except Exception as e:
+        error_msg = "❌ <b>Erro ao baixar.</b> Verifique o link ou se o vídeo tem mais de 90 segundos."
+        bot.edit_message_text(error_msg, message.chat.id, msg_processando.message_id, parse_mode="HTML")
 
 # --- SERVIDOR ---
 @app.route('/')
