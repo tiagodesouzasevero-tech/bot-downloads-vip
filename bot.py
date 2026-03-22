@@ -5,11 +5,11 @@ from threading import Thread
 from telebot import types
 from pymongo import MongoClient
 
-# --- CONFIGURAÇÕES CRÍTICAS ---
+# --- CONFIGURAÇÕES CRÍTICAS (MANTIDAS) ---
 TOKEN_TELEGRAM = "8629536333:AAHjRGGxSm_Fc_WnAv8a2qLItCC_-bMUWqY"
 MP_ACCESS_TOKEN = "APP_USR-8179041093511853-031916-7364f07318b6c464600a781433c743f7-384532659"
 MONGO_URI = "mongodb+srv://tiagodesouzasevero_db_user:rdS2qlLSlH7eI9jA@cluster0.x3wiavb.mongodb.net/bot_downloader?retryWrites=true&w=majority&tlsAllowInvalidCertificates=true"
-ID_ADM = 6185834035  # Seu ID verificado
+ID_ADM = 493336271  # ID ATUALIZADO PARA O SEU ACESSO ADMINISTRATIVO
 
 client = MongoClient(MONGO_URI)
 db = client.get_default_database()
@@ -18,7 +18,7 @@ bot = telebot.TeleBot(TOKEN_TELEGRAM, threaded=False)
 app = Flask(__name__)
 sdk = mercadopago.SDK(MP_ACCESS_TOKEN)
 
-# --- FUNÇÕES DE SUPORTE (MANTIDAS) ---
+# --- FUNÇÕES DE SUPORTE ---
 def obter_usuario(user_id):
     uid = str(user_id)
     user = usuarios_col.find_one({"_id": uid})
@@ -37,7 +37,7 @@ def is_vip(user_id):
     except:
         return False
 
-# --- PROCESSAMENTO DE VÍDEO (MANTIDO) ---
+# --- PROCESSAMENTO DE VÍDEO (PADRONIZAÇÃO 9:16 - MANTIDO) ---
 def process_video_standard(input_path, output_path):
     video_filter = "scale='min(720,iw)':-2,scale=-2:'min(1280,ih)',pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,fps=30"
     cmd = ['ffmpeg', '-y', '-i', input_path, '-vf', video_filter, '-c:v', 'libx264', '-crf', '23', '-preset', 'veryfast', '-c:a', 'copy', output_path]
@@ -67,9 +67,13 @@ def send_welcome(message):
     user = obter_usuario(message.from_user.id)
     vip = is_vip(message.from_user.id)
     
-    # Se for o comando /meuadm, pula direto para a função de aviso
-    if message.text == "/meuadm" and message.from_user.id == ID_ADM:
-        return admin_aviso(message)
+    # Validação de comando ADM direto
+    if message.text == "/meuadm":
+        if message.from_user.id == ID_ADM:
+            return admin_aviso(message)
+        else:
+            # Se não for ADM, ignora e segue o fluxo normal
+            pass
 
     status_info = "💎 VIP PRO – Download ilimitado" if vip else f"👤 Gratuito – {max(0, 5 - user.get('downloads_hoje', 0))}/5 downloads hoje"
     
@@ -80,7 +84,7 @@ def send_welcome(message):
     btn_suporte = types.KeyboardButton("🛠 Suporte")
     markup.row(btn_planos, btn_suporte)
     
-    # Adiciona o botão de aviso se for o ADM
+    # Botão visível apenas para o seu ID
     if message.from_user.id == ID_ADM:
         btn_adm = types.KeyboardButton("📢 Enviar Aviso (ADM)")
         markup.add(btn_adm)
@@ -99,7 +103,7 @@ def planos_menu(message):
 @bot.message_handler(func=lambda message: message.text == "📢 Enviar Aviso (ADM)")
 def admin_aviso(message):
     if message.from_user.id == ID_ADM:
-        msg = bot.send_message(message.chat.id, "📝 Digite a mensagem que deseja enviar para TODOS os usuários cadastrados:")
+        msg = bot.send_message(message.chat.id, "📝 Digite a mensagem que deseja enviar para TODOS os usuários cadastrados no bot:")
         bot.register_next_step_handler(msg, enviar_massa)
 
 def enviar_massa(message):
