@@ -20,7 +20,7 @@ bot = telebot.TeleBot(TOKEN_TELEGRAM, threaded=False)
 app = Flask(__name__)
 sdk = mercadopago.SDK(MP_ACCESS_TOKEN)
 
-# --- GESTÃO DE USUÁRIOS (MANTIDA v1.0.0) ---
+# --- GESTÃO DE USUÁRIOS ---
 def obter_usuario(user_id):
     uid = str(user_id)
     hoje = datetime.now().strftime('%Y-%m-%d')
@@ -44,16 +44,15 @@ def is_vip(user_id):
     try: return datetime.now() < datetime.strptime(user["vip_ate"], '%Y-%m-%d')
     except: return False
 
-# --- MENUS (VALOR VITALÍCIO ATUALIZADO v1.0.1) ---
+# --- MENUS (VALORES MANTIDOS APENAS NOS BOTÕES) ---
 def menu_planos():
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("💳 Mensal - R$10,00", callback_data="buy_10_Mensal"))
     markup.add(types.InlineKeyboardButton("🌟 Anual - R$69,90", callback_data="buy_69.9_Anual"))
-    # Alteração de valor: 499 -> 190
     markup.add(types.InlineKeyboardButton("💎 Vitalício - R$190,00 🔥", callback_data="buy_190_Vitalicio"))
     return markup
 
-# --- COMANDOS (TEXTOS ATUALIZADOS v1.0.1) ---
+# --- COMANDOS (TEXTOS SEM VALORES v1.2.0) ---
 @bot.message_handler(commands=['meuadm'])
 def cmd_adm(message):
     if str(message.from_user.id) == MY_ID:
@@ -83,14 +82,14 @@ def cmd_start(message):
             f"Baixe vídeos do TikTok, Pinterest e Rednote em segundos 👇\n\n"
             f"🎁 <b>Plano GRATUITO:</b>\n• 5 downloads por dia\n\n"
             f"💎 <b>Plano VIP:</b>\n• Downloads ILIMITADOS\n• Sem fila\n• Alta velocidade\n\n"
-            f"💰 <b>Planos:</b>\n• Mensal: R$10,00\n• Anual: R$69,90\n"
-            f"• Vitalício: R$190,00 🔥 Oferta por tempo limitado\n\n"
+            f"💰 <b>Planos:</b>\n• Mensal\n• Anual\n"
+            f"• Vitalício 🔥 Oferta por tempo limitado\n\n"
             f"👇 Escolha uma opção abaixo:"
         )
         markup = menu_planos()
     bot.reply_to(message, texto, reply_markup=markup, parse_mode="HTML")
 
-# --- WEBHOOK (MANTIDO + TEXTO v1.0.1) ---
+# --- WEBHOOK (MANTIDO v1.0.0) ---
 @app.route('/webhook', methods=['POST'])
 def webhook():
     data = request.get_json()
@@ -119,7 +118,6 @@ def webhook():
             bot.send_message(user_id, confirmacao, parse_mode="HTML")
     return "OK", 200
 
-# --- COMPRA (VALOR VITALÍCIO ATUALIZADO v1.0.1) ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith("buy_"))
 def callback_buy(call):
     _, valor, plano = call.data.split("_")
@@ -135,33 +133,38 @@ def callback_buy(call):
     markup.add(types.InlineKeyboardButton("🔗 Pagar Agora", url=url_pag))
     
     texto_compra = (
-        f"💳 <b>Assinatura {plano}</b>\n"
-        f"Valor: R$ {valor}\n\n"
+        f"💳 <b>Assinatura {plano}</b>\n\n"
         f"👉 Clique abaixo e libere agora"
     )
     bot.edit_message_text(texto_compra, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="HTML")
 
-# --- DOWNLOADER (MANTIDO v1.0.0 + TEXTO LIMITE v1.0.1) ---
+# --- DOWNLOADER (LÓGICA DE LIMITE v1.2.0) ---
 @bot.message_handler(func=lambda message: "http" in message.text)
 def handle_dl(message):
     user = obter_usuario(message.from_user.id)
     vip = is_vip(message.from_user.id)
-    
-    if not vip and user.get("downloads_hoje", 0) >= 5:
-        msg_limite = (
-            "⚠️ <b>Você atingiu o limite de 5 downloads gratuitos hoje.</b>\n\n"
-            "Mas relaxa 👇\n\n"
-            "🔥 <b>Libere acesso ILIMITADO agora mesmo:</b>\n"
+    downloads_atuais = user.get("downloads_hoje", 0)
+
+    # Nova regra: Bloqueia apenas se já tiver atingido 5 (6º link em diante)
+    if not vip and downloads_atuais >= 5:
+        msg_excedeu = (
+            "⚠️ <b>Você atingiu o limite de downloads gratuitos hoje.</b>\n\n"
+            "🔥 <b>Libere acesso ilimitado para continuar:</b>\n"
             "• Baixe quantos vídeos quiser\n"
             "• Sem espera\n"
             "• Muito mais rápido\n\n"
-            "💎 <b>Torne-se VIP:</b>\n• R$10/mês\n• R$69,90/ano\n"
-            "• R$190 vitalício 🔥 Oferta por tempo limitado\n\n"
-            "👉 Clique abaixo e libere agora"
+            "💎 <b>Escolha um plano abaixo 👇</b>"
         )
-        return bot.reply_to(message, msg_limite, reply_markup=menu_planos(), parse_mode="HTML")
+        return bot.reply_to(message, msg_excedeu, reply_markup=menu_planos(), parse_mode="HTML")
 
-    msg = bot.reply_to(message, "⏳ <b>Processando em HD...</b>", parse_mode="HTML")
+    # Mensagem de fila com contador (v1.2.0)
+    # Mostramos o número atual (ex: 0/5, 1/5... até 4/5 antes de processar o 5º)
+    fila_msg = (
+        "✅ Seu link foi adicionado à fila de download! Por favor, aguarde alguns instantes!\n\n"
+        f"📊 Hoje: {downloads_atuais}/5"
+    )
+    msg_processando = bot.reply_to(message, fila_msg, parse_mode="HTML")
+    
     url = message.text.split()[0]
     file_id = f"dl_{message.from_user.id}_{message.message_id}"
     
@@ -179,30 +182,46 @@ def handle_dl(message):
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
             if info.get('duration', 0) > 90:
-                bot.edit_message_text("⚠️ <b>Vídeo muito longo!</b> O limite é 90 segundos.", message.chat.id, msg.message_id, parse_mode="HTML")
+                bot.edit_message_text("⚠️ <b>Vídeo muito longo!</b> O limite é 90 segundos.", message.chat.id, msg_processando.message_id, parse_mode="HTML")
                 for f in glob.glob(f"{file_id}.*"): os.remove(f)
                 return
 
             files = glob.glob(f"{file_id}.*")
             if files:
                 with open(files[0], 'rb') as f:
+                    # Legenda simplificada após download (v1.2.0)
                     bot.send_video(
                         message.chat.id, 
                         f, 
-                        caption="🛍 <b>Vídeo pronto em HD!</b>\nGerado por @AfiliadoClipPro_bot", 
+                        caption="Vídeo baixado com sucesso🤝", 
                         parse_mode="HTML"
                     )
                 for f in files: os.remove(f)
+                
+                # Incrementa contador
                 if not vip:
                     user["downloads_hoje"] += 1
                     salvar_usuario(user)
-                bot.delete_message(message.chat.id, msg.message_id)
+                    
+                    # Se acabou de completar o 5º download, envia oferta VIP automática
+                    if user["downloads_hoje"] == 5:
+                        msg_oferta = (
+                            "⚠️ <b>Você atingiu o limite de downloads gratuitos hoje.</b>\n\n"
+                            "🔥 <b>Libere acesso ilimitado para continuar:</b>\n"
+                            "• Baixe quantos vídeos quiser\n"
+                            "• Sem espera\n"
+                            "• Muito mais rápido\n\n"
+                            "💎 <b>Escolha um plano abaixo 👇</b>"
+                        )
+                        bot.send_message(message.chat.id, msg_oferta, reply_markup=menu_planos(), parse_mode="HTML")
+
+                bot.delete_message(message.chat.id, msg_processando.message_id)
             else:
                 raise Exception("Arquivo não encontrado")
     except Exception as e:
-        bot.edit_message_text("❌ <b>Erro ao baixar.</b> Verifique o link.", message.chat.id, msg.message_id, parse_mode="HTML")
+        bot.edit_message_text("❌ <b>Erro ao baixar.</b> Verifique o link.", message.chat.id, msg_processando.message_id, parse_mode="HTML")
 
-# --- SERVIDOR (MANTIDO v1.0.0) ---
+# --- SERVIDOR (MANTIDO v1.0.1) ---
 @app.route('/')
 def health(): return "Online", 200
 
