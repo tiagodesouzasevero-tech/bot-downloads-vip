@@ -6,12 +6,16 @@ from telebot import types
 from pymongo import MongoClient
 import static_ffmpeg
 
+# Importação para pegar o caminho absoluto do FFmpeg e evitar falhas silenciosas
+from static_ffmpeg.run import get_or_fetch_platform_executables
+
 # --- CONFIGURAÇÕES CRÍTICAS ---
 TOKEN_TELEGRAM = "8629536333:AAHjRGGxSm_Fc_WnAv8a2qLItCC_-bMUWqY"
 MP_ACCESS_TOKEN = "APP_USR-8179041093511853-031916-7364f07318b6c464600a781433c743f7-384532659"
 MONGO_URI = "mongodb+srv://tiagodesouzasevero_db_user:rdS2qlLSlH7eI9jA@cluster0.x3wiavb.mongodb.net/bot_downloader?retryWrites=true&w=majority&tlsAllowInvalidCertificates=true"
 ID_ADM = 493336271 
 
+# Inicializa o FFmpeg no ambiente da Railway
 static_ffmpeg.add_paths()
 
 client = MongoClient(MONGO_URI)
@@ -40,11 +44,14 @@ def is_vip(user_id):
     except:
         return False
 
-# --- MOTOR DE VÍDEO (AGORA COM TRAVA 720p 30FPS) ---
+# --- MOTOR DE VÍDEO (720P / 30FPS GARANTIDO) ---
 def process_video_optimized(input_path, output_path):
-    # COMANDO OTIMIZADO PARA ECONOMIA E QUALIDADE HD (MÁX 720P)
+    # Pega o executável exato do FFmpeg instalado
+    ffmpeg_exe, _ = get_or_fetch_platform_executables()
+    
+    # Scale: Teto de 720p mantendo proporção. FPS travado em 30.
     cmd = [
-        'ffmpeg', '-y', '-i', input_path, 
+        ffmpeg_exe, '-y', '-i', input_path, 
         '-vf', "scale='if(gt(ih,720),-2,iw)':'min(ih,720)',fps=min(30,fps)", 
         '-c:v', 'libx264', '-crf', '30', '-preset', 'ultrafast', 
         '-ac', '1', '-ar', '22050', '-b:a', '64k', 
@@ -52,13 +59,17 @@ def process_video_optimized(input_path, output_path):
         output_path
     ]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        return result.returncode == 0
+        # Timeout de 180s para garantir que a Railway processe sem cortar
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+        if result.returncode != 0:
+            print(f"ERRO FFMPEG NA CONVERSÃO: {result.stderr}")
+            return False
+        return True
     except Exception as e:
-        print(f"Erro FFmpeg: {e}")
+        print(f"FALHA CRÍTICA AO RODAR FFMPEG: {e}")
         return False
 
-# --- INTERFACE ---
+# --- COMANDOS E INTERFACE ---
 @bot.message_handler(commands=['start', 'perfil'])
 def start(message):
     user = obter_usuario(message.from_user.id)
@@ -85,32 +96,41 @@ def handle_download(message):
     out_name = f"v_{message.from_user.id}.mp4"
 
     try:
-        ydl_opts = {'format': 'bestvideo+bestaudio/best', 'outtmpl': raw_name, 'quiet': True}
+        # Formato 'best' baixa áudio e vídeo juntos, evitando que o yt-dlp trave no 100%
+        ydl_opts = {
+            'format': 'best', 
+            'outtmpl': raw_name,
+            'nocheckcertificate': True
+        }
+        
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
             if info.get('duration', 0) > 95:
                 if os.path.exists(raw_name): os.remove(raw_name)
                 return bot.edit_message_text("❌ Vídeo muito longo (Máx 90s).", message.chat.id, msg_status.message_id)
 
-        # Processamento com a trava de 720p/30fps
+        # Processamento e Redução HD
         if process_video_optimized(raw_name, out_name):
             with open(out_name, 'rb') as f:
-                bot.send_video(message.chat.id, f, caption="✅ Vídeo pronto (HD 720p)!")
+                bot.send_video(message.chat.id, f, caption="✅ Vídeo pronto (HD)!")
             
             if not vip:
                 usuarios_col.update_one({"_id": user["_id"]}, {"$inc": {"downloads_hoje": 1}})
         else:
-            bot.edit_message_text("❌ Erro ao converter para 720p.", message.chat.id, msg_status.message_id)
+            bot.edit_message_text("❌ Erro interno ao converter para 720p.", message.chat.id, msg_status.message_id)
 
     except Exception as e:
-        bot.edit_message_text(f"❌ Falha no processamento.", message.chat.id, msg_status.message_id)
+        print(f"ERRO NO FLUXO PRINCIPAL: {e}")
+        bot.edit_message_text(f"❌ Falha no processamento do link.", message.chat.id, msg_status.message_id)
     
     finally:
+        # Limpa os arquivos temporários
         for f in [raw_name, out_name]:
             if os.path.exists(f): os.remove(f)
         try: bot.delete_message(message.chat.id, msg_status.message_id)
         except: pass
 
+# --- WEBHOOK FLASK ---
 @app.route('/')
 def health(): return "Bot Online", 200
 
