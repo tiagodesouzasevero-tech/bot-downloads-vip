@@ -57,7 +57,7 @@ def process_video_standard(input_path, output_path):
         print(f"Erro FFmpeg: {e}")
         return False
 
-# --- COMANDO /START (ATUALIZADO) ---
+# --- COMANDO /START (MANTIDO) ---
 @bot.message_handler(commands=['start', 'perfil'])
 def send_welcome(message):
     user = obter_usuario(message.from_user.id)
@@ -83,7 +83,30 @@ def send_welcome(message):
     
     bot.send_message(message.chat.id, texto, parse_mode="HTML", reply_markup=markup)
 
-# --- DOWNLOADER (MENSAGENS ATUALIZADAS) ---
+# --- CORREÇÃO DO BOTÃO VIP (EXIBIR PLANOS) ---
+@bot.callback_query_handler(func=lambda call: call.data == "upgrade_vip")
+def show_plans(call):
+    markup = types.InlineKeyboardMarkup()
+    # Links de pagamento integrados ao seu external_reference (ID do usuário)
+    # Nota: Certifique-se de que as URLs de pagamento do Mercado Pago estejam corretas
+    btn_mensal = types.InlineKeyboardButton("💎 VIP Mensal - R$ 19,90", url=f"https://www.mercadopago.com.br/checkout/v1/redirect?pref_id=SEU_PREF_ID_MENSAL&external_reference={call.from_user.id}")
+    btn_vitalicio = types.InlineKeyboardButton("🔥 VIP Vitalício - R$ 49,90", url=f"https://www.mercadopago.com.br/checkout/v1/redirect?pref_id=SEU_PREF_ID_VITALICIO&external_reference={call.from_user.id}")
+    
+    markup.add(btn_mensal)
+    markup.add(btn_vitalicio)
+    
+    texto_vip = (
+        "💎 <b>Escolha seu Plano VIP</b>\n\n"
+        "✅ Downloads Ilimitados\n"
+        "✅ Sem filas de espera\n"
+        "✅ Suporte Prioritário\n"
+        "✅ Acesso Vitalício opcional\n\n"
+        "Selecione uma das opções abaixo para ativar agora via PIX ou Cartão:"
+    )
+    
+    bot.edit_message_text(texto_vip, call.message.chat.id, call.message.message_id, parse_mode="HTML", reply_markup=markup)
+
+# --- DOWNLOADER (MANTIDO) ---
 @bot.message_handler(func=lambda message: "http" in message.text)
 def handle_dl(message):
     user = obter_usuario(message.from_user.id)
@@ -101,7 +124,6 @@ def handle_dl(message):
             markup.add(types.InlineKeyboardButton("💎 Ativar VIP Ilimitado", callback_data="upgrade_vip"))
             return bot.reply_to(message, "⚠️ <b>Limite atingido! (5/5)</b>\n\nVocê já usou seus 5 downloads gratuitos de hoje. Assine o VIP para continuar baixando sem limites!", parse_mode="HTML", reply_markup=markup)
         
-    # Mensagem de início de fila
     msg_p = bot.reply_to(message, "✅ Seu link foi adicionado à fila de download! Por favor, aguarde alguns instantes!", parse_mode="HTML")
     
     url = message.text.split()[0]
@@ -119,7 +141,6 @@ def handle_dl(message):
 
         if process_video_standard(raw_file, final_file):
             with open(final_file, 'rb') as f:
-                # Legenda de sucesso no envio do vídeo
                 bot.send_video(message.chat.id, f, caption="Vídeo baixado com sucesso 🤝")
             
             if not vip:
