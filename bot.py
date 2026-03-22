@@ -1,29 +1,20 @@
-import os, telebot, yt_dlp, mercadopago, json, subprocess
-from datetime import datetime, timedelta
-from flask import Flask, request
+import os, telebot, yt_dlp, mercadopago, json
+from datetime import datetime
+from flask import Flask
 from threading import Thread
 from telebot import types
 from pymongo import MongoClient
-import static_ffmpeg
 
-# CORREÇÃO: Nome exato da função na versão atual da biblioteca
-from static_ffmpeg.run import get_or_fetch_platform_executables_else_raise
-
-# --- CONFIGURAÇÕES CRÍTICAS (PRESERVADAS) ---
+# --- CONFIGURAÇÕES CRÍTICAS ---
 TOKEN_TELEGRAM = "8629536333:AAHjRGGxSm_Fc_WnAv8a2qLItCC_-bMUWqY"
 MP_ACCESS_TOKEN = "APP_USR-8179041093511853-031916-7364f07318b6c464600a781433c743f7-384532659"
 MONGO_URI = "mongodb+srv://tiagodesouzasevero_db_user:rdS2qlLSlH7eI9jA@cluster0.x3wiavb.mongodb.net/bot_downloader?retryWrites=true&w=majority&tlsAllowInvalidCertificates=true"
-ID_ADM = 493336271 
-
-# Inicializa o FFmpeg no ambiente
-static_ffmpeg.add_paths()
 
 client = MongoClient(MONGO_URI)
 db = client.get_default_database()
 usuarios_col = db["usuarios"]
 bot = telebot.TeleBot(TOKEN_TELEGRAM, threaded=False)
 app = Flask(__name__)
-sdk = mercadopago.SDK(MP_ACCESS_TOKEN)
 
 # --- FUNÇÕES DE USUÁRIO ---
 def obter_usuario(user_id):
@@ -44,34 +35,6 @@ def is_vip(user_id):
     except:
         return False
 
-# --- MOTOR DE VÍDEO (REVISADO: MÁX 720p / 30FPS) ---
-def process_video_optimized(input_path, output_path):
-    # Pega o executável absoluto do FFmpeg
-    ffmpeg_exe, _ = get_or_fetch_platform_executables_else_raise()
-    
-    # -vf scale: Garante que a altura não passe de 720 (ou largura 1280) mantendo a proporção.
-    # -r 30: Força 30 FPS de forma universal (resolve o erro de "Filter not found").
-    # -crf 28 e preset ultrafast: Equilíbrio entre qualidade e economia de CPU na Railway.
-    cmd = [
-        ffmpeg_exe, '-y', '-i', input_path, 
-        '-vf', "scale='min(1280,iw)':-2", 
-        '-r', '30', 
-        '-c:v', 'libx264', '-crf', '28', '-preset', 'ultrafast', 
-        '-ac', '1', '-ar', '22050', '-b:a', '64k', 
-        '-movflags', '+faststart',
-        output_path
-    ]
-    try:
-        # Aumentamos o tempo de espera para 3 minutos
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
-        if result.returncode != 0:
-            print(f"ERRO FFMPEG NO LOG: {result.stderr}")
-            return False
-        return True
-    except Exception as e:
-        print(f"FALHA CRÍTICA NO PROCESSAMENTO: {e}")
-        return False
-
 # --- INTERFACE ---
 @bot.message_handler(commands=['start', 'perfil'])
 def start(message):
@@ -81,64 +44,60 @@ def start(message):
     
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
     markup.row("💎 Planos VIP", "🛠 Suporte")
-    
-    bot.send_message(message.chat.id, f"🚀 <b>AfiliadoClip Pro</b>\n\n{status}\n\n🔗 Envie um link do TikTok, Pinterest ou RedNote:", parse_mode="HTML", reply_markup=markup)
+    bot.send_message(message.chat.id, f"🚀 <b>AfiliadoClip Pro</b>\n\n{status}\n\n🔗 Envie um link:", parse_mode="HTML", reply_markup=markup)
 
-# --- FLUXO DE DOWNLOAD ---
+# --- FLUXO DE DOWNLOAD COM TETO HD ---
 @bot.message_handler(func=lambda message: "http" in message.text)
 def handle_download(message):
     user = obter_usuario(message.from_user.id)
     vip = is_vip(message.from_user.id)
     
     if not vip and user.get("downloads_hoje", 0) >= 5:
-        return bot.reply_to(message, "⚠️ Limite diário atingido! Assine o VIP para downloads ilimitados.")
+        return bot.reply_to(message, "⚠️ Limite diário atingido!")
 
-    msg_status = bot.reply_to(message, "⏳ Baixando e Otimizando para HD...")
+    msg_status = bot.reply_to(message, "⏳ Baixando em HD 720p...")
     url = message.text.split()[0]
-    raw_name = f"r_{message.from_user.id}.mp4"
-    out_name = f"v_{message.from_user.id}.mp4"
+    file_name = f"v_{message.from_user.id}.mp4"
 
     try:
-        # Formato 'best' evita que o bot trave tentando juntar vídeo e áudio separados
+        # A MÁGICA ESTÁ AQUI: 
+        # 'best[height<=1280][width<=1280]' garante que o vídeo não passe de 720p 
+        # tanto em pé (vertical) quanto deitado (horizontal).
         ydl_opts = {
-            'format': 'best', 
-            'outtmpl': raw_name,
+            'format': 'best[height<=1280][width<=1280][ext=mp4]/best[height<=1280]/best',
+            'outtmpl': file_name,
             'nocheckcertificate': True,
-            'quiet': False # Deixamos False para você ver detalhes no log se falhar
+            'quiet': True
         }
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            if info.get('duration', 0) > 95:
-                if os.path.exists(raw_name): os.remove(raw_name)
-                return bot.edit_message_text("❌ Vídeo muito longo (Máx 90s).", message.chat.id, msg_status.message_id)
+            ydl.download([url])
 
-        # Inicia a conversão para 720p 30fps
-        if process_video_optimized(raw_name, out_name):
-            with open(out_name, 'rb') as f:
-                bot.send_video(message.chat.id, f, caption="✅ Vídeo processado em HD!")
+        if os.path.exists(file_name):
+            with open(file_name, 'rb') as f:
+                bot.send_video(message.chat.id, f, caption="✅ Vídeo 720p pronto!")
             
             if not vip:
                 usuarios_col.update_one({"_id": user["_id"]}, {"$inc": {"downloads_hoje": 1}})
         else:
-            bot.edit_message_text("❌ Erro ao otimizar vídeo. Tente novamente.", message.chat.id, msg_status.message_id)
+            bot.edit_message_text("❌ Erro ao baixar arquivo.", message.chat.id, msg_status.message_id)
 
     except Exception as e:
-        print(f"ERRO NO FLUXO: {e}")
-        bot.edit_message_text(f"❌ Falha ao processar link.", message.chat.id, msg_status.message_id)
+        print(f"ERRO: {e}")
+        bot.edit_message_text("❌ Link não suportado ou erro no download.", message.chat.id, msg_status.message_id)
     
     finally:
-        # Garante a limpeza do servidor
-        for f in [raw_name, out_name]:
-            if os.path.exists(f): os.remove(f)
-        try: bot.delete_message(message.chat.id, msg_status.message_id)
-        except: pass
+        if os.path.exists(file_name):
+            os.remove(file_name)
+        try:
+            bot.delete_message(message.chat.id, msg_status.message_id)
+        except:
+            pass
 
-# --- WEBHOOK / HEALTH ---
+# --- WEBHOOK ---
 @app.route('/')
 def health(): return "Bot Online", 200
 
 if __name__ == "__main__":
-    # Rodar o bot
     Thread(target=lambda: app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))).start()
     bot.infinity_polling(skip_pending=True)
