@@ -17,6 +17,7 @@ bot = telebot.TeleBot(TOKEN_TELEGRAM, threaded=False)
 app = Flask(__name__)
 sdk = mercadopago.SDK(MP_ACCESS_TOKEN)
 
+# --- FUNÇÕES DE USUÁRIO (MANTIDAS) ---
 def obter_usuario(user_id):
     uid = str(user_id)
     user = usuarios_col.find_one({"_id": uid})
@@ -30,19 +31,72 @@ def is_vip(user_id):
     user = obter_usuario(user_id)
     if user.get("vip_ate") == "Vitalício": return True
     if not user.get("vip_ate"): return False
-    try:
-        return datetime.now() < datetime.strptime(user["vip_ate"], '%Y-%m-%d')
+    try: return datetime.now() < datetime.strptime(user["vip_ate"], '%Y-%m-%d')
     except: return False
 
-@bot.message_handler(commands=['start', 'perfil'])
-def cmd_start(message):
+# --- DOWNLOADER v1.1.0 (SOLUÇÃO DE RESOLUÇÃO E ERRO PINTEREST) ---
+@bot.message_handler(func=lambda message: "http" in message.text)
+def handle_dl(message):
     user = obter_usuario(message.from_user.id)
     vip = is_vip(message.from_user.id)
-    status = user.get("vip_ate", "Grátis") if vip else "Grátis"
-    bot.reply_to(message, f"🚀 <b>ViralClip Pro</b>\n\n💎 Status: <b>{status}</b>\n\nEnvie o link do vídeo 👇", 
-                 reply_markup=None if vip else types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("💳 Planos VIP", callback_data="buy_10_Mensal")), parse_mode="HTML")
+    
+    hoje = datetime.now().strftime('%Y-%m-%d')
+    if user.get("ultima_data") != hoje:
+        usuarios_col.update_one({"_id": user["_id"]}, {"$set": {"downloads_hoje": 0, "ultima_data": hoje}})
+        user["downloads_hoje"] = 0
+    if not vip and user.get("downloads_hoje", 0) >= 5:
+        return bot.reply_to(message, "⚠️ Limite diário atingido!")
 
-# --- WEBHOOK E PIX MANTIDOS ---
+    msg_p = bot.reply_to(message, "✅ Seu link foi adicionado à fila de download! Por favor, aguarde alguns instantes!")
+    
+    url = message.text.split()[0]
+    file_id = f"dl_{message.from_user.id}_{message.message_id}"
+    
+    # ESTRATÉGIA v1.1.0: Usar seletor genérico para evitar erro de 'Format not available'
+    ydl_opts = {
+        'format': 'best', 
+        'outtmpl': f'{file_id}.%(ext)s',
+        'merge_output_format': 'mp4',
+        'quiet': True,
+        'no_warnings': True,
+        # FORÇA O REDIMENSIONAMENTO NO TIKTOK E MANTÉM ORIGINAL SE < 720p
+        'postprocessor_args': [
+            '-vf', "scale='if(gt(ih,720),-2,iw)':'if(gt(ih,720),720,ih)',fps=30",
+            '-c:v', 'libx264',
+            '-preset', 'ultrafast', # Aumenta velocidade na Railway
+            '-crf', '24'
+        ],
+        'postprocessors': [{'key': 'FFmpegVideoConvertor', 'preferedformat': 'mp4'}],
+    }
+    
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            # Extração de info para checar duração (RedNote continua liberado se duracao for 0 ou None)
+            info = ydl.extract_info(url, download=False)
+            duracao = info.get('duration', 0)
+            
+            if duracao and duracao > 90:
+                return bot.edit_message_text("❌ Vídeo acima de 90 segundos.", message.chat.id, msg_p.message_id)
+
+            ydl.download([url])
+            
+            # Localizar o arquivo final
+            files = glob.glob(f"{file_id}.mp4") or glob.glob(f"{file_id}.*")
+            if files:
+                with open(files[0], 'rb') as f:
+                    bot.send_video(message.chat.id, f, caption="Vídeo baixado com sucesso🤝")
+                for f in files: os.remove(f)
+                if not vip:
+                    usuarios_col.update_one({"_id": user["_id"]}, {"$inc": {"downloads_hoje": 1}})
+                bot.delete_message(message.chat.id, msg_p.message_id)
+            else:
+                raise Exception("Arquivo não gerado")
+                
+    except Exception as e:
+        print(f"Erro detalhado: {e}")
+        bot.edit_message_text("❌ Erro ao processar. Certifique-se que o link é público e tem menos de 90s.", message.chat.id, msg_p.message_id)
+
+# --- SERVIDOR E WEBHOOK (MANTIDOS) ---
 @app.route('/webhook', methods=['POST'])
 def webhook():
     data = request.args.to_dict() or request.json or {}
@@ -57,66 +111,6 @@ def webhook():
                 usuarios_col.update_one({"_id": str(user_id)}, {"$set": {"vip_ate": expira}})
                 bot.send_message(user_id, "✅ <b>VIP Ativado!</b>")
     return "OK", 200
-
-# --- DOWNLOADER v1.0.8 (RESOLUÇÃO DINÂMICA) ---
-@bot.message_handler(func=lambda message: "http" in message.text)
-def handle_dl(message):
-    user = obter_usuario(message.from_user.id)
-    vip = is_vip(message.from_user.id)
-    
-    hoje = datetime.now().strftime('%Y-%m-%d')
-    if user.get("ultima_data") != hoje:
-        usuarios_col.update_one({"_id": user["_id"]}, {"$set": {"downloads_hoje": 0, "ultima_data": hoje}})
-        user["downloads_hoje"] = 0
-    if not vip and user.get("downloads_hoje", 0) >= 5:
-        return bot.reply_to(message, "⚠️ Limite diário atingido!")
-
-    # NOVA MENSAGEM DE FILA
-    msg_p = bot.reply_to(message, "✅ Seu link foi adicionado à fila de download! Por favor, aguarde alguns instantes!")
-    
-    url = message.text.split()[0]
-    file_id = f"dl_{message.from_user.id}_{message.message_id}"
-    
-    ydl_opts = {
-        'format': 'bestvideo[height<=?720]+bestaudio/best', # Prioriza formatos até 720p
-        'outtmpl': f'{file_id}.%(ext)s',
-        'merge_output_format': 'mp4',
-        'quiet': True,
-        # FILTRO DINÂMICO: Reduz se for > 720p, mantém se for < 720p
-        'postprocessor_args': [
-            '-vf', "scale='if(gt(ih,720),-2,iw)':'if(gt(ih,720),720,ih)',fps=30",
-            '-c:v', 'libx264',
-            '-crf', '23',
-            '-preset', 'fast'
-        ],
-        'postprocessors': [{'key': 'FFmpegVideoConvertor', 'preferedformat': 'mp4'}],
-    }
-    
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            duracao = info.get('duration', 0)
-            
-            if duracao and duracao > 90:
-                return bot.edit_message_text("❌ Vídeo acima de 90 segundos.", message.chat.id, msg_p.message_id)
-
-            ydl.download([url])
-            
-            files = glob.glob(f"{file_id}.mp4") or glob.glob(f"{file_id}.*")
-            if files:
-                with open(files[0], 'rb') as f:
-                    # NOVA MENSAGEM DE SUCESSO NO CAPTION
-                    bot.send_video(message.chat.id, f, caption="Vídeo baixado com sucesso🤝")
-                for f in files: os.remove(f)
-                if not vip:
-                    usuarios_col.update_one({"_id": user["_id"]}, {"$inc": {"downloads_hoje": 1}})
-                bot.delete_message(message.chat.id, msg_p.message_id)
-            else:
-                raise Exception("Erro")
-                
-    except Exception as e:
-        print(f"Erro: {e}")
-        bot.edit_message_text("❌ Erro ao baixar ou vídeo acima de 90s.", message.chat.id, msg_p.message_id)
 
 @app.route('/')
 def health(): return "Bot Online", 200
