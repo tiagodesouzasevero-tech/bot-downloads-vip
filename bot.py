@@ -5,7 +5,7 @@ from threading import Thread
 from telebot import types
 from pymongo import MongoClient
 
-# --- CONFIGURAÇÕES CRÍTICAS (PRESERVADAS E VALIDADAS) ---
+# --- CONFIGURAÇÕES CRÍTICAS (PRESERVADAS) ---
 TOKEN_TELEGRAM = "8629536333:AAHjRGGxSm_Fc_WnAv8a2qLItCC_-bMUWqY"
 MP_ACCESS_TOKEN = "APP_USR-8179041093511853-031916-7364f07318b6c464600a781433c743f7-384532659"
 MONGO_URI = "mongodb+srv://tiagodesouzasevero_db_user:rdS2qlLSlH7eI9jA@cluster0.x3wiavb.mongodb.net/bot_downloader?retryWrites=true&w=majority&tlsAllowInvalidCertificates=true"
@@ -37,23 +37,29 @@ def is_vip(user_id):
     except:
         return False
 
-# --- PROCESSAMENTO ECONOMIA EXTREMA (MANTÉM FORMATO ORIGINAL + TETO 720p) ---
+# --- PROCESSAMENTO OTIMIZADO (COM CAPTURA DE LOGS) ---
 def process_video_optimized(input_path, output_path):
-    # LÓGICA:
-    # 1. scale: Se maior que 720p, reduz para 720p. Se menor, mantém original (ECONOMIZA CPU).
-    # 2. fps: Trava em no máximo 30fps.
-    # 3. Áudio: Converte para Mono (-ac 1) e reduz bitrate para 64k (ECONOMIZA BANDA).
-    # 4. Compressão: CRF 30 e Preset Ultrafast (ECONOMIZA DINHEIRO NA RAILWAY).
+    # scale: Teto 720p (mantém formato original)
+    # ac 1 / ar 22050 / b:a 64k: Economia de banda (Mono)
+    # crf 30 / ultrafast: Economia de CPU e peso
     cmd = [
         'ffmpeg', '-y', '-i', input_path, 
         '-vf', "scale='if(gt(ih,720),-2,iw)':'min(ih,720)',fps=min(30,fps)", 
         '-c:v', 'libx264', '-crf', '30', '-preset', 'ultrafast', 
-        '-ac', '1', '-ar', '22050', '-b:a', '64k', output_path
+        '-ac', '1', '-ar', '22050', '-b:a', '64k', 
+        '-movflags', '+faststart',
+        output_path
     ]
     try:
-        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        return True
-    except:
+        # Captura stdout e stderr para vermos o erro exato na Railway se falhar
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+        if result.returncode == 0:
+            return True
+        else:
+            print(f"--- ERRO FFmpeg ---\n{result.stderr}\n-------------------")
+            return False
+    except Exception as e:
+        print(f"Erro ao chamar subprocesso: {e}")
         return False
 
 # --- SISTEMA DE PAGAMENTO ---
@@ -163,9 +169,9 @@ def handle_dl(message):
             for f in [raw_file, final_file]:
                 if os.path.exists(f): os.remove(f)
             bot.delete_message(message.chat.id, msg_p.message_id)
-        else: raise Exception()
-    except:
-        bot.edit_message_text("❌ Erro ao processar.", message.chat.id, msg_p.message_id)
+        else: raise Exception("Falha no FFmpeg")
+    except Exception as e:
+        bot.edit_message_text(f"❌ Erro ao processar.", message.chat.id, msg_p.message_id)
         if os.path.exists(raw_file): os.remove(raw_file)
 
 # --- WEBHOOK ---
