@@ -3,4 +3,3 @@ yt-dlp
 mercadopago
 pymongo
 flask
-static-ffmpeg
