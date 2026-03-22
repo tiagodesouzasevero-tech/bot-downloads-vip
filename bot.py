@@ -5,7 +5,7 @@ from threading import Thread
 from telebot import types
 from pymongo import MongoClient
 
-# --- CONFIGURAÇÕES (MANTIDAS) ---
+# --- CONFIGURAÇÕES MANTIDAS ---
 TOKEN_TELEGRAM = "8629536333:AAHjRGGxSm_Fc_WnAv8a2qLItCC_-bMUWqY"
 MP_ACCESS_TOKEN = "APP_USR-8179041093511853-031916-7364f07318b6c464600a781433c743f7-384532659"
 MONGO_URI = "mongodb+srv://tiagodesouzasevero_db_user:rdS2qlLSlH7eI9jA@cluster0.x3wiavb.mongodb.net/bot_downloader?retryWrites=true&w=majority&tlsAllowInvalidCertificates=true"
@@ -13,12 +13,10 @@ MONGO_URI = "mongodb+srv://tiagodesouzasevero_db_user:rdS2qlLSlH7eI9jA@cluster0.
 client = MongoClient(MONGO_URI)
 db = client.get_default_database()
 usuarios_col = db["usuarios"]
-
 bot = telebot.TeleBot(TOKEN_TELEGRAM, threaded=False)
 app = Flask(__name__)
 sdk = mercadopago.SDK(MP_ACCESS_TOKEN)
 
-# --- FUNÇÕES DE USUÁRIO (MANTIDAS) ---
 def obter_usuario(user_id):
     uid = str(user_id)
     user = usuarios_col.find_one({"_id": uid})
@@ -33,12 +31,9 @@ def is_vip(user_id):
     if user.get("vip_ate") == "Vitalício": return True
     if not user.get("vip_ate"): return False
     try:
-        data_vip = datetime.strptime(user["vip_ate"], '%Y-%m-%d')
-        return datetime.now() < data_vip
-    except:
-        return False
+        return datetime.now() < datetime.strptime(user["vip_ate"], '%Y-%m-%d')
+    except: return False
 
-# --- MENUS (MANTIDOS) ---
 def menu_planos():
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("💳 Mensal - R$10,00", callback_data="buy_10_Mensal"))
@@ -46,7 +41,6 @@ def menu_planos():
     markup.add(types.InlineKeyboardButton("💎 Vitalício - R$190,00 🔥", callback_data="buy_190_Vitalicio"))
     return markup
 
-# --- COMANDOS (MANTIDOS) ---
 @bot.message_handler(commands=['start', 'perfil'])
 def cmd_start(message):
     user = obter_usuario(message.from_user.id)
@@ -55,7 +49,7 @@ def cmd_start(message):
     bot.reply_to(message, f"🚀 <b>ViralClip Pro</b>\n\n💎 Status: <b>{status}</b>\n\nEnvie o link do vídeo 👇", 
                  reply_markup=None if vip else menu_planos(), parse_mode="HTML")
 
-# --- PAGAMENTOS PIX (MANTIDO) ---
+# --- WEBHOOK E PIX MANTIDOS ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith("buy_"))
 def callback_buy(call):
     try:
@@ -73,8 +67,7 @@ def callback_buy(call):
         if "response" in res and "point_of_interaction" in res["response"]:
             pix_code = res["response"]["point_of_interaction"]["transaction_data"]["qr_code"]
             bot.edit_message_text(f"💰 <b>Pix Copia e Cola:</b>\n\n<code>{pix_code}</code>", call.message.chat.id, call.message.message_id, parse_mode="HTML")
-    except:
-        bot.answer_callback_query(call.id, "❌ Erro ao gerar Pix.")
+    except: bot.answer_callback_query(call.id, "❌ Erro.")
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
@@ -91,7 +84,7 @@ def webhook():
                 bot.send_message(user_id, "✅ <b>VIP Ativado!</b>")
     return "OK", 200
 
-# --- DOWNLOADER (v1.0.5 - FORÇA BRUTA HD) ---
+# --- DOWNLOADER v1.0.6 (FIX TIKTOK/PINTEREST) ---
 @bot.message_handler(func=lambda message: "http" in message.text)
 def handle_dl(message):
     user = obter_usuario(message.from_user.id)
@@ -104,26 +97,24 @@ def handle_dl(message):
     if not vip and user.get("downloads_hoje", 0) >= 5:
         return bot.reply_to(message, "⚠️ Limite diário atingido!", reply_markup=menu_planos())
 
-    msg_p = bot.reply_to(message, "⏳ Processando vídeo em HD 720p...")
+    msg_p = bot.reply_to(message, "⏳ Processando em HD 720p...")
     url = message.text.split()[0]
     file_id = f"dl_{message.from_user.id}_{message.message_id}"
     
     ydl_opts = {
-        'format': 'best', # Pega o melhor arquivo disponível para garantir o download
-        'outtmpl': f'{file_id}_raw.%(ext)s', # Baixa um arquivo temporário bruto
+        # 'best' resolve o erro do Pinterest de formato não disponível
+        'format': 'bestvideo+bestaudio/best',
+        'outtmpl': f'{file_id}.%(ext)s',
+        'merge_output_format': 'mp4',
         'quiet': True,
         'no_warnings': True,
-        # FORÇA A RE-CODIFICAÇÃO PARA 720p e 30FPS INDEPENDENTE DA FONTE
-        'postprocessors': [{
-            'key': 'FFmpegVideoConvertor',
-            'preferedformat': 'mp4',
-        }],
+        # Força reprocessamento total para garantir 720p/30fps
         'postprocessor_args': [
-            '-vf', 'scale=-2:720,fps=30', # Fixa altura em 720, largura proporcional (múltiplo de 2) e 30fps
-            '-c:v', 'libx264',             # Codec de vídeo padrão
-            '-crf', '23',                 # Qualidade equilibrada
-            '-preset', 'fast'             # Velocidade de conversão
+            '-vf', 'scale=-2:720,fps=30',
+            '-c:v', 'libx264',
+            '-preset', 'veryfast'
         ],
+        'postprocessors': [{'key': 'FFmpegVideoConvertor', 'preferedformat': 'mp4'}],
     }
     
     try:
@@ -131,18 +122,14 @@ def handle_dl(message):
             info = ydl.extract_info(url, download=False)
             duracao = info.get('duration', 0)
             
-            # Trava de 90 segundos (Com folga para erros de metadados)
+            # Trava de 90s: RedNote costuma vir com 0 ou None, então ele passa direto.
+            # Pinterest e TikTok agora são identificados corretamente.
             if duracao and duracao > 90:
                 return bot.edit_message_text("❌ Vídeo acima de 90 segundos.", message.chat.id, msg_p.message_id)
 
-            # Executa o download e a conversão forçada
             ydl.download([url])
             
-            # Procura o arquivo final (o yt-dlp converte para .mp4 conforme 'preferedformat')
-            files = glob.glob(f"{file_id}_raw.mp4")
-            if not files: # Se não achou .mp4, procura qualquer extensão do file_id
-                files = glob.glob(f"{file_id}_raw.*")
-
+            files = glob.glob(f"{file_id}.mp4") or glob.glob(f"{file_id}.*")
             if files:
                 with open(files[0], 'rb') as f:
                     bot.send_video(message.chat.id, f, caption="Vídeo pronto em HD 720p 🤝")
@@ -151,13 +138,12 @@ def handle_dl(message):
                     usuarios_col.update_one({"_id": user["_id"]}, {"$inc": {"downloads_hoje": 1}})
                 bot.delete_message(message.chat.id, msg_p.message_id)
             else:
-                raise Exception("Erro no arquivo")
+                raise Exception("Erro ao gerar arquivo")
                 
     except Exception as e:
         print(f"Erro: {e}")
-        bot.edit_message_text("❌ Erro ou vídeo acima de 90s (RedNote/TikTok).", message.chat.id, msg_p.message_id)
+        bot.edit_message_text("❌ Erro ao baixar ou vídeo acima de 90s.", message.chat.id, msg_p.message_id)
 
-# --- SERVIDOR ---
 @app.route('/')
 def health(): return "Bot Online", 200
 def run_flask(): app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
