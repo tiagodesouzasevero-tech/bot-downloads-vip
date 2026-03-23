@@ -19,7 +19,7 @@ usuarios_col = db["usuarios"]
 bot = telebot.TeleBot(TOKEN_TELEGRAM, threaded=False)
 app = Flask(__name__)
 
-# --- FUNÇÕES DE USUÁRIO (COM RESET DIÁRIO AUTOMÁTICO) ---
+# --- FUNÇÕES DE USUÁRIO ---
 def obter_usuario(user_id):
     uid = str(user_id)
     user = usuarios_col.find_one({"_id": uid})
@@ -60,7 +60,6 @@ def aviso_geral(message):
         msg_texto = message.text.replace('/avisogeral', '').strip()
         if not msg_texto:
             return bot.reply_to(message, "❌ Digite a mensagem após o comando.")
-        
         usuarios = usuarios_col.find({}, {"_id": 1})
         cont = 0
         for u in usuarios:
@@ -70,6 +69,37 @@ def aviso_geral(message):
             except: pass
         bot.reply_to(message, f"📢 Aviso enviado para {cont} usuários!")
 
+# --- MENU SECRETO DO ADM ---
+@bot.message_handler(func=lambda m: m.text == "⚙️ Painel Admin")
+def painel_admin(message):
+    if message.from_user.id == ADMIN_ID:
+        total_users = usuarios_col.count_documents({})
+        hoje_str = datetime.now().strftime('%Y-%m-%d')
+        vips_ativos = usuarios_col.count_documents({"$or": [{"vip_ate": "Vitalício"}, {"vip_ate": {"$gte": hoje_str}}]})
+        
+        # Soma de todos os downloads feitos hoje por todos os usuários
+        pipeline = [{"$group": {"_id": None, "total": {"$sum": "$downloads_hoje"}}}]
+        res_downloads = list(usuarios_col.aggregate(pipeline))
+        downloads_totais_hoje = res_downloads[0]['total'] if res_downloads else 0
+
+        texto_admin = (
+            "🛠 **GUIA DE COMANDOS DO ADMINISTRADOR**\n\n"
+            f"👤 Usuários Totais: `{total_users}`\n"
+            f"💎 VIPs Ativos: `{vips_ativos}`\n"
+            f"📥 Downloads Hoje (Global): `{downloads_totais_hoje}`\n\n"
+            "🚀 **COMANDOS DISPONÍVEIS:**\n\n"
+            "1️⃣ **Dar VIP Manual:**\n"
+            "   `/darvip [ID_DO_USER] [DIAS]`\n"
+            "   *Ex: /darvip 123456 30*\n\n"
+            "2️⃣ **Aviso Geral (Broadcast):**\n"
+            "   `/avisogeral [SUA MENSAGEM]`\n"
+            "   *Envia para todos no banco.*\n\n"
+            "3️⃣ **Pegar ID de alguém:**\n"
+            "   Peça para o usuário te mandar o print do `/perfil` dele.\n\n"
+            "⚠️ *Nota: Somente você visualiza este menu.*"
+        )
+        bot.send_message(message.chat.id, texto_admin, parse_mode="Markdown")
+
 # --- INTERFACE ---
 @bot.message_handler(commands=['start', 'perfil'])
 def start(message):
@@ -78,8 +108,11 @@ def start(message):
     status = "💎 **STATUS: VIP PRO**" if vip else f"👤 **STATUS: GRÁTIS** ({user.get('downloads_hoje', 0)}/5)"
     texto = (f"🚀 **AfiliadoClip Pro**\n\nBaixe vídeos em HD do TikTok, Pinterest e RedNote.\n\n"
              f"• Duração máx: 90s\n• Sua ID: `{message.from_user.id}`\n\n{status}")
+    
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
     markup.row("💎 Planos VIP", "🛠 Suporte")
+    if message.from_user.id == ADMIN_ID:
+        markup.row("⚙️ Painel Admin") # AQUI ESTÁ O SEU BOTÃO SECRETO
     bot.send_message(message.chat.id, texto, parse_mode="Markdown", reply_markup=markup)
 
 @bot.message_handler(func=lambda m: m.text == "💎 Planos VIP")
@@ -92,6 +125,11 @@ def mostrar_planos(message):
     )
     bot.send_message(message.chat.id, "Escolha seu plano:", reply_markup=markup)
 
+@bot.message_handler(func=lambda m: m.text == "🛠 Suporte")
+def suporte(message):
+    markup = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("Chamar no Suporte", url=LINK_SUPORTE))
+    bot.send_message(message.chat.id, "👋 Precisa de ajuda? Clique abaixo:", reply_markup=markup)
+
 @bot.callback_query_handler(func=lambda call: call.data.startswith("pay_"))
 def pag_manual(call):
     valor = call.data.split("_")[1]
@@ -100,16 +138,14 @@ def pag_manual(call):
     markup = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("📤 Enviar Comprovante", url=LINK_SUPORTE))
     bot.send_message(call.message.chat.id, msg, parse_mode="Markdown", reply_markup=markup)
 
-# --- DOWNLOADER (COM AS NOVAS MENSAGENS PERSONALIZADAS) ---
+# --- DOWNLOADER (ESTÁVEL + TRAVA 720p) ---
 @bot.message_handler(func=lambda message: "http" in message.text)
 def handle_download(message):
     user = obter_usuario(message.from_user.id)
     if not is_vip(message.from_user.id) and user.get("downloads_hoje", 0) >= 5:
         return bot.reply_to(message, "⚠️ **Limite atingido!** Adquira o VIP.")
 
-    # MENSAGEM DE FILA (INÍCIO)
     status_msg = bot.reply_to(message, "✅ Seu link já entrou na fila de download! Aguarde só alguns instantes enquanto processamos 👊")
-    
     url = message.text.split()[0]
     file_name = f"v_{message.from_user.id}.mp4"
 
@@ -119,7 +155,6 @@ def handle_download(message):
             if info.get('duration', 0) > 90:
                 return bot.edit_message_text("⚠️ Vídeo muito longo (máx 90s).", message.chat.id, status_msg.message_id)
 
-        # REGRA RÍGIDA: 720p HD
         ydl_opts = {
             'format': 'bestvideo[height<=1280][width<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=1280][ext=mp4]/best[ext=mp4]/best',
             'outtmpl': file_name, 'nocheckcertificate': True, 'quiet': True, 'noplaylist': True, 'merge_output_format': 'mp4'
@@ -135,21 +170,14 @@ def handle_download(message):
 
         if os.path.exists(file_name):
             with open(file_name, 'rb') as f:
-                # MENSAGEM DE CONCLUSÃO (CAPTION DO VÍDEO)
                 bot.send_video(message.chat.id, f, caption="👉 Download concluído! Aqui está seu vídeo 👊")
-            
             if not is_vip(message.from_user.id):
                 usuarios_col.update_one({"_id": user["_id"]}, {"$inc": {"downloads_hoje": 1}})
-        
         bot.delete_message(message.chat.id, status_msg.message_id)
     except:
         bot.edit_message_text("❌ Erro no link ou formato.", message.chat.id, status_msg.message_id)
     finally:
         if os.path.exists(file_name): os.remove(file_name)
-
-@bot.callback_query_handler(func=lambda call: call.data == "mostrar_planos_bt")
-def callback_planos(call):
-    mostrar_planos(call.message)
 
 @app.route('/')
 def health(): return "ONLINE", 200
