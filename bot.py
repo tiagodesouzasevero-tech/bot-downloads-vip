@@ -92,11 +92,6 @@ def mostrar_planos(message):
     )
     bot.send_message(message.chat.id, "Escolha seu plano:", reply_markup=markup)
 
-@bot.message_handler(func=lambda m: m.text == "🛠 Suporte")
-def suporte(message):
-    markup = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("Chamar no Suporte", url=LINK_SUPORTE))
-    bot.send_message(message.chat.id, "👋 Precisa de ajuda?", reply_markup=markup)
-
 @bot.callback_query_handler(func=lambda call: call.data.startswith("pay_"))
 def pag_manual(call):
     valor = call.data.split("_")[1]
@@ -105,14 +100,16 @@ def pag_manual(call):
     markup = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("📤 Enviar Comprovante", url=LINK_SUPORTE))
     bot.send_message(call.message.chat.id, msg, parse_mode="Markdown", reply_markup=markup)
 
-# --- DOWNLOADER (ESTÁVEL + TRAVA 720p VERTICAL) ---
+# --- DOWNLOADER (COM AS NOVAS MENSAGENS PERSONALIZADAS) ---
 @bot.message_handler(func=lambda message: "http" in message.text)
 def handle_download(message):
     user = obter_usuario(message.from_user.id)
     if not is_vip(message.from_user.id) and user.get("downloads_hoje", 0) >= 5:
         return bot.reply_to(message, "⚠️ **Limite atingido!** Adquira o VIP.")
 
-    status_msg = bot.reply_to(message, "⏳ Analisando...")
+    # MENSAGEM DE FILA (INÍCIO)
+    status_msg = bot.reply_to(message, "✅ Seu link já entrou na fila de download! Aguarde só alguns instantes enquanto processamos 👊")
+    
     url = message.text.split()[0]
     file_name = f"v_{message.from_user.id}.mp4"
 
@@ -122,9 +119,7 @@ def handle_download(message):
             if info.get('duration', 0) > 90:
                 return bot.edit_message_text("⚠️ Vídeo muito longo (máx 90s).", message.chat.id, status_msg.message_id)
 
-        bot.edit_message_text("📥 Baixando em HD...", message.chat.id, status_msg.message_id)
-        
-        # REGRA RÍGIDA: Nunca passa de 1280px de altura.
+        # REGRA RÍGIDA: 720p HD
         ydl_opts = {
             'format': 'bestvideo[height<=1280][width<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=1280][ext=mp4]/best[ext=mp4]/best',
             'outtmpl': file_name, 'nocheckcertificate': True, 'quiet': True, 'noplaylist': True, 'merge_output_format': 'mp4'
@@ -140,9 +135,12 @@ def handle_download(message):
 
         if os.path.exists(file_name):
             with open(file_name, 'rb') as f:
-                bot.send_video(message.chat.id, f, caption="✅ Enviado por @AfiliadoClipProBot")
+                # MENSAGEM DE CONCLUSÃO (CAPTION DO VÍDEO)
+                bot.send_video(message.chat.id, f, caption="👉 Download concluído! Aqui está seu vídeo 👊")
+            
             if not is_vip(message.from_user.id):
                 usuarios_col.update_one({"_id": user["_id"]}, {"$inc": {"downloads_hoje": 1}})
+        
         bot.delete_message(message.chat.id, status_msg.message_id)
     except:
         bot.edit_message_text("❌ Erro no link ou formato.", message.chat.id, status_msg.message_id)
