@@ -54,6 +54,17 @@ def dar_vip_manual(message):
             bot.send_message(alvo_id, "🎉 **PAGAMENTO CONFIRMADO!**\nSeu acesso VIP foi liberado.")
         except: bot.reply_to(message, "❌ Use: `/darvip ID DIAS`")
 
+@bot.message_handler(commands=['zerar'])
+def zerar_contador(message):
+    if message.from_user.id == ADMIN_ID:
+        try:
+            args = message.text.split()
+            alvo_id = args[1]
+            usuarios_col.update_one({"_id": str(alvo_id)}, {"$set": {"downloads_hoje": 0}})
+            bot.reply_to(message, f"✅ Contador do usuário {alvo_id} foi zerado!")
+            bot.send_message(alvo_id, "🔄 Suas tentativas diárias foram resetadas pelo suporte. Pode voltar a baixar!")
+        except: bot.reply_to(message, "❌ Use: `/zerar ID`")
+
 @bot.message_handler(commands=['avisogeral'])
 def aviso_geral(message):
     if message.from_user.id == ADMIN_ID:
@@ -80,13 +91,14 @@ def painel_admin(message):
         downloads_totais_hoje = res_downloads[0]['total'] if res_downloads else 0
 
         texto_admin = (
-            "🛠 **GUIA DE COMANDOS DO ADMINISTRADOR**\n\n"
+            "🛠 **PAINEL DE CONTROLE ADMIN**\n\n"
             f"👤 Usuários Totais: `{total_users}`\n"
             f"💎 VIPs Ativos: `{vips_ativos}`\n"
-            f"📥 Downloads Hoje (Global): `{downloads_totais_hoje}`\n\n"
+            f"📥 Downloads Hoje: `{downloads_totais_hoje}`\n\n"
             "🚀 **COMANDOS DISPONÍVEIS:**\n"
-            "• `/avisogeral [mensagem]`\n"
             "• `/darvip [ID] [Dias]`\n"
+            "• `/zerar [ID]`\n"
+            "• `/avisogeral [Mensagem]`"
         )
         bot.send_message(message.chat.id, texto_admin, parse_mode="Markdown")
 
@@ -133,7 +145,6 @@ def handle_download(message):
     user = obter_usuario(message.from_user.id)
     vip_status = is_vip(message.from_user.id)
     
-    # TRAVA DE LIMITE IMEDIATA COM PLANOS
     if not vip_status and user.get("downloads_hoje", 0) >= 5:
         bot.reply_to(message, "⚠️ **Limite diário atingido (5/5)!**\nPara continuar baixando sem limites, adquira um de nossos planos VIP abaixo: 👇")
         return mostrar_planos(message)
@@ -165,7 +176,6 @@ def handle_download(message):
             with open(file_name, 'rb') as f:
                 bot.send_video(message.chat.id, f, caption="👉 Download concluído! Aqui está seu vídeo 👊")
             
-            # ATUALIZA CONTADOR E MOSTRA 1/5, 2/5...
             if not vip_status:
                 usuarios_col.update_one({"_id": user["_id"]}, {"$inc": {"downloads_hoje": 1}})
                 novo_count = user.get("downloads_hoje", 0) + 1
