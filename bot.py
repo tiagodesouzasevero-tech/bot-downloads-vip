@@ -69,15 +69,12 @@ def aviso_geral(message):
             except: pass
         bot.reply_to(message, f"📢 Aviso enviado para {cont} usuários!")
 
-# --- MENU SECRETO DO ADM ---
 @bot.message_handler(func=lambda m: m.text == "⚙️ Painel Admin")
 def painel_admin(message):
     if message.from_user.id == ADMIN_ID:
         total_users = usuarios_col.count_documents({})
         hoje_str = datetime.now().strftime('%Y-%m-%d')
         vips_ativos = usuarios_col.count_documents({"$or": [{"vip_ate": "Vitalício"}, {"vip_ate": {"$gte": hoje_str}}]})
-        
-        # Soma de todos os downloads feitos hoje por todos os usuários
         pipeline = [{"$group": {"_id": None, "total": {"$sum": "$downloads_hoje"}}}]
         res_downloads = list(usuarios_col.aggregate(pipeline))
         downloads_totais_hoje = res_downloads[0]['total'] if res_downloads else 0
@@ -87,16 +84,9 @@ def painel_admin(message):
             f"👤 Usuários Totais: `{total_users}`\n"
             f"💎 VIPs Ativos: `{vips_ativos}`\n"
             f"📥 Downloads Hoje (Global): `{downloads_totais_hoje}`\n\n"
-            "🚀 **COMANDOS DISPONÍVEIS:**\n\n"
-            "1️⃣ **Dar VIP Manual:**\n"
-            "   `/darvip [ID_DO_USER] [DIAS]`\n"
-            "   *Ex: /darvip 123456 30*\n\n"
-            "2️⃣ **Aviso Geral (Broadcast):**\n"
-            "   `/avisogeral [SUA MENSAGEM]`\n"
-            "   *Envia para todos no banco.*\n\n"
-            "3️⃣ **Pegar ID de alguém:**\n"
-            "   Peça para o usuário te mandar o print do `/perfil` dele.\n\n"
-            "⚠️ *Nota: Somente você visualiza este menu.*"
+            "🚀 **COMANDOS DISPONÍVEIS:**\n"
+            "• `/avisogeral [mensagem]`\n"
+            "• `/darvip [ID] [Dias]`\n"
         )
         bot.send_message(message.chat.id, texto_admin, parse_mode="Markdown")
 
@@ -108,11 +98,10 @@ def start(message):
     status = "💎 **STATUS: VIP PRO**" if vip else f"👤 **STATUS: GRÁTIS** ({user.get('downloads_hoje', 0)}/5)"
     texto = (f"🚀 **AfiliadoClip Pro**\n\nBaixe vídeos em HD do TikTok, Pinterest e RedNote.\n\n"
              f"• Duração máx: 90s\n• Sua ID: `{message.from_user.id}`\n\n{status}")
-    
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
     markup.row("💎 Planos VIP", "🛠 Suporte")
     if message.from_user.id == ADMIN_ID:
-        markup.row("⚙️ Painel Admin") # AQUI ESTÁ O SEU BOTÃO SECRETO
+        markup.row("⚙️ Painel Admin")
     bot.send_message(message.chat.id, texto, parse_mode="Markdown", reply_markup=markup)
 
 @bot.message_handler(func=lambda m: m.text == "💎 Planos VIP")
@@ -138,12 +127,16 @@ def pag_manual(call):
     markup = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("📤 Enviar Comprovante", url=LINK_SUPORTE))
     bot.send_message(call.message.chat.id, msg, parse_mode="Markdown", reply_markup=markup)
 
-# --- DOWNLOADER (ESTÁVEL + TRAVA 720p) ---
+# --- DOWNLOADER ---
 @bot.message_handler(func=lambda message: "http" in message.text)
 def handle_download(message):
     user = obter_usuario(message.from_user.id)
-    if not is_vip(message.from_user.id) and user.get("downloads_hoje", 0) >= 5:
-        return bot.reply_to(message, "⚠️ **Limite atingido!** Adquira o VIP.")
+    vip_status = is_vip(message.from_user.id)
+    
+    # TRAVA DE LIMITE IMEDIATA COM PLANOS
+    if not vip_status and user.get("downloads_hoje", 0) >= 5:
+        bot.reply_to(message, "⚠️ **Limite diário atingido (5/5)!**\nPara continuar baixando sem limites, adquira um de nossos planos VIP abaixo: 👇")
+        return mostrar_planos(message)
 
     status_msg = bot.reply_to(message, "✅ Seu link já entrou na fila de download! Aguarde só alguns instantes enquanto processamos 👊")
     url = message.text.split()[0]
@@ -171,8 +164,13 @@ def handle_download(message):
         if os.path.exists(file_name):
             with open(file_name, 'rb') as f:
                 bot.send_video(message.chat.id, f, caption="👉 Download concluído! Aqui está seu vídeo 👊")
-            if not is_vip(message.from_user.id):
+            
+            # ATUALIZA CONTADOR E MOSTRA 1/5, 2/5...
+            if not vip_status:
                 usuarios_col.update_one({"_id": user["_id"]}, {"$inc": {"downloads_hoje": 1}})
+                novo_count = user.get("downloads_hoje", 0) + 1
+                bot.send_message(message.chat.id, f"📊 Uso diário: {novo_count}/5")
+        
         bot.delete_message(message.chat.id, status_msg.message_id)
     except:
         bot.edit_message_text("❌ Erro no link ou formato.", message.chat.id, status_msg.message_id)
