@@ -9,12 +9,10 @@ from pymongo import MongoClient
 TOKEN_TELEGRAM = "8629536333:AAHjRGGxSm_Fc_WnAv8a2qLItCC_-bMUWqY"
 MONGO_URI = "mongodb+srv://tiagodesouzasevero_db_user:rdS2qlLSlH7eI9jA@cluster0.x3wiavb.mongodb.net/bot_downloader?retryWrites=true&w=majority"
 
-# Seus Dados Reais Configuradas
 CHAVE_PIX_INFINITE = "dc359b2c-d52f-48b5-b022-3c4fb3a8ddb5" 
 LINK_SUPORTE = "https://t.me/suporteafiliadoclippro"
 ADMIN_ID = 493336271
 
-# Conexão Banco de Dados
 client = MongoClient(MONGO_URI)
 db = client.get_default_database()
 usuarios_col = db["usuarios"]
@@ -22,7 +20,6 @@ usuarios_col = db["usuarios"]
 bot = telebot.TeleBot(TOKEN_TELEGRAM, threaded=False)
 app = Flask(__name__)
 
-# --- FUNÇÕES DE CONTROLE DE USUÁRIO ---
 def obter_usuario(user_id):
     uid = str(user_id)
     user = usuarios_col.find_one({"_id": uid})
@@ -37,39 +34,31 @@ def is_vip(user_id):
     if user.get("vip_ate") == "Vitalício": return True
     if not user.get("vip_ate"): return False
     try:
-        # Verifica se a data atual é menor que a data de expiração
         return datetime.now() < datetime.strptime(user["vip_ate"], '%Y-%m-%d')
     except: return False
 
-# --- COMANDO ADMIN (LIBERAR VIP MANUALMENTE) ---
 @bot.message_handler(commands=['darvip'])
 def dar_vip_manual(message):
     if message.from_user.id == ADMIN_ID:
         try:
-            # Comando: /darvip ID_DO_USUARIO DIAS
             args = message.text.split()
             alvo_id = args[1]
             dias = int(args[2])
-            
-            # Se colocar 3650 dias ou mais, vira Vitalício
             nova_data = "Vitalício" if dias >= 3650 else (datetime.now() + timedelta(days=dias)).strftime('%Y-%m-%d')
             usuarios_col.update_one({"_id": str(alvo_id)}, {"$set": {"vip_ate": nova_data}})
-            
-            bot.reply_to(message, f"✅ Sucesso! VIP liberado para {alvo_id} até {nova_data}!")
-            bot.send_message(alvo_id, f"🎉 **PAGAMENTO CONFIRMADO!**\nSeu acesso VIP foi liberado até {nova_data}. Aproveite downloads ilimitados em HD! 🚀")
+            bot.reply_to(message, f"✅ VIP liberado para {alvo_id} até {nova_data}!")
+            bot.send_message(alvo_id, f"🎉 **PAGAMENTO CONFIRMADO!**\nVIP liberado até {nova_data}!")
         except:
-            bot.reply_to(message, "❌ Erro! Use: `/darvip ID DIAS` (Ex: /darvip 123456 30)", parse_mode="Markdown")
+            bot.reply_to(message, "❌ Use: /darvip ID DIAS")
 
-# --- COMANDOS E INTERFACE ---
 @bot.message_handler(commands=['start', 'perfil'])
 def start(message):
     user = obter_usuario(message.from_user.id)
     vip = is_vip(message.from_user.id)
     status = "💎 **STATUS: VIP PRO**" if vip else f"👤 **STATUS: GRÁTIS** ({user.get('downloads_hoje', 0)}/5)"
-    
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
     markup.row("💎 Planos VIP", "🛠 Suporte")
-    bot.send_message(message.chat.id, f"🚀 **AfiliadoClip Pro**\n\nSua ID: `{message.from_user.id}`\n{status}\n\n🔗 Envie um link para baixar em HD!", parse_mode="Markdown", reply_markup=markup)
+    bot.send_message(message.chat.id, f"🚀 **AfiliadoClip Pro**\n\nSua ID: `{message.from_user.id}`\n{status}", parse_mode="Markdown", reply_markup=markup)
 
 @bot.message_handler(func=lambda m: m.text == "💎 Planos VIP")
 def mostrar_planos(message):
@@ -81,73 +70,50 @@ def mostrar_planos(message):
     )
     bot.send_message(message.chat.id, "Escolha o melhor plano para você:", reply_markup=markup)
 
-# --- SISTEMA DE PAGAMENTO (INFINITEPAY MANUAL) ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith("pay_"))
 def pagamento_manual(call):
     valor = call.data.split("_")[1]
-    bot.answer_callback_query(call.id)
-
-    msg = (
-        f"💎 **Plano Selecionado: R$ {valor}**\n\n"
-        f"Para ativar seu VIP, pague via **Pix Copia e Cola**:\n\n"
-        f"`{CHAVE_PIX_INFINITE}`\n\n"
-        f"⚠️ **IMPORTANTE:** Após pagar, envie o comprovante e sua ID abaixo no botão de suporte!\n\n"
-        f"Sua ID: `{call.from_user.id}`"
-    )
-
+    msg = f"💎 **Plano: R$ {valor}**\n\nPix Copia e Cola:\n`{CHAVE_PIX_INFINITE}`\n\nEnvie o comprovante e sua ID: `{call.from_user.id}`"
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("📤 Enviar Comprovante", url=LINK_SUPORTE))
-
     bot.send_message(call.message.chat.id, msg, parse_mode="Markdown", reply_markup=markup)
 
-# --- DOWNLOADER (Configuração HD 720p Otimizada) ---
 @bot.message_handler(func=lambda message: "http" in message.text)
 def handle_download(message):
     user = obter_usuario(message.from_user.id)
     
-    if not is_vip(message.from_user.id) and user.get("downloads_hoje', 0) >= 5:
-        markup = types.InlineKeyboardMarkup(row_width=1)
-        markup.add(
-            types.InlineKeyboardButton("💳 VIP Mensal - R$ 10,00", callback_data="pay_10.00"),
-            types.InlineKeyboardButton("💳 VIP Anual - R$ 69,90", callback_data="pay_69.90"),
-            types.InlineKeyboardButton("💎 VIP Vitalício - R$ 197,00", callback_data="pay_197.00")
-        )
-        return bot.reply_to(message, "⚠️ **Limite atingido!**\nUse um dos planos abaixo para continuar baixando hoje:", reply_markup=markup, parse_mode="Markdown")
+    # LINHA 108 CORRIGIDA ABAIXO
+    if not is_vip(message.from_user.id) and user.get("downloads_hoje", 0) >= 5:
+        return bot.reply_to(message, "⚠️ Limite atingido! Adquira um plano VIP.")
 
     status_msg = bot.reply_to(message, "⏳ Processando link em HD...")
     url = message.text.split()[0]
     file_name = f"v_{message.from_user.id}.mp4"
 
     try:
-        # A Regra de Ouro: HD 720p Leve (best[height<=1280])
         ydl_opts = {
             'format': 'best[height<=1280][width<=1280][ext=mp4]/best[height<=1280]/best',
             'outtmpl': file_name,
             'nocheckcertificate': True,
             'quiet': True
         }
-        
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
 
         if os.path.exists(file_name):
             with open(file_name, 'rb') as f:
                 bot.send_video(message.chat.id, f, caption="✅ Vídeo HD pronto!")
-            
             if not is_vip(message.from_user.id):
                 usuarios_col.update_one({"_id": user["_id"]}, {"$inc": {"downloads_hoje": 1}})
         else:
-            bot.edit_message_text("❌ Falha ao processar o arquivo.", message.chat.id, status_msg.message_id)
-
-    except Exception:
-        bot.edit_message_text("❌ Erro no download. Tente outro link.", message.chat.id, status_msg.message_id)
-    
+            bot.edit_message_text("❌ Erro ao processar.", message.chat.id, status_msg.message_id)
+    except:
+        bot.edit_message_text("❌ Erro no download.", message.chat.id, status_msg.message_id)
     finally:
         if os.path.exists(file_name): os.remove(file_name)
         try: bot.delete_message(message.chat.id, status_msg.message_id)
         except: pass
 
-# --- SAÚDE DO SISTEMA ---
 @app.route('/')
 def health(): return "ONLINE", 200
 
