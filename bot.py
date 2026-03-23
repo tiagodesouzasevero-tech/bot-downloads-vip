@@ -20,7 +20,7 @@ usuarios_col = db["usuarios"]
 bot = telebot.TeleBot(TOKEN_TELEGRAM, threaded=False)
 app = Flask(__name__)
 
-# --- FUNÇÕES ---
+# --- FUNÇÕES DE USUÁRIO ---
 def obter_usuario(user_id):
     uid = str(user_id)
     user = usuarios_col.find_one({"_id": uid})
@@ -49,11 +49,11 @@ def dar_vip_manual(message):
             nova_data = "Vitalício" if dias >= 3650 else (datetime.now() + timedelta(days=dias)).strftime('%Y-%m-%d')
             usuarios_col.update_one({"_id": str(alvo_id)}, {"$set": {"vip_ate": nova_data}})
             bot.reply_to(message, f"✅ VIP liberado para {alvo_id} até {nova_data}!")
-            bot.send_message(alvo_id, f"🎉 **PAGAMENTO CONFIRMADO!**\nVIP liberado até {nova_data}. Aproveite! 🚀")
+            bot.send_message(alvo_id, f"🎉 **PAGAMENTO CONFIRMADO!**\nSeu acesso VIP foi liberado. Aproveite! 🚀")
         except:
             bot.reply_to(message, "❌ Use: `/darvip ID DIAS`", parse_mode="Markdown")
 
-# --- INTERFACE (BOAS-VINDAS ATUALIZADA) ---
+# --- INTERFACE ---
 @bot.message_handler(commands=['start', 'perfil'])
 def start(message):
     user = obter_usuario(message.from_user.id)
@@ -89,7 +89,7 @@ def mostrar_planos(message):
 def suporte_link(message):
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("Chamar no Suporte", url=LINK_SUPORTE))
-    bot.send_message(message.chat.id, "👋 Precisa de ajuda ou quer ativar seu VIP?\nClique abaixo:", reply_markup=markup)
+    bot.send_message(message.chat.id, "👋 Precisa de ajuda ou ativação?\nClique abaixo:", reply_markup=markup)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("pay_"))
 def pagamento_manual(call):
@@ -101,39 +101,37 @@ def pagamento_manual(call):
     markup.add(types.InlineKeyboardButton("📤 Enviar Comprovante", url=LINK_SUPORTE))
     bot.send_message(call.message.chat.id, msg, parse_mode="Markdown", reply_markup=markup)
 
-# --- DOWNLOADER (COM TRAVA DE 90s E HD) ---
+# --- DOWNLOADER (CORREÇÃO DA MENSAGEM QUE SOME) ---
 @bot.message_handler(func=lambda message: "http" in message.text)
 def handle_download(message):
     user = obter_usuario(message.from_user.id)
     
     if not is_vip(message.from_user.id) and user.get("downloads_hoje", 0) >= 5:
-        markup = types.InlineKeyboardMarkup(row_width=1)
-        markup.add(
-            types.InlineKeyboardButton("💎 Ver Planos VIP", callback_data="mostrar_planos_bt")
-        )
-        return bot.reply_to(message, "⚠️ **Limite atingido!**\nUse um dos planos para continuar baixando.", reply_markup=markup, parse_mode="Markdown")
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("💎 Ver Planos VIP", callback_data="mostrar_planos_bt"))
+        return bot.reply_to(message, "⚠️ **Limite atingido!**\nUse um dos planos para continuar.", reply_markup=markup, parse_mode="Markdown")
 
     status_msg = bot.reply_to(message, "⏳ Analisando vídeo...")
     url = message.text.split()[0]
     file_name = f"v_{message.from_user.id}.mp4"
+    deve_apagar_status = True # Controle para não apagar erro
 
     try:
-        # Configuração para extrair informações antes de baixar
         with yt_dlp.YoutubeDL({'quiet': True, 'nocheckcertificate': True}) as ydl:
             info = ydl.extract_info(url, download=False)
             duration = info.get('duration', 0)
 
-            # TRAVA DE 90 SEGUNDOS
             if duration > 90:
-                return bot.edit_message_text(f"⚠️ **Vídeo muito longo!**\nO limite é de 90 segundos. Este vídeo possui {int(duration)}s.", message.chat.id, status_msg.message_id, parse_mode="Markdown")
+                deve_apagar_status = False # Não apaga, para o usuário ler
+                bot.edit_message_text(f"⚠️ **Vídeo muito longo!**\nO limite é de 90s. Este vídeo tem {int(duration)}s.", message.chat.id, status_msg.message_id, parse_mode="Markdown")
+                return
 
         bot.edit_message_text("📥 Baixando em HD (720p)...", message.chat.id, status_msg.message_id)
 
         ydl_opts = {
             'format': 'best[height<=1280][width<=1280][ext=mp4]/best[height<=1280]/best',
             'outtmpl': file_name,
-            'nocheckcertificate': True,
-            'quiet': True
+            'nocheckcertificate': True, 'quiet': True
         }
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -146,12 +144,15 @@ def handle_download(message):
                 usuarios_col.update_one({"_id": user["_id"]}, {"$inc": {"downloads_hoje": 1}})
         else:
             bot.edit_message_text("❌ Erro ao processar arquivo.", message.chat.id, status_msg.message_id)
+            deve_apagar_status = False
     except Exception:
         bot.edit_message_text("❌ Link inválido ou não suportado.", message.chat.id, status_msg.message_id)
+        deve_apagar_status = False
     finally:
         if os.path.exists(file_name): os.remove(file_name)
-        try: bot.delete_message(message.chat.id, status_msg.message_id)
-        except: pass
+        if deve_apagar_status:
+            try: bot.delete_message(message.chat.id, status_msg.message_id)
+            except: pass
 
 @bot.callback_query_handler(func=lambda call: call.data == "mostrar_planos_bt")
 def callback_planos(call):
