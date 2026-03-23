@@ -19,17 +19,15 @@ usuarios_col = db["usuarios"]
 bot = telebot.TeleBot(TOKEN_TELEGRAM, threaded=False)
 app = Flask(__name__)
 
-# --- FUNÇÕES DE USUÁRIO (COM RESET DIÁRIO) ---
+# --- FUNÇÕES DE USUÁRIO (COM RESET DIÁRIO AUTOMÁTICO) ---
 def obter_usuario(user_id):
     uid = str(user_id)
     user = usuarios_col.find_one({"_id": uid})
     hoje = datetime.now().strftime('%Y-%m-%d')
-    
     if not user:
         user = {"_id": uid, "vip_ate": None, "downloads_hoje": 0, "ultima_data": hoje}
         usuarios_col.insert_one(user)
     elif user.get("ultima_data") != hoje:
-        # Reseta o contador se mudou o dia
         usuarios_col.update_one({"_id": uid}, {"$set": {"downloads_hoje": 0, "ultima_data": hoje}})
         user["downloads_hoje"] = 0
     return user
@@ -52,15 +50,17 @@ def dar_vip_manual(message):
             alvo_id, dias = args[1], int(args[2])
             nova_data = "Vitalício" if dias >= 3650 else (datetime.now() + timedelta(days=dias)).strftime('%Y-%m-%d')
             usuarios_col.update_one({"_id": str(alvo_id)}, {"$set": {"vip_ate": nova_data}})
-            bot.reply_to(message, f"✅ VIP liberado para {alvo_id} até {nova_data}!")
-            bot.send_message(alvo_id, f"🎉 **PAGAMENTO CONFIRMADO!**\nSeu acesso VIP foi liberado.")
+            bot.reply_to(message, f"✅ VIP liberado para {alvo_id}!")
+            bot.send_message(alvo_id, "🎉 **PAGAMENTO CONFIRMADO!**\nSeu acesso VIP foi liberado.")
         except: bot.reply_to(message, "❌ Use: `/darvip ID DIAS`")
 
 @bot.message_handler(commands=['avisogeral'])
 def aviso_geral(message):
     if message.from_user.id == ADMIN_ID:
         msg_texto = message.text.replace('/avisogeral', '').strip()
-        if not msg_texto: return bot.reply_to(message, "❌ Digite a mensagem após o comando.")
+        if not msg_texto:
+            return bot.reply_to(message, "❌ Digite a mensagem após o comando.")
+        
         usuarios = usuarios_col.find({}, {"_id": 1})
         cont = 0
         for u in usuarios:
@@ -68,7 +68,7 @@ def aviso_geral(message):
                 bot.send_message(u["_id"], msg_texto, parse_mode="Markdown")
                 cont += 1
             except: pass
-        bot.reply_to(message, f"📢 Enviado para {cont} usuários!")
+        bot.reply_to(message, f"📢 Aviso enviado para {cont} usuários!")
 
 # --- INTERFACE ---
 @bot.message_handler(commands=['start', 'perfil'])
@@ -76,10 +76,8 @@ def start(message):
     user = obter_usuario(message.from_user.id)
     vip = is_vip(message.from_user.id)
     status = "💎 **STATUS: VIP PRO**" if vip else f"👤 **STATUS: GRÁTIS** ({user.get('downloads_hoje', 0)}/5)"
-    
-    texto = (f"🚀 **AfiliadoClip Pro**\n\nBaixe do TikTok, Pinterest e RedNote em HD.\n\n"
+    texto = (f"🚀 **AfiliadoClip Pro**\n\nBaixe vídeos em HD do TikTok, Pinterest e RedNote.\n\n"
              f"• Duração máx: 90s\n• Sua ID: `{message.from_user.id}`\n\n{status}")
-    
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
     markup.row("💎 Planos VIP", "🛠 Suporte")
     bot.send_message(message.chat.id, texto, parse_mode="Markdown", reply_markup=markup)
@@ -107,7 +105,7 @@ def pag_manual(call):
     markup = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("📤 Enviar Comprovante", url=LINK_SUPORTE))
     bot.send_message(call.message.chat.id, msg, parse_mode="Markdown", reply_markup=markup)
 
-# --- DOWNLOADER (REGRAS DE VÍDEO VERTICAL) ---
+# --- DOWNLOADER (ESTÁVEL + TRAVA 720p VERTICAL) ---
 @bot.message_handler(func=lambda message: "http" in message.text)
 def handle_download(message):
     user = obter_usuario(message.from_user.id)
@@ -124,11 +122,11 @@ def handle_download(message):
             if info.get('duration', 0) > 90:
                 return bot.edit_message_text("⚠️ Vídeo muito longo (máx 90s).", message.chat.id, status_msg.message_id)
 
-        bot.edit_message_text("📥 Baixando vídeo...", message.chat.id, status_msg.message_id)
+        bot.edit_message_text("📥 Baixando em HD...", message.chat.id, status_msg.message_id)
         
-        # PRIORIDADE: 1280x720 Vertical e MP4
+        # REGRA RÍGIDA: Nunca passa de 1280px de altura.
         ydl_opts = {
-            'format': 'bestvideo[height=1280][width=720][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height>=1024][width>=576][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+            'format': 'bestvideo[height<=1280][width<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=1280][ext=mp4]/best[ext=mp4]/best',
             'outtmpl': file_name, 'nocheckcertificate': True, 'quiet': True, 'noplaylist': True, 'merge_output_format': 'mp4'
         }
         
@@ -136,7 +134,7 @@ def handle_download(message):
             with yt_dlp.YoutubeDL(ydl_opts) as ydl: ydl.download([url])
         except:
             if "pin" in url or "pinterest" in url:
-                ydl_opts['format'] = 'best'
+                ydl_opts['format'] = 'best[height<=1280]' 
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl: ydl.download([url])
             else: raise Exception
 
@@ -150,6 +148,10 @@ def handle_download(message):
         bot.edit_message_text("❌ Erro no link ou formato.", message.chat.id, status_msg.message_id)
     finally:
         if os.path.exists(file_name): os.remove(file_name)
+
+@bot.callback_query_handler(func=lambda call: call.data == "mostrar_planos_bt")
+def callback_planos(call):
+    mostrar_planos(call.message)
 
 @app.route('/')
 def health(): return "ONLINE", 200
