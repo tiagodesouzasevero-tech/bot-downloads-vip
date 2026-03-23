@@ -38,7 +38,7 @@ def is_vip(user_id):
         return datetime.now() < datetime.strptime(user["vip_ate"], '%Y-%m-%d')
     except: return False
 
-# --- COMANDOS ---
+# --- COMANDOS ADMIN ---
 @bot.message_handler(commands=['darvip'])
 def dar_vip_manual(message):
     if message.from_user.id == ADMIN_ID:
@@ -53,6 +53,7 @@ def dar_vip_manual(message):
         except:
             bot.reply_to(message, "❌ Use: `/darvip ID DIAS`", parse_mode="Markdown")
 
+# --- INTERFACE ---
 @bot.message_handler(commands=['start', 'perfil'])
 def start(message):
     user = obter_usuario(message.from_user.id)
@@ -72,6 +73,13 @@ def mostrar_planos(message):
     )
     bot.send_message(message.chat.id, "Escolha o melhor plano para você:", reply_markup=markup)
 
+# --- FUNÇÃO DO SUPORTE (CORRIGIDA) ---
+@bot.message_handler(func=lambda m: m.text == "🛠 Suporte")
+def suporte_link(message):
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("Chamar no Suporte", url=LINK_SUPORTE))
+    bot.send_message(message.chat.id, "👋 Precisa de ajuda ou quer ativar seu VIP enviando o comprovante?\n\nClique no botão abaixo para falar comigo:", reply_markup=markup)
+
 @bot.callback_query_handler(func=lambda call: call.data.startswith("pay_"))
 def pagamento_manual(call):
     valor = call.data.split("_")[1]
@@ -82,7 +90,7 @@ def pagamento_manual(call):
     markup.add(types.InlineKeyboardButton("📤 Enviar Comprovante", url=LINK_SUPORTE))
     bot.send_message(call.message.chat.id, msg, parse_mode="Markdown", reply_markup=markup)
 
-# --- DOWNLOADER ---
+# --- DOWNLOADER (HD 720p) ---
 @bot.message_handler(func=lambda message: "http" in message.text)
 def handle_download(message):
     user = obter_usuario(message.from_user.id)
@@ -117,9 +125,8 @@ def handle_download(message):
                 usuarios_col.update_one({"_id": user["_id"]}, {"$inc": {"downloads_hoje": 1}})
         else:
             bot.edit_message_text("❌ Falha ao processar o arquivo.", message.chat.id, status_msg.message_id)
-    except Exception as e:
-        # AQUI FOI CORRIGIDO O ERRO DA IMAGEM
-        bot.edit_message_text(f"❌ Erro no download. Tente outro link.", message.chat.id, status_msg.message_id)
+    except:
+        bot.edit_message_text("❌ Erro no download. Tente outro link.", message.chat.id, status_msg.message_id)
     finally:
         if os.path.exists(file_name): os.remove(file_name)
         try: bot.delete_message(message.chat.id, status_msg.message_id)
