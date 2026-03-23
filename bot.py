@@ -101,7 +101,7 @@ def pagamento_manual(call):
     markup.add(types.InlineKeyboardButton("📤 Enviar Comprovante", url=LINK_SUPORTE))
     bot.send_message(call.message.chat.id, msg, parse_mode="Markdown", reply_markup=markup)
 
-# --- DOWNLOADER (AJUSTE PINTEREST + FALLBACK) ---
+# --- DOWNLOADER (RESTAURADO + FIX PINTEREST) ---
 @bot.message_handler(func=lambda message: "http" in message.text)
 def handle_download(message):
     user = obter_usuario(message.from_user.id)
@@ -116,38 +116,38 @@ def handle_download(message):
     file_name = f"v_{message.from_user.id}.mp4"
     deve_apagar_status = True 
 
-    # Headers para evitar bloqueios do Pinterest e TikTok
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        'Referer': 'https://www.pinterest.com/'
-    }
-
     try:
-        # 1. Extração de informações com Headers
-        with yt_dlp.YoutubeDL({'quiet': True, 'nocheckcertificate': True, 'http_headers': headers}) as ydl:
+        with yt_dlp.YoutubeDL({'quiet': True, 'nocheckcertificate': True}) as ydl:
             info = ydl.extract_info(url, download=False)
             duration = info.get('duration', 0)
 
-            if duration and duration > 90:
+            if duration > 90:
                 deve_apagar_status = False 
-                bot.edit_message_text(f"⚠️ **Vídeo muito longo!**\nO limite é de 90s. Este tem {int(duration)}s.", message.chat.id, status_msg.message_id, parse_mode="Markdown")
+                bot.edit_message_text(f"⚠️ **Vídeo muito longo!**\nO limite é de 90s. Este vídeo tem {int(duration)}s.", message.chat.id, status_msg.message_id, parse_mode="Markdown")
                 return
 
-        bot.edit_message_text("📥 Baixando vídeo...", message.chat.id, status_msg.message_id)
+        bot.edit_message_text("📥 Baixando em HD (720p)...", message.chat.id, status_msg.message_id)
 
-        # 2. Download Flexível (Tenta HD, mas aceita o que estiver disponível)
+        # Configuração original que você prefere (HD)
         ydl_opts = {
-            'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+            'format': 'best[height<=1280][width<=1280][ext=mp4]/best[height<=1280]/best',
             'outtmpl': file_name,
             'nocheckcertificate': True, 
-            'quiet': True,
-            'http_headers': headers,
-            'noplaylist': True,
-            'merge_output_format': 'mp4'
+            'quiet': True
         }
         
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
+        except Exception:
+            # SEGUNDA TENTATIVA: Se for Pinterest e der erro de formato, tenta o 'best' puro
+            if "pin.it" in url or "pinterest" in url:
+                bot.edit_message_text("📥 Ajustando formato para Pinterest...", message.chat.id, status_msg.message_id)
+                ydl_opts['format'] = 'best'
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    ydl.download([url])
+            else:
+                raise # Se não for Pinterest, mantém o erro original
 
         if os.path.exists(file_name):
             with open(file_name, 'rb') as f:
@@ -155,11 +155,10 @@ def handle_download(message):
             if not is_vip(message.from_user.id):
                 usuarios_col.update_one({"_id": user["_id"]}, {"$inc": {"downloads_hoje": 1}})
         else:
-            bot.edit_message_text("❌ Falha ao processar arquivo.", message.chat.id, status_msg.message_id)
+            bot.edit_message_text("❌ Erro ao processar arquivo.", message.chat.id, status_msg.message_id)
             deve_apagar_status = False
-    except Exception as e:
-        print(f"Erro: {e}")
-        bot.edit_message_text("❌ Erro no link ou formato indisponível.", message.chat.id, status_msg.message_id)
+    except Exception:
+        bot.edit_message_text("❌ Link inválido ou formato não suportado.", message.chat.id, status_msg.message_id)
         deve_apagar_status = False
     finally:
         if os.path.exists(file_name): os.remove(file_name)
