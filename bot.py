@@ -20,6 +20,7 @@ usuarios_col = db["usuarios"]
 bot = telebot.TeleBot(TOKEN_TELEGRAM, threaded=False)
 app = Flask(__name__)
 
+# --- CONTROLE DE USUÁRIO ---
 def obter_usuario(user_id):
     uid = str(user_id)
     user = usuarios_col.find_one({"_id": uid})
@@ -37,6 +38,7 @@ def is_vip(user_id):
         return datetime.now() < datetime.strptime(user["vip_ate"], '%Y-%m-%d')
     except: return False
 
+# --- COMANDO ADMIN ---
 @bot.message_handler(commands=['darvip'])
 def dar_vip_manual(message):
     if message.from_user.id == ADMIN_ID:
@@ -47,10 +49,11 @@ def dar_vip_manual(message):
             nova_data = "Vitalício" if dias >= 3650 else (datetime.now() + timedelta(days=dias)).strftime('%Y-%m-%d')
             usuarios_col.update_one({"_id": str(alvo_id)}, {"$set": {"vip_ate": nova_data}})
             bot.reply_to(message, f"✅ VIP liberado para {alvo_id} até {nova_data}!")
-            bot.send_message(alvo_id, f"🎉 **PAGAMENTO CONFIRMADO!**\nVIP liberado até {nova_data}!")
+            bot.send_message(alvo_id, f"🎉 **PAGAMENTO CONFIRMADO!**\nVIP liberado até {nova_data}. Aproveite! 🚀")
         except:
-            bot.reply_to(message, "❌ Use: /darvip ID DIAS")
+            bot.reply_to(message, "❌ Use: `/darvip ID DIAS`", parse_mode="Markdown")
 
+# --- INTERFACE ---
 @bot.message_handler(commands=['start', 'perfil'])
 def start(message):
     user = obter_usuario(message.from_user.id)
@@ -73,18 +76,27 @@ def mostrar_planos(message):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("pay_"))
 def pagamento_manual(call):
     valor = call.data.split("_")[1]
-    msg = f"💎 **Plano: R$ {valor}**\n\nPix Copia e Cola:\n`{CHAVE_PIX_INFINITE}`\n\nEnvie o comprovante e sua ID: `{call.from_user.id}`"
+    bot.answer_callback_query(call.id)
+    msg = (f"💎 **Plano: R$ {valor}**\n\nPix Copia e Cola:\n`{CHAVE_PIX_INFINITE}`\n\n"
+           f"⚠️ Envie o comprovante e sua ID: `{call.from_user.id}`")
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("📤 Enviar Comprovante", url=LINK_SUPORTE))
     bot.send_message(call.message.chat.id, msg, parse_mode="Markdown", reply_markup=markup)
 
+# --- DOWNLOADER (O CORAÇÃO DO BOT) ---
 @bot.message_handler(func=lambda message: "http" in message.text)
 def handle_download(message):
     user = obter_usuario(message.from_user.id)
     
-    # LINHA 108 CORRIGIDA ABAIXO
+    # Se atingir o limite, mostra os botões de planos
     if not is_vip(message.from_user.id) and user.get("downloads_hoje", 0) >= 5:
-        return bot.reply_to(message, "⚠️ Limite atingido! Adquira um plano VIP.")
+        markup = types.InlineKeyboardMarkup(row_width=1)
+        markup.add(
+            types.InlineKeyboardButton("💳 VIP Mensal - R$ 10,00", callback_data="pay_10.00"),
+            types.InlineKeyboardButton("💳 VIP Anual - R$ 69,90", callback_data="pay_69.90"),
+            types.InlineKeyboardButton("💎 VIP Vitalício - R$ 197,00", callback_data="pay_197.00")
+        )
+        return bot.reply_to(message, "⚠️ **Limite atingido!**\nEscolha um plano abaixo para baixar agora:", reply_markup=markup, parse_mode="Markdown")
 
     status_msg = bot.reply_to(message, "⏳ Processando link em HD...")
     url = message.text.split()[0]
@@ -106,17 +118,6 @@ def handle_download(message):
             if not is_vip(message.from_user.id):
                 usuarios_col.update_one({"_id": user["_id"]}, {"$inc": {"downloads_hoje": 1}})
         else:
-            bot.edit_message_text("❌ Erro ao processar.", message.chat.id, status_msg.message_id)
+            bot.edit_message_text("❌ Falha ao processar o arquivo.", message.chat.id, status_msg.message_id)
     except:
-        bot.edit_message_text("❌ Erro no download.", message.chat.id, status_msg.message_id)
-    finally:
-        if os.path.exists(file_name): os.remove(file_name)
-        try: bot.delete_message(message.chat.id, status_msg.message_id)
-        except: pass
-
-@app.route('/')
-def health(): return "ONLINE", 200
-
-if __name__ == "__main__":
-    Thread(target=lambda: app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))).start()
-    bot.infinity_polling(skip_pending=True)
+        bot.edit_message_text("❌ Erro no download. Tente outro link
