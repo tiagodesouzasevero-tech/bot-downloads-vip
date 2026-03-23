@@ -75,33 +75,7 @@ def start(message):
     markup.row("💎 Planos VIP", "🛠 Suporte")
     bot.send_message(message.chat.id, texto_welcome, parse_mode="Markdown", reply_markup=markup)
 
-@bot.message_handler(func=lambda m: m.text == "💎 Planos VIP")
-def mostrar_planos(message):
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    markup.add(
-        types.InlineKeyboardButton("💳 VIP Mensal - R$ 10,00", callback_data="pay_10.00"),
-        types.InlineKeyboardButton("💳 VIP Anual - R$ 69,90", callback_data="pay_69.90"),
-        types.InlineKeyboardButton("💎 VIP Vitalício - R$ 197,00", callback_data="pay_197.00")
-    )
-    bot.send_message(message.chat.id, "Escolha o melhor plano para você:", reply_markup=markup)
-
-@bot.message_handler(func=lambda m: m.text == "🛠 Suporte")
-def suporte_link(message):
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("Chamar no Suporte", url=LINK_SUPORTE))
-    bot.send_message(message.chat.id, "👋 Precisa de ajuda ou ativação?\nClique abaixo:", reply_markup=markup)
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("pay_"))
-def pagamento_manual(call):
-    valor = call.data.split("_")[1]
-    bot.answer_callback_query(call.id)
-    msg = (f"💎 **Plano: R$ {valor}**\n\nPix Copia e Cola:\n`{CHAVE_PIX_INFINITE}`\n\n"
-           f"⚠️ Envie o comprovante e sua ID: `{call.from_user.id}`")
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("📤 Enviar Comprovante", url=LINK_SUPORTE))
-    bot.send_message(call.message.chat.id, msg, parse_mode="Markdown", reply_markup=markup)
-
-# --- DOWNLOADER (RESTAURADO + AJUSTE PINTEREST) ---
+# --- DOWNLOADER (AJUSTE FINO PINTEREST VERTICAL) ---
 @bot.message_handler(func=lambda message: "http" in message.text)
 def handle_download(message):
     user = obter_usuario(message.from_user.id)
@@ -117,7 +91,6 @@ def handle_download(message):
     deve_apagar_status = True 
 
     try:
-        # Extração de informações básica
         with yt_dlp.YoutubeDL({'quiet': True, 'nocheckcertificate': True}) as ydl:
             info = ydl.extract_info(url, download=False)
             duration = info.get('duration', 0)
@@ -129,9 +102,10 @@ def handle_download(message):
 
         bot.edit_message_text("📥 Baixando vídeo...", message.chat.id, status_msg.message_id)
 
-        # Configuração de Formato com Prioridade (Resolve erro do Pinterest)
+        # Regras de Qualidade: Prioriza 720x1280, depois 576x1024 (Vertical)
+        # Mantém a compatibilidade MP4 como prioridade máxima
         ydl_opts = {
-            'format': 'bestvideo[height<=1280][ext=mp4]+bestaudio[ext=m4a]/best[height<=1280][ext=mp4]/best[ext=mp4]/best',
+            'format': 'bestvideo[height=1280][width=720][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height>=1024][width>=576][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
             'outtmpl': file_name,
             'nocheckcertificate': True, 
             'quiet': True,
@@ -143,9 +117,9 @@ def handle_download(message):
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.download([url])
         except Exception:
-            # Fallback final se for Pinterest
+            # Fallback final flexível para o Pinterest
             if "pin.it" in url or "pinterest" in url:
-                bot.edit_message_text("📥 Otimizando formato...", message.chat.id, status_msg.message_id)
+                bot.edit_message_text("📥 Ajustando resolução...", message.chat.id, status_msg.message_id)
                 ydl_opts['format'] = 'best'
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     ydl.download([url])
@@ -162,7 +136,7 @@ def handle_download(message):
             deve_apagar_status = False
     except Exception as e:
         print(f"Erro: {e}")
-        bot.edit_message_text("❌ Link inválido ou formato não suportado.", message.chat.id, status_msg.message_id)
+        bot.edit_message_text("❌ Link não suportado ou erro de conexão.", message.chat.id, status_msg.message_id)
         deve_apagar_status = False
     finally:
         if os.path.exists(file_name): os.remove(file_name)
