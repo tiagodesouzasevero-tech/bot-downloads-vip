@@ -49,19 +49,31 @@ def dar_vip_manual(message):
             nova_data = "Vitalício" if dias >= 3650 else (datetime.now() + timedelta(days=dias)).strftime('%Y-%m-%d')
             usuarios_col.update_one({"_id": str(alvo_id)}, {"$set": {"vip_ate": nova_data}})
             bot.reply_to(message, f"✅ VIP liberado para {alvo_id} até {nova_data}!")
-            bot.send_message(alvo_id, f"🎉 **PAGAMENTO CONFIRMADO!**\nSeu acesso VIP foi liberado até {nova_data}. Aproveite! 🚀")
+            bot.send_message(alvo_id, f"🎉 **PAGAMENTO CONFIRMADO!**\nVIP liberado até {nova_data}. Aproveite! 🚀")
         except:
             bot.reply_to(message, "❌ Use: `/darvip ID DIAS`", parse_mode="Markdown")
 
-# --- INTERFACE ---
+# --- INTERFACE (BOAS-VINDAS ATUALIZADA) ---
 @bot.message_handler(commands=['start', 'perfil'])
 def start(message):
     user = obter_usuario(message.from_user.id)
     vip = is_vip(message.from_user.id)
     status = "💎 **STATUS: VIP PRO**" if vip else f"👤 **STATUS: GRÁTIS** ({user.get('downloads_hoje', 0)}/5)"
+    
+    texto_welcome = (
+        f"🚀 **Bem-vindo ao AfiliadoClip Pro!**\n\n"
+        f"Baixe vídeos em **HD** do:\n"
+        f"🔹 **TikTok**\n🔹 **Pinterest**\n🔹 **RedNote**\n\n"
+        f"⚡️ **Regras do Bot:**\n"
+        f"• Limite de duração: **90 segundos**\n"
+        f"• Sua ID: `{message.from_user.id}`\n\n"
+        f"{status}\n\n"
+        f"🔗 Envie o link do vídeo para começar!"
+    )
+    
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
     markup.row("💎 Planos VIP", "🛠 Suporte")
-    bot.send_message(message.chat.id, f"🚀 **AfiliadoClip Pro**\n\nSua ID: `{message.from_user.id}`\n{status}", parse_mode="Markdown", reply_markup=markup)
+    bot.send_message(message.chat.id, texto_welcome, parse_mode="Markdown", reply_markup=markup)
 
 @bot.message_handler(func=lambda m: m.text == "💎 Planos VIP")
 def mostrar_planos(message):
@@ -73,12 +85,11 @@ def mostrar_planos(message):
     )
     bot.send_message(message.chat.id, "Escolha o melhor plano para você:", reply_markup=markup)
 
-# --- FUNÇÃO DO SUPORTE (CORRIGIDA) ---
 @bot.message_handler(func=lambda m: m.text == "🛠 Suporte")
 def suporte_link(message):
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("Chamar no Suporte", url=LINK_SUPORTE))
-    bot.send_message(message.chat.id, "👋 Precisa de ajuda ou quer ativar seu VIP enviando o comprovante?\n\nClique no botão abaixo para falar comigo:", reply_markup=markup)
+    bot.send_message(message.chat.id, "👋 Precisa de ajuda ou quer ativar seu VIP?\nClique abaixo:", reply_markup=markup)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("pay_"))
 def pagamento_manual(call):
@@ -90,7 +101,7 @@ def pagamento_manual(call):
     markup.add(types.InlineKeyboardButton("📤 Enviar Comprovante", url=LINK_SUPORTE))
     bot.send_message(call.message.chat.id, msg, parse_mode="Markdown", reply_markup=markup)
 
-# --- DOWNLOADER (HD 720p) ---
+# --- DOWNLOADER (COM TRAVA DE 90s E HD) ---
 @bot.message_handler(func=lambda message: "http" in message.text)
 def handle_download(message):
     user = obter_usuario(message.from_user.id)
@@ -98,39 +109,53 @@ def handle_download(message):
     if not is_vip(message.from_user.id) and user.get("downloads_hoje", 0) >= 5:
         markup = types.InlineKeyboardMarkup(row_width=1)
         markup.add(
-            types.InlineKeyboardButton("💳 VIP Mensal - R$ 10,00", callback_data="pay_10.00"),
-            types.InlineKeyboardButton("💳 VIP Anual - R$ 69,90", callback_data="pay_69.90"),
-            types.InlineKeyboardButton("💎 VIP Vitalício - R$ 197,00", callback_data="pay_197.00")
+            types.InlineKeyboardButton("💎 Ver Planos VIP", callback_data="mostrar_planos_bt")
         )
-        return bot.reply_to(message, "⚠️ **Limite atingido!**\nEscolha um plano abaixo para baixar agora:", reply_markup=markup, parse_mode="Markdown")
+        return bot.reply_to(message, "⚠️ **Limite atingido!**\nUse um dos planos para continuar baixando.", reply_markup=markup, parse_mode="Markdown")
 
-    status_msg = bot.reply_to(message, "⏳ Processando link em HD...")
+    status_msg = bot.reply_to(message, "⏳ Analisando vídeo...")
     url = message.text.split()[0]
     file_name = f"v_{message.from_user.id}.mp4"
 
     try:
+        # Configuração para extrair informações antes de baixar
+        with yt_dlp.YoutubeDL({'quiet': True, 'nocheckcertificate': True}) as ydl:
+            info = ydl.extract_info(url, download=False)
+            duration = info.get('duration', 0)
+
+            # TRAVA DE 90 SEGUNDOS
+            if duration > 90:
+                return bot.edit_message_text(f"⚠️ **Vídeo muito longo!**\nO limite é de 90 segundos. Este vídeo possui {int(duration)}s.", message.chat.id, status_msg.message_id, parse_mode="Markdown")
+
+        bot.edit_message_text("📥 Baixando em HD (720p)...", message.chat.id, status_msg.message_id)
+
         ydl_opts = {
             'format': 'best[height<=1280][width<=1280][ext=mp4]/best[height<=1280]/best',
             'outtmpl': file_name,
             'nocheckcertificate': True,
             'quiet': True
         }
+        
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
 
         if os.path.exists(file_name):
             with open(file_name, 'rb') as f:
-                bot.send_video(message.chat.id, f, caption="✅ Vídeo HD pronto!")
+                bot.send_video(message.chat.id, f, caption="✅ Enviado com AfiliadoClip Pro!")
             if not is_vip(message.from_user.id):
                 usuarios_col.update_one({"_id": user["_id"]}, {"$inc": {"downloads_hoje": 1}})
         else:
-            bot.edit_message_text("❌ Falha ao processar o arquivo.", message.chat.id, status_msg.message_id)
-    except:
-        bot.edit_message_text("❌ Erro no download. Tente outro link.", message.chat.id, status_msg.message_id)
+            bot.edit_message_text("❌ Erro ao processar arquivo.", message.chat.id, status_msg.message_id)
+    except Exception:
+        bot.edit_message_text("❌ Link inválido ou não suportado.", message.chat.id, status_msg.message_id)
     finally:
         if os.path.exists(file_name): os.remove(file_name)
         try: bot.delete_message(message.chat.id, status_msg.message_id)
         except: pass
+
+@bot.callback_query_handler(func=lambda call: call.data == "mostrar_planos_bt")
+def callback_planos(call):
+    mostrar_planos(call.message)
 
 @app.route('/')
 def health(): return "ONLINE", 200
