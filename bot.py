@@ -145,6 +145,7 @@ def handle_download(message):
     user = obter_usuario(message.from_user.id)
     vip_status = is_vip(message.from_user.id)
     
+    # Bloqueia se já tiver passado de 5
     if not vip_status and user.get("downloads_hoje", 0) >= 5:
         bot.reply_to(message, "⚠️ **Limite diário atingido (5/5)!**\nPara continuar baixando sem limites, adquira um de nossos planos VIP abaixo: 👇")
         return mostrar_planos(message)
@@ -177,9 +178,15 @@ def handle_download(message):
                 bot.send_video(message.chat.id, f, caption="👉 Download concluído! Aqui está seu vídeo 👊")
             
             if not vip_status:
+                # Incrementa e verifica se acabou de chegar no 5
                 usuarios_col.update_one({"_id": user["_id"]}, {"$inc": {"downloads_hoje": 1}})
                 novo_count = user.get("downloads_hoje", 0) + 1
                 bot.send_message(message.chat.id, f"📊 Uso diário: {novo_count}/5")
+                
+                # Se este foi o 5º download, já oferece o VIP imediatamente
+                if novo_count >= 5:
+                    bot.send_message(message.chat.id, "⚠️ **Você atingiu seu limite diário (5/5)!**\nPara continuar baixando de forma ilimitada agora mesmo, escolha um plano VIP: 👇")
+                    mostrar_planos(message)
         
         bot.delete_message(message.chat.id, status_msg.message_id)
     except:
