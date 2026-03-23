@@ -20,7 +20,6 @@ usuarios_col = db["usuarios"]
 bot = telebot.TeleBot(TOKEN_TELEGRAM, threaded=False)
 app = Flask(__name__)
 
-# --- FUNÇÕES DE USUÁRIO ---
 def obter_usuario(user_id):
     uid = str(user_id)
     user = usuarios_col.find_one({"_id": uid})
@@ -38,74 +37,70 @@ def is_vip(user_id):
         return datetime.now() < datetime.strptime(user["vip_ate"], '%Y-%m-%d')
     except: return False
 
-# --- INTERFACE ---
 @bot.message_handler(commands=['start', 'perfil'])
 def start(message):
     user = obter_usuario(message.from_user.id)
     vip = is_vip(message.from_user.id)
     status = "💎 **STATUS: VIP PRO**" if vip else f"👤 **STATUS: GRÁTIS** ({user.get('downloads_hoje', 0)}/5)"
-    
     texto_welcome = (
         f"🚀 **Bem-vindo ao AfiliadoClip Pro!**\n\n"
-        f"Baixe vídeos do:\n"
-        f"🔹 **TikTok** (HD)\n🔹 **Pinterest** (Melhor qualidade)\n🔹 **RedNote** (HD)\n\n"
-        f"⚡️ **Regras:** Limite de 90s por vídeo.\n"
-        f"{status}\n\n🔗 Envie o link para começar!"
+        f"Baixe vídeos do:\n🔹 **TikTok**\n🔹 **Pinterest**\n🔹 **RedNote**\n\n"
+        f"⚡️ Limite: 90s por vídeo.\n{status}\n\n🔗 Envie o link!"
     )
-    
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
     markup.row("💎 Planos VIP", "🛠 Suporte")
     bot.send_message(message.chat.id, texto_welcome, parse_mode="Markdown", reply_markup=markup)
 
-# --- DOWNLOADER (SOLUÇÃO DEFINITIVA PINTEREST) ---
+# --- DOWNLOADER COM FALLBACK PARA PINTEREST ---
 @bot.message_handler(func=lambda message: "http" in message.text)
 def handle_download(message):
     user = obter_usuario(message.from_user.id)
-    
     if not is_vip(message.from_user.id) and user.get("downloads_hoje", 0) >= 5:
-        return bot.reply_to(message, "⚠️ **Limite diário atingido!** Adquira o VIP para downloads ilimitados.")
+        return bot.reply_to(message, "⚠️ Limite atingido! Adquira o VIP.")
 
-    status_msg = bot.reply_to(message, "⏳ Analisando vídeo...")
+    status_msg = bot.reply_to(message, "⏳ Analisando...")
     url = message.text.split()[0]
     file_name = f"v_{message.from_user.id}.mp4"
     deve_apagar_status = True 
 
-    try:
-        # 1. Configuração base (HD)
-        ydl_opts = {
-            'format': 'best[height<=1280][ext=mp4]/best[height<=1280]/best',
-            'outtmpl': file_name,
-            'nocheckcertificate': True, 
-            'quiet': True,
-            'noplaylist': True
-        }
+    # Configuração Padrão (HD)
+    ydl_opts = {
+        'format': 'best[height<=1280][ext=mp4]/best[height<=1280]/best',
+        'outtmpl': file_name,
+        'nocheckcertificate': True, 
+        'quiet': True,
+        'noplaylist': True
+    }
 
-        # 2. Verificação de duração
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+    try:
+        with yt_dlp.YoutubeDL({'quiet': True}) as ydl:
             info = ydl.extract_info(url, download=False)
             if info.get('duration', 0) > 90:
                 bot.edit_message_text("⚠️ Vídeo muito longo (limite 90s).", message.chat.id, status_msg.message_id)
                 return
 
-            bot.edit_message_text("📥 Baixando...", message.chat.id, status_msg.message_id)
-            
-            # Se for Pinterest, usamos uma regra extra para não dar erro de formato
-            if "pin.it" in url or "pinterest" in url:
-                # Se falhar o MP4 HD, o 'best' sozinho garante que baixe qualquer formato disponível
-                ydl_opts['format'] = 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best'
-            
-            ydl.download([url])
+        bot.edit_message_text("📥 Baixando...", message.chat.id, status_msg.message_id)
+        
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
+        except Exception:
+            # FALLBACK: Se falhar o formato HD (comum no Pinterest), tenta o melhor disponível
+            bot.edit_message_text("📥 Otimizando formato...", message.chat.id, status_msg.message_id)
+            ydl_opts['format'] = 'best'
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
 
         if os.path.exists(file_name):
             with open(file_name, 'rb') as f:
-                bot.send_video(message.chat.id, f, caption="✅ Enviado por @AfiliadoClipProBot")
+                bot.send_video(message.chat.id, f, caption="✅ Enviado com AfiliadoClip Pro!")
             if not is_vip(message.from_user.id):
                 usuarios_col.update_one({"_id": user["_id"]}, {"$inc": {"downloads_hoje": 1}})
         else:
-            raise Exception("Arquivo não encontrado")
+            raise Exception
 
     except Exception:
-        bot.edit_message_text("❌ Não consegui baixar este vídeo. O formato pode ser incompatível.", message.chat.id, status_msg.message_id)
+        bot.edit_message_text("❌ Erro no link ou formato indisponível.", message.chat.id, status_msg.message_id)
         deve_apagar_status = False
     finally:
         if os.path.exists(file_name): os.remove(file_name)
