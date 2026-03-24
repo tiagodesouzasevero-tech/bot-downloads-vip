@@ -8,7 +8,7 @@ from pymongo import MongoClient
 # --- CONFIGURAÇÕES ---
 TOKEN_TELEGRAM = "8629536333:AAHjRGGxSm_Fc_WnAv8a2qLItCC_-bMUWqY"
 MONGO_URI = "mongodb+srv://tiagodesouzasevero_db_user:rdS2qlLSlH7eI9jA@cluster0.x3wiavb.mongodb.net/bot_downloader?retryWrites=true&w=majority"
-CHAVE_PIX_INFINITE = "dc359b2c-d52f-48b5-b022-3c4fb3a8ddb5" 
+CHAVE_PIX_INFINITE = "dc359b2c-d52f-48b5-b022-3c4fb3a8ddb5"
 LINK_SUPORTE = "https://t.me/suporteafiliadoclippro"
 ADMIN_ID = 493336271
 
@@ -140,7 +140,7 @@ def pag_manual(call):
     bot.send_message(call.message.chat.id, msg, parse_mode="Markdown", reply_markup=markup)
 
 # --- DOWNLOADER ---
-@bot.message_handler(func=lambda message: "http" in message.text)
+@bot.message_handler(func=lambda message: message.text and "http" in message.text)
 def handle_download(message):
     user = obter_usuario(message.from_user.id)
     vip_status = is_vip(message.from_user.id)
@@ -155,23 +155,64 @@ def handle_download(message):
     file_name = f"v_{message.from_user.id}.mp4"
 
     try:
-        with yt_dlp.YoutubeDL({'quiet': True, 'nocheckcertificate': True}) as ydl:
+        with yt_dlp.YoutubeDL({'quiet': True, 'nocheckcertificate': True, 'noplaylist': True}) as ydl:
             info = ydl.extract_info(url, download=False)
             if info.get('duration', 0) > 90:
                 return bot.edit_message_text("⚠️ Vídeo muito longo (máx 90s).", message.chat.id, status_msg.message_id)
 
-        ydl_opts = {
-            'format': 'bestvideo[height<=1280][width<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=1280][ext=mp4]/best[ext=mp4]/best',
-            'outtmpl': file_name, 'nocheckcertificate': True, 'quiet': True, 'noplaylist': True, 'merge_output_format': 'mp4'
+        is_pinterest = ("pin" in url.lower()) or ("pinterest" in url.lower())
+
+        common_opts = {
+            'outtmpl': file_name,
+            'nocheckcertificate': True,
+            'quiet': True,
+            'noplaylist': True,
+            'merge_output_format': 'mp4',
+            'retries': 3,
+            'fragment_retries': 3,
+            'http_headers': {
+                'User-Agent': 'Mozilla/5.0',
+                'Accept-Language': 'pt-BR,pt;q=0.9,en;q=0.8'
+            }
         }
-        
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl: ydl.download([url])
-        except:
-            if "pin" in url or "pinterest" in url:
-                ydl_opts['format'] = 'best[height<=1280]' 
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl: ydl.download([url])
-            else: raise Exception
+
+        if is_pinterest:
+            formatos = [
+                'best[width<=720][height<=1280][fps<=30]',
+                'best[height<=1280][fps<=30]'
+            ]
+        else:
+            formatos = [
+                'bestvideo[width<=720][height<=1280][fps<=30]+bestaudio/best[width<=720][height<=1280][fps<=30]',
+                'best[width<=720][height<=1280][fps<=30]'
+            ]
+
+        baixou = False
+        ultimo_erro = None
+
+        for fmt in formatos:
+            try:
+                opts = common_opts.copy()
+                opts['format'] = fmt
+
+                if is_pinterest:
+                    opts['http_headers'] = {
+                        **common_opts['http_headers'],
+                        'Referer': 'https://www.pinterest.com/'
+                    }
+
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    ydl.download([url])
+
+                if os.path.exists(file_name):
+                    baixou = True
+                    break
+            except Exception as e:
+                ultimo_erro = str(e)
+                print(f"[TENTATIVA FALHOU] formato={fmt} | url={url} | erro={e}")
+
+        if not baixou:
+            raise Exception(ultimo_erro or "Falha ao baixar")
 
         if os.path.exists(file_name):
             with open(file_name, 'rb') as f:
@@ -189,7 +230,8 @@ def handle_download(message):
                     mostrar_planos(message)
         
         bot.delete_message(message.chat.id, status_msg.message_id)
-    except:
+    except Exception as e:
+        print(f"[ERRO DOWNLOAD] URL: {url} | ERRO: {e}")
         bot.edit_message_text("❌ Erro no link ou formato.", message.chat.id, status_msg.message_id)
     finally:
         if os.path.exists(file_name): os.remove(file_name)
