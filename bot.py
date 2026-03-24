@@ -160,7 +160,10 @@ def handle_download(message):
             if info.get('duration', 0) > 90:
                 return bot.edit_message_text("⚠️ Vídeo muito longo (máx 90s).", message.chat.id, status_msg.message_id)
 
-        is_pinterest = ("pin" in url.lower()) or ("pinterest" in url.lower())
+        url_lower = url.lower()
+        is_pinterest = ("pin.it" in url_lower) or ("pinterest" in url_lower)
+        is_tiktok = ("tiktok.com" in url_lower) or ("vm.tiktok.com" in url_lower) or ("vt.tiktok.com" in url_lower)
+        is_rednote = ("xiaohongshu.com" in url_lower) or ("xhslink.com" in url_lower) or ("rednote" in url_lower)
 
         common_opts = {
             'outtmpl': file_name,
@@ -179,12 +182,30 @@ def handle_download(message):
         if is_pinterest:
             formatos = [
                 'best[width<=720][height<=1280][fps<=30]',
-                'best[height<=1280][fps<=30]'
+                'best[width<=720][height<=1280]',
+                'best[width<=720]'
+            ]
+        elif is_tiktok:
+            formatos = [
+                'bestvideo[width<=720][height<=1280][fps<=30]+bestaudio/best[width<=720][height<=1280][fps<=30]',
+                'bestvideo[height<=1280][fps<=30]+bestaudio/best[height<=1280][fps<=30]',
+                'best[width<=720][height<=1280][fps<=30]',
+                'best[width<=720][height<=1280]',
+                'best[width<=720]'
+            ]
+        elif is_rednote:
+            formatos = [
+                'bestvideo[width<=720][height<=1280][fps<=30]+bestaudio/best[width<=720][height<=1280][fps<=30]',
+                'best[width<=720][height<=1280][fps<=30]',
+                'best[width<=720][height<=1280]',
+                'best[width<=720]'
             ]
         else:
             formatos = [
                 'bestvideo[width<=720][height<=1280][fps<=30]+bestaudio/best[width<=720][height<=1280][fps<=30]',
-                'best[width<=720][height<=1280][fps<=30]'
+                'best[width<=720][height<=1280][fps<=30]',
+                'best[width<=720][height<=1280]',
+                'best[width<=720]'
             ]
 
         baixou = False
@@ -232,9 +253,16 @@ def handle_download(message):
         bot.delete_message(message.chat.id, status_msg.message_id)
     except Exception as e:
         print(f"[ERRO DOWNLOAD] URL: {url} | ERRO: {e}")
-        bot.edit_message_text("❌ Erro no link ou formato.", message.chat.id, status_msg.message_id)
+        try:
+            bot.edit_message_text("❌ Erro no link ou formato.", message.chat.id, status_msg.message_id)
+        except:
+            bot.send_message(message.chat.id, "❌ Erro no link ou formato.")
     finally:
-        if os.path.exists(file_name): os.remove(file_name)
+        if os.path.exists(file_name):
+            try:
+                os.remove(file_name)
+            except:
+                pass
 
 @app.route('/')
 def health(): return "ONLINE", 200
