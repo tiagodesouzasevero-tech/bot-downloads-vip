@@ -2,4 +2,4 @@ pyTelegramBotAPI
 yt-dlp
 flask
 pymongo[srv]
-certifi
+requests
