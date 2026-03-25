@@ -21,7 +21,7 @@ from requests.exceptions import RequestException, Timeout
 # CONFIGURAÇÕES
 # =========================================
 TOKEN_TELEGRAM = os.environ.get("TOKEN_TELEGRAM", "8629536333:AAHjRGGxSm_Fc_WnAv8a2qLItCC_-bMUWqY")
-MONGO_URI = os.environ.get("MONGO_URI", "mongodb+srv://tiagodesouzasevero_db_user:rdS2qlLSlH7eI9jA@cluster0.x3wiavb.mongodb.net/bot_downloader?retryWrites=true&w=majority")
+MONGO_URI = os.environ.get("mongodb+srv://tiagodesouzasevero_db_user:rdS2qlLSlH7eI9jA@cluster0.x3wiavb.mongodb.net/bot_downloader?retryWrites=true&w=majority")
 LINK_SUPORTE = os.environ.get("LINK_SUPORTE", "https://t.me/suporteafiliadotools")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "493336271"))
 
@@ -1119,26 +1119,6 @@ def handle_download(message):
             raise Exception("Arquivo final não encontrado após o download")
 
         arquivo_ok = arquivo_final
-
-        if is_instagram:
-            try:
-                with yt_dlp.YoutubeDL(montar_info_opts(is_instagram=True)) as ydl_check:
-                    info_final = ydl_check.extract_info(url, download=False)
-                largura = info_final.get("width") or 0
-                altura = info_final.get("height") or 0
-                fps = info_final.get("fps") or 0
-
-                if (
-                    (largura and largura > 720) or
-                    (altura and altura > 1280) or
-                    (fps and fps > 30)
-                ):
-                    logger.info(
-                        f"[INSTAGRAM_LIMITES] arquivo acima do alvo 720x1280/30fps "
-                        f"user_id={message.from_user.id} width={largura} height={altura} fps={fps}"
-                    )
-            except Exception as e:
-                logger.warning(f"[INSTAGRAM_CHECK_META] Falha ao conferir metadados finais: {e}")
 
         enviado = enviar_arquivo_com_fallback(message.chat.id, arquivo_ok)
         if not enviado:
