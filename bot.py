@@ -21,7 +21,8 @@ from requests.exceptions import RequestException, Timeout
 # CONFIGURAÇÕES
 # =========================================
 TOKEN_TELEGRAM = os.environ.get("TOKEN_TELEGRAM", "8629536333:AAHjRGGxSm_Fc_WnAv8a2qLItCC_-bMUWqY")
-MONGO_URI = os.environ.get("mongodb+srv://tiagodesouzasevero_db_user:rdS2qlLSlH7eI9jA@cluster0.x3wiavb.mongodb.net/bot_downloader?retryWrites=true&w=majority")
+MONGO_URI = os.environ.get("MONGO_URI", "mongodb+srv://tiagodesouzasevero_db_user:rdS2qlLSlH7eI9jA@cluster0.x3wiavb.mongodb.net/bot_downloader?retryWrites=true&w=majority")
+MONGO_DB_NAME = os.environ.get("MONGO_DB_NAME", "bot_downloader")
 LINK_SUPORTE = os.environ.get("LINK_SUPORTE", "https://t.me/suporteafiliadotools")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "493336271"))
 
@@ -56,7 +57,7 @@ logger = logging.getLogger("afiliadotools")
 # DB / BOT / APP
 # =========================================
 client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
-db = client.get_default_database()
+db = client[MONGO_DB_NAME]
 usuarios_col = db["usuarios"]
 pedidos_col = db["pedidos"]
 
@@ -1086,9 +1087,8 @@ def handle_download(message):
             return
 
         common_opts = montar_download_opts(prefix, is_instagram=is_instagram)
-        formatos = (
-            ["best[ext=mp4]/best"] if is_instagram else formatos_capados_gerais()
-        )
+        formatos = ["best[ext=mp4]/best"] if is_instagram else formatos_capados_gerais()
+
         baixou = False
         ultimo_erro = None
 
@@ -1118,9 +1118,7 @@ def handle_download(message):
         if not arquivo_final or not os.path.exists(arquivo_final):
             raise Exception("Arquivo final não encontrado após o download")
 
-        arquivo_ok = arquivo_final
-
-        enviado = enviar_arquivo_com_fallback(message.chat.id, arquivo_ok)
+        enviado = enviar_arquivo_com_fallback(message.chat.id, arquivo_final)
         if not enviado:
             raise Exception("Falha ao enviar arquivo ao Telegram")
 
@@ -1132,7 +1130,10 @@ def handle_download(message):
 
     except Exception as e:
         logger.error(f"[ERRO_DOWNLOAD] user_id={message.from_user.id} url={url} erro={e}")
-        texto_erro = mapear_erro_download(str(e), plataforma=("instagram" if "instagram.com" in url.lower() else "geral"))
+        texto_erro = mapear_erro_download(
+            str(e),
+            plataforma=("instagram" if "instagram.com" in url.lower() else "geral")
+        )
 
         if status_msg:
             safe_edit_message(message.chat.id, status_msg.message_id, texto_erro)
