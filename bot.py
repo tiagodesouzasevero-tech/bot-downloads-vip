@@ -39,6 +39,8 @@ TZ = ZoneInfo("America/Sao_Paulo")
 FREE_DAILY_LIMIT = 5
 MAX_DURATION_SECONDS = 90
 
+INSTAGRAM_COOKIES_TEXT = os.environ.get("INSTAGRAM_COOKIES_TEXT", "").strip()
+
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 # =========================================
@@ -83,10 +85,18 @@ PINTEREST_HEADERS = {
 }
 
 INSTAGRAM_HEADERS = {
-    "User-Agent": "Mozilla/5.0",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/134.0.0.0 Safari/537.36"
+    ),
     "Referer": "https://www.instagram.com/",
     "Origin": "https://www.instagram.com",
-    "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8"
+    "Accept": "*/*",
+    "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-origin"
 }
 
 PLANOS = {
@@ -260,6 +270,15 @@ def nome_plataforma(is_pinterest, is_tiktok, is_instagram, is_rednote):
     return "Desconhecida"
 
 
+def get_instagram_cookiefile():
+    if INSTAGRAM_COOKIES_TEXT:
+        cookie_path = os.path.join(DOWNLOAD_DIR, "instagram_cookies.txt")
+        with open(cookie_path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(INSTAGRAM_COOKIES_TEXT)
+        return cookie_path
+    return None
+
+
 def montar_info_opts(is_instagram=False, is_pinterest=False):
     opts = {
         "quiet": True,
@@ -271,6 +290,9 @@ def montar_info_opts(is_instagram=False, is_pinterest=False):
 
     if is_instagram:
         opts["http_headers"] = INSTAGRAM_HEADERS
+        cookiefile = get_instagram_cookiefile()
+        if cookiefile:
+            opts["cookiefile"] = cookiefile
     elif is_pinterest:
         opts["http_headers"] = PINTEREST_HEADERS
 
@@ -292,6 +314,9 @@ def montar_download_opts(prefix, is_instagram=False, is_pinterest=False):
 
     if is_instagram:
         opts["http_headers"] = INSTAGRAM_HEADERS
+        cookiefile = get_instagram_cookiefile()
+        if cookiefile:
+            opts["cookiefile"] = cookiefile
     elif is_pinterest:
         opts["http_headers"] = PINTEREST_HEADERS
 
@@ -312,6 +337,17 @@ def mapear_erro_download(err_text, plataforma="geral"):
         if "720x1280" in err or "30fps" in err:
             return "❌ Não encontrei uma versão do pin compatível com o limite máximo de 720x1280 em até 30 fps."
         return texto_erro
+
+    if plataforma == "instagram":
+        if "login required" in err or "requested content is not available" in err or "rate-limit reached" in err:
+            return "❌ O Instagram bloqueou esse link no momento. Para Reels assim, o bot precisa de cookies válidos da conta logada no Instagram."
+        if "private" in err:
+            return "❌ Esse conteúdo do Instagram é privado."
+        if "403" in err:
+            return "❌ O Instagram bloqueou temporariamente a requisição. Tente novamente em instantes."
+        if "timed out" in err:
+            return "❌ O Instagram demorou para responder. Tente novamente."
+        return "❌ Não consegui baixar esse link do Instagram agora."
 
     texto_erro = "❌ Erro no link ou formato."
     if "unsupported url" in err:
@@ -1050,7 +1086,9 @@ def handle_download(message):
             return
 
         common_opts = montar_download_opts(prefix, is_instagram=is_instagram)
-        formatos = formatos_capados_gerais()
+        formatos = (
+            ["best[ext=mp4]/best"] if is_instagram else formatos_capados_gerais()
+        )
         baixou = False
         ultimo_erro = None
 
@@ -1080,7 +1118,29 @@ def handle_download(message):
         if not arquivo_final or not os.path.exists(arquivo_final):
             raise Exception("Arquivo final não encontrado após o download")
 
-        enviado = enviar_arquivo_com_fallback(message.chat.id, arquivo_final)
+        arquivo_ok = arquivo_final
+
+        if is_instagram:
+            try:
+                with yt_dlp.YoutubeDL(montar_info_opts(is_instagram=True)) as ydl_check:
+                    info_final = ydl_check.extract_info(url, download=False)
+                largura = info_final.get("width") or 0
+                altura = info_final.get("height") or 0
+                fps = info_final.get("fps") or 0
+
+                if (
+                    (largura and largura > 720) or
+                    (altura and altura > 1280) or
+                    (fps and fps > 30)
+                ):
+                    logger.info(
+                        f"[INSTAGRAM_LIMITES] arquivo acima do alvo 720x1280/30fps "
+                        f"user_id={message.from_user.id} width={largura} height={altura} fps={fps}"
+                    )
+            except Exception as e:
+                logger.warning(f"[INSTAGRAM_CHECK_META] Falha ao conferir metadados finais: {e}")
+
+        enviado = enviar_arquivo_com_fallback(message.chat.id, arquivo_ok)
         if not enviado:
             raise Exception("Falha ao enviar arquivo ao Telegram")
 
@@ -1092,7 +1152,7 @@ def handle_download(message):
 
     except Exception as e:
         logger.error(f"[ERRO_DOWNLOAD] user_id={message.from_user.id} url={url} erro={e}")
-        texto_erro = mapear_erro_download(str(e), plataforma="geral")
+        texto_erro = mapear_erro_download(str(e), plataforma=("instagram" if "instagram.com" in url.lower() else "geral"))
 
         if status_msg:
             safe_edit_message(message.chat.id, status_msg.message_id, texto_erro)
