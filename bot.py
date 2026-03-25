@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 import requests
 import telebot
 import yt_dlp
+import subprocess
 
 from flask import Flask, request, jsonify
 from telebot import types
@@ -194,6 +195,58 @@ def encontrar_arquivo_baixado(prefix):
 
     candidatos.sort(key=lambda x: os.path.getsize(x), reverse=True)
     return candidatos[0]
+
+
+def ffmpeg_disponivel():
+    try:
+        r = subprocess.run(
+            ["ffmpeg", "-version"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def converter_para_720x1280_30fps(arquivo_entrada):
+    """
+    Garante saída final em no máximo 720x1280, 30fps, H.264/AAC.
+    Para vídeos fora da proporção, completa com borda.
+    """
+    base, _ = os.path.splitext(arquivo_entrada)
+    arquivo_saida = f"{base}_720x1280_30fps.mp4"
+
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i", arquivo_entrada,
+        "-vf", "scale=720:1280:force_original_aspect_ratio=decrease:force_divisible_by=2,fps=30,pad=720:1280:(ow-iw)/2:(oh-ih)/2",
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "23",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-movflags", "+faststart",
+        arquivo_saida
+    ]
+
+    resultado = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True
+    )
+
+    if resultado.returncode != 0:
+        raise Exception(f"Falha no ffmpeg: {resultado.stderr[-1500:]}")
+
+    if not os.path.exists(arquivo_saida):
+        raise Exception("Arquivo convertido não foi gerado.")
+
+    return arquivo_saida
 
 
 def safe_send_message(chat_id, texto, **kwargs):
@@ -1088,7 +1141,6 @@ def handle_download(message):
 
         common_opts = montar_download_opts(prefix, is_instagram=is_instagram)
         formatos = ["best[ext=mp4]/best"] if is_instagram else formatos_capados_gerais()
-
         baixou = False
         ultimo_erro = None
 
@@ -1118,7 +1170,12 @@ def handle_download(message):
         if not arquivo_final or not os.path.exists(arquivo_final):
             raise Exception("Arquivo final não encontrado após o download")
 
-        enviado = enviar_arquivo_com_fallback(message.chat.id, arquivo_final)
+        if not ffmpeg_disponivel():
+            raise Exception("ffmpeg não está instalado no servidor.")
+
+        arquivo_envio = converter_para_720x1280_30fps(arquivo_final)
+
+        enviado = enviar_arquivo_com_fallback(message.chat.id, arquivo_envio)
         if not enviado:
             raise Exception("Falha ao enviar arquivo ao Telegram")
 
@@ -1130,10 +1187,7 @@ def handle_download(message):
 
     except Exception as e:
         logger.error(f"[ERRO_DOWNLOAD] user_id={message.from_user.id} url={url} erro={e}")
-        texto_erro = mapear_erro_download(
-            str(e),
-            plataforma=("instagram" if "instagram.com" in url.lower() else "geral")
-        )
+        texto_erro = mapear_erro_download(str(e), plataforma=("instagram" if "instagram.com" in url.lower() else "geral"))
 
         if status_msg:
             safe_edit_message(message.chat.id, status_msg.message_id, texto_erro)
