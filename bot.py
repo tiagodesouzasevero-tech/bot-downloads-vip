@@ -210,6 +210,158 @@ def ffmpeg_disponivel():
         return False
 
 
+def ffprobe_disponivel():
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-version"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def parse_fps(valor):
+    try:
+        if not valor or valor in ("0/0", "N/A"):
+            return None
+        if "/" in str(valor):
+            num, den = str(valor).split("/", 1)
+            num = float(num)
+            den = float(den)
+            if den == 0:
+                return None
+            return num / den
+        return float(valor)
+    except Exception:
+        return None
+
+
+def obter_info_midia(arquivo_entrada):
+    if not ffprobe_disponivel():
+        return None
+
+    cmd = [
+        "ffprobe",
+        "-v", "error",
+        "-print_format", "json",
+        "-show_format",
+        "-show_streams",
+        arquivo_entrada
+    ]
+
+    resultado = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True
+    )
+
+    if resultado.returncode != 0:
+        logger.warning(f"[FFPROBE] Falha ao analisar {arquivo_entrada}: {resultado.stderr[-500:]}")
+        return None
+
+    try:
+        import json
+        dados = json.loads(resultado.stdout)
+    except Exception as e:
+        logger.warning(f"[FFPROBE] JSON inválido para {arquivo_entrada}: {e}")
+        return None
+
+    video_stream = None
+    audio_stream = None
+
+    for stream in dados.get("streams", []):
+        if stream.get("codec_type") == "video" and video_stream is None:
+            video_stream = stream
+        elif stream.get("codec_type") == "audio" and audio_stream is None:
+            audio_stream = stream
+
+    fps = None
+    if video_stream:
+        fps = parse_fps(video_stream.get("avg_frame_rate")) or parse_fps(video_stream.get("r_frame_rate"))
+
+    format_name = (dados.get("format", {}) or {}).get("format_name", "")
+    tamanho = None
+    try:
+        tamanho = os.path.getsize(arquivo_entrada)
+    except Exception:
+        tamanho = None
+
+    return {
+        "width": (video_stream or {}).get("width"),
+        "height": (video_stream or {}).get("height"),
+        "fps": fps,
+        "vcodec": (video_stream or {}).get("codec_name"),
+        "acodec": (audio_stream or {}).get("codec_name") if audio_stream else None,
+        "format_name": format_name,
+        "size_bytes": tamanho,
+    }
+
+
+def arquivo_ja_otimizado_para_envio(arquivo_entrada, info=None):
+    info = info or obter_info_midia(arquivo_entrada)
+    if not info:
+        return False
+
+    ext = os.path.splitext(arquivo_entrada)[1].lower()
+    width = info.get("width") or 0
+    height = info.get("height") or 0
+    fps = info.get("fps") or 0
+    vcodec = (info.get("vcodec") or "").lower()
+    acodec = (info.get("acodec") or "none").lower()
+
+    return (
+        ext == ".mp4"
+        and width <= 720
+        and height <= 1280
+        and fps <= 30.5
+        and vcodec in ("h264", "avc1")
+        and acodec in ("aac", "none")
+    )
+
+
+def codecs_compativeis_para_remux_mp4(info):
+    if not info:
+        return False
+
+    vcodec = (info.get("vcodec") or "").lower()
+    acodec = (info.get("acodec") or "none").lower()
+
+    return vcodec in ("h264", "avc1") and acodec in ("aac", "none")
+
+
+def remuxar_para_mp4_faststart(arquivo_entrada):
+    base, _ = os.path.splitext(arquivo_entrada)
+    arquivo_saida = f"{base}_remux.mp4"
+
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i", arquivo_entrada,
+        "-c", "copy",
+        "-movflags", "+faststart",
+        arquivo_saida
+    ]
+
+    resultado = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True
+    )
+
+    if resultado.returncode != 0:
+        raise Exception(f"Falha no remux do ffmpeg: {resultado.stderr[-1500:]}")
+
+    if not os.path.exists(arquivo_saida):
+        raise Exception("Arquivo remuxado não foi gerado.")
+
+    return arquivo_saida
+
+
 def converter_para_720x1280_30fps(arquivo_entrada):
     """
     Garante saída final em no máximo 720x1280, 30fps, H.264/AAC.
@@ -247,6 +399,41 @@ def converter_para_720x1280_30fps(arquivo_entrada):
         raise Exception("Arquivo convertido não foi gerado.")
 
     return arquivo_saida
+
+
+def preparar_arquivo_para_envio(arquivo_entrada):
+    info = obter_info_midia(arquivo_entrada)
+
+    if arquivo_ja_otimizado_para_envio(arquivo_entrada, info):
+        logger.info(
+            f"[MIDIA] Enviando original sem reconversão | arquivo={arquivo_entrada} "
+            f"width={info.get('width')} height={info.get('height')} fps={info.get('fps')} "
+            f"vcodec={info.get('vcodec')} acodec={info.get('acodec')}"
+        )
+        return arquivo_entrada
+
+    if info:
+        width = info.get("width") or 0
+        height = info.get("height") or 0
+        fps = info.get("fps") or 0
+        ext = os.path.splitext(arquivo_entrada)[1].lower()
+
+        if (
+            width <= 720
+            and height <= 1280
+            and fps <= 30.5
+            and codecs_compativeis_para_remux_mp4(info)
+            and ext != ".mp4"
+        ):
+            logger.info(
+                f"[MIDIA] Fazendo apenas remux para MP4 | arquivo={arquivo_entrada} "
+                f"width={width} height={height} fps={fps} "
+                f"vcodec={info.get('vcodec')} acodec={info.get('acodec')}"
+            )
+            return remuxar_para_mp4_faststart(arquivo_entrada)
+
+    logger.info(f"[MIDIA] Convertendo arquivo para padrão 720x1280 30fps | arquivo={arquivo_entrada} info={info}")
+    return converter_para_720x1280_30fps(arquivo_entrada)
 
 
 def safe_send_message(chat_id, texto, **kwargs):
@@ -1173,7 +1360,7 @@ def handle_download(message):
         if not ffmpeg_disponivel():
             raise Exception("ffmpeg não está instalado no servidor.")
 
-        arquivo_envio = converter_para_720x1280_30fps(arquivo_final)
+        arquivo_envio = preparar_arquivo_para_envio(arquivo_final)
 
         enviado = enviar_arquivo_com_fallback(message.chat.id, arquivo_envio)
         if not enviado:
