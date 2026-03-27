@@ -1111,6 +1111,28 @@ def zerar_contador(message):
         safe_reply_to(message, "❌ Use: `/zerar ID`", parse_mode="Markdown")
 
 
+def processar_aviso_geral(admin_chat_id, msg_texto):
+    try:
+        usuarios = usuarios_col.find({}, {"_id": 1})
+        cont = 0
+
+        logger.info("[AVISOGERAL_LOOP] iniciado")
+
+        for u in usuarios:
+            try:
+                safe_send_message(int(u["_id"]), msg_texto, parse_mode="Markdown")
+                cont += 1
+                time.sleep(0.05)
+            except Exception:
+                pass
+
+        safe_send_message(admin_chat_id, f"📢 Aviso enviado para {cont} usuários!")
+        logger.info(f"[AVISOGERAL_LOOP] finalizado enviados={cont}")
+    except Exception as e:
+        logger.error(f"[AVISOGERAL_LOOP] erro={e}")
+        safe_send_message(admin_chat_id, "❌ Erro ao enviar aviso geral.")
+
+
 @bot.message_handler(commands=["avisogeral"])
 def aviso_geral(message):
     if message.from_user.id != ADMIN_ID:
@@ -1121,21 +1143,16 @@ def aviso_geral(message):
         if not msg_texto:
             return safe_reply_to(message, "❌ Digite a mensagem após o comando.")
 
-        usuarios = usuarios_col.find({}, {"_id": 1})
-        cont = 0
+        Thread(
+            target=processar_aviso_geral,
+            args=(message.chat.id, msg_texto),
+            daemon=True
+        ).start()
 
-        for u in usuarios:
-            try:
-                safe_send_message(int(u["_id"]), msg_texto, parse_mode="Markdown")
-                cont += 1
-                time.sleep(0.05)
-            except Exception:
-                pass
-
-        safe_reply_to(message, f"📢 Aviso enviado para {cont} usuários!")
+        safe_reply_to(message, "📢 Envio do aviso geral iniciado em segundo plano.")
     except Exception as e:
         logger.error(f"[AVISOGERAL] erro={e}")
-        safe_reply_to(message, "❌ Erro ao enviar aviso geral.")
+        safe_reply_to(message, "❌ Erro ao iniciar aviso geral.")
 
 
 @bot.message_handler(func=lambda m: m.text == "⚙️ Painel Admin")
