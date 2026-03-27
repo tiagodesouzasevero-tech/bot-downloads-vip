@@ -21,18 +21,22 @@ from requests.exceptions import RequestException, Timeout
 # =========================================
 # CONFIGURAÇÕES
 # =========================================
-TOKEN_TELEGRAM = os.environ.get("TOKEN_TELEGRAM", "8629536333:AAHjRGGxSm_Fc_WnAv8a2qLItCC_-bMUWqY")
-MONGO_URI = os.environ.get("MONGO_URI", "mongodb+srv://tiagodesouzasevero_db_user:rdS2qlLSlH7eI9jA@cluster0.x3wiavb.mongodb.net/bot_downloader?retryWrites=true&w=majority")
-MONGO_DB_NAME = os.environ.get("MONGO_DB_NAME", "bot_downloader")
-LINK_SUPORTE = os.environ.get("LINK_SUPORTE", "https://t.me/suporteafiliadotools")
-ADMIN_ID = int(os.environ.get("ADMIN_ID", "493336271"))
+def get_env_required(name):
+    value = os.environ.get(name)
+    if value is None or str(value).strip() == "":
+        raise RuntimeError(f"Variável de ambiente obrigatória ausente: {name}")
+    return value.strip()
+
+
+TOKEN_TELEGRAM = get_env_required("TOKEN_TELEGRAM")
+MONGO_URI = get_env_required("MONGO_URI")
+MONGO_DB_NAME = get_env_required("MONGO_DB_NAME")
+LINK_SUPORTE = get_env_required("LINK_SUPORTE")
+ADMIN_ID = int(get_env_required("ADMIN_ID"))
 
 # InfinitePay
-INFINITEPAY_HANDLE = os.environ.get("INFINITEPAY_HANDLE", "tiago-s-severo")
-APP_BASE_URL = os.environ.get(
-    "APP_BASE_URL",
-    "https://bot-downloads-vip-production.up.railway.app"
-)
+INFINITEPAY_HANDLE = get_env_required("INFINITEPAY_HANDLE")
+APP_BASE_URL = get_env_required("APP_BASE_URL").rstrip("/")
 INFINITEPAY_CHECKOUT_URL = "https://api.infinitepay.io/invoices/public/checkout/links"
 
 DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", "downloads_temp")
