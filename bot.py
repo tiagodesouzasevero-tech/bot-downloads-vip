@@ -28,6 +28,14 @@ def get_env_required(name):
     return value.strip()
 
 
+def get_first_env(names, default=None):
+    for name in names:
+        value = os.environ.get(name)
+        if value is not None and str(value).strip() != "":
+            return value.strip()
+    return default
+
+
 TOKEN_TELEGRAM = get_env_required("TOKEN_TELEGRAM")
 MONGO_URI = get_env_required("MONGO_URI")
 MONGO_DB_NAME = get_env_required("MONGO_DB_NAME")
@@ -41,6 +49,24 @@ INFINITEPAY_CHECKOUT_URL = "https://api.infinitepay.io/invoices/public/checkout/
 
 DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", "downloads_temp")
 TZ = ZoneInfo("America/Sao_Paulo")
+
+SERVICE_NAME = get_first_env(
+    ["SERVICE_NAME", "RAILWAY_SERVICE_NAME"],
+    default="bot-downloads-vip"
+)
+APP_VERSION = get_first_env(
+    ["APP_VERSION", "RAILWAY_GIT_COMMIT_SHA", "GIT_COMMIT", "COMMIT_SHA"],
+    default="unknown"
+)
+DEPLOYMENT_ID = get_first_env(
+    ["RAILWAY_DEPLOYMENT_ID", "DEPLOYMENT_ID", "RAILWAY_REPLICA_ID"],
+    default="unknown"
+)
+ENVIRONMENT_NAME = get_first_env(
+    ["RAILWAY_ENVIRONMENT_NAME", "RAILWAY_ENVIRONMENT", "ENVIRONMENT"],
+    default="production"
+)
+APP_STARTED_AT = datetime.now(TZ).isoformat()
 
 FREE_DAILY_LIMIT = 5
 MAX_DURATION_SECONDS = 90
@@ -1671,8 +1697,21 @@ def webhook_infinitepay():
 # HEALTHCHECK
 # =========================================
 @app.route("/")
-def health():
+def root_status():
     return "ONLINE", 200
+
+@app.route("/health")
+def health():
+    return jsonify({
+        "status": "ok",
+        "service": SERVICE_NAME,
+        "version": APP_VERSION,
+        "deployment_id": DEPLOYMENT_ID,
+        "environment": ENVIRONMENT_NAME,
+        "started_at": APP_STARTED_AT,
+        "bot": "running",
+        "flask": "running"
+    }), 200
 
 
 # =========================================
