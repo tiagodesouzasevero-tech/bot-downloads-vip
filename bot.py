@@ -313,12 +313,14 @@ def arquivo_ja_otimizado_para_envio(arquivo_entrada, info=None):
     vcodec = (info.get("vcodec") or "").lower()
     acodec = (info.get("acodec") or "none").lower()
 
+    # Aceita também HEVC/H.265 em MP4 quando já veio pequeno e dentro do padrão.
+    # Isso reduz MUITO o tamanho final porque evita reencodar para H.264 sem necessidade.
     return (
         ext == ".mp4"
         and width <= 720
         and height <= 1280
         and fps <= 30.5
-        and vcodec in ("h264", "avc1")
+        and vcodec in ("h264", "avc1", "hevc", "h265", "hev1")
         and acodec in ("aac", "none")
     )
 
@@ -330,7 +332,7 @@ def codecs_compativeis_para_remux_mp4(info):
     vcodec = (info.get("vcodec") or "").lower()
     acodec = (info.get("acodec") or "none").lower()
 
-    return vcodec in ("h264", "avc1") and acodec in ("aac", "none")
+    return vcodec in ("h264", "avc1", "hevc", "h265", "hev1") and acodec in ("aac", "none")
 
 
 def remuxar_para_mp4_faststart(arquivo_entrada):
@@ -406,7 +408,7 @@ def preparar_arquivo_para_envio(arquivo_entrada):
 
     if arquivo_ja_otimizado_para_envio(arquivo_entrada, info):
         logger.info(
-            f"[MIDIA] Enviando original sem reconversão | arquivo={arquivo_entrada} "
+            f"[MIDIA] Enviando original sem reconversão (mp4 compatível) | arquivo={arquivo_entrada} "
             f"width={info.get('width')} height={info.get('height')} fps={info.get('fps')} "
             f"vcodec={info.get('vcodec')} acodec={info.get('acodec')}"
         )
