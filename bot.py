@@ -213,7 +213,7 @@ def ffmpeg_disponivel():
 def converter_para_720x1280_30fps(arquivo_entrada):
     """
     Garante saída final em no máximo 720x1280, 30fps, H.264/AAC.
-    Para vídeos fora da proporção, completa com borda.
+    Mantém a proporção original sem adicionar bordas.
     """
     base, _ = os.path.splitext(arquivo_entrada)
     arquivo_saida = f"{base}_720x1280_30fps.mp4"
@@ -222,7 +222,7 @@ def converter_para_720x1280_30fps(arquivo_entrada):
         "ffmpeg",
         "-y",
         "-i", arquivo_entrada,
-        "-vf", "scale=720:1280:force_original_aspect_ratio=decrease:force_divisible_by=2,fps=30,pad=720:1280:(ow-iw)/2:(oh-ih)/2",
+        "-vf", "scale=720:1280:force_original_aspect_ratio=decrease:force_divisible_by=2,fps=30",
         "-c:v", "libx264",
         "-preset", "veryfast",
         "-crf", "23",
