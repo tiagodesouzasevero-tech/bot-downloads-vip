@@ -896,6 +896,44 @@ def notificar_pagamento_confirmado(user_id, plano_nome, vip_ate, receipt_url=Non
         logger.error(f"[NOTIFICAR_PAGAMENTO] user_id={user_id} erro={e}")
 
 
+def _escape_md(texto):
+    texto = str(texto)
+    for ch in r"_[]()~`>#+-=|{}.!":
+        texto = texto.replace(ch, "\\" + ch)
+    return texto
+
+
+def notificar_admin_privado(texto):
+    try:
+        safe_send_message(ADMIN_ID, texto, parse_mode="Markdown", disable_web_page_preview=True)
+    except Exception as e:
+        logger.error(f"[NOTIFICAR_ADMIN] erro={e}")
+
+
+def disparar_notificacao_admin(texto):
+    Thread(target=notificar_admin_privado, args=(texto,), daemon=True).start()
+
+
+def montar_texto_admin_webhook(status, order_nsu=None, user_id=None, plano_nome=None, valor_centavos=None, detalhe=None):
+    linhas = [status]
+    if order_nsu:
+        linhas.append(f"Pedido: `{_escape_md(order_nsu)}`")
+    if user_id is not None:
+        linhas.append(f"Usuário: `{_escape_md(user_id)}`")
+    if plano_nome:
+        linhas.append(f"Plano: *{_escape_md(plano_nome)}*")
+    if valor_centavos is not None:
+        try:
+            valor = int(valor_centavos) / 100
+            valor_formatado = f"{valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+            linhas.append(f"Valor: *R$ {valor_formatado}*")
+        except Exception:
+            linhas.append(f"Valor: `{_escape_md(valor_centavos)}`")
+    if detalhe:
+        linhas.append(f"Detalhe: {_escape_md(detalhe)}")
+    return "\n".join(linhas)
+
+
 # =========================================
 # USUÁRIO / VIP
 # =========================================
@@ -1614,21 +1652,45 @@ def webhook_infinitepay():
         secret_recebido = (request.args.get("secret") or "").strip()
         if secret_recebido != INFINITEPAY_WEBHOOK_SECRET:
             logger.warning("[WEBHOOK_INFINITEPAY] acesso negado: secret inválido")
+            disparar_notificacao_admin(
+                montar_texto_admin_webhook(
+                    "🚫 *Webhook InfinitePay negado*",
+                    detalhe="Secret inválido"
+                )
+            )
             return jsonify({
                 "success": False,
                 "message": "Não autorizado"
             }), 403
 
         payload = request.get_json(silent=True) or {}
-        logger.info(f"[WEBHOOK_INFINITEPAY] payload={payload}")
-
         order_nsu = payload.get("order_nsu")
         transaction_nsu = payload.get("transaction_nsu")
         amount = payload.get("amount")
         receipt_url = payload.get("receipt_url")
         capture_method = payload.get("capture_method")
 
+        logger.info(
+            f"[WEBHOOK_INFINITEPAY] recebido order_nsu={order_nsu} transaction_nsu={transaction_nsu} "
+            f"amount={amount} capture_method={capture_method}"
+        )
+        disparar_notificacao_admin(
+            montar_texto_admin_webhook(
+                "📩 *Webhook InfinitePay recebido*",
+                order_nsu=order_nsu,
+                valor_centavos=amount,
+                detalhe=f"Forma: {capture_method or 'não informada'}"
+            )
+        )
+
         if not order_nsu:
+            logger.warning("[WEBHOOK_INFINITEPAY] order_nsu ausente")
+            disparar_notificacao_admin(
+                montar_texto_admin_webhook(
+                    "⚠️ *Webhook com erro*",
+                    detalhe="order_nsu ausente"
+                )
+            )
             return jsonify({
                 "success": False,
                 "message": "order_nsu ausente"
@@ -1636,12 +1698,33 @@ def webhook_infinitepay():
 
         pedido = pedidos_col.find_one({"order_nsu": order_nsu})
         if not pedido:
+            logger.warning(f"[WEBHOOK_PEDIDO_NAO_ENCONTRADO] order_nsu={order_nsu}")
+            disparar_notificacao_admin(
+                montar_texto_admin_webhook(
+                    "⚠️ *Pedido não encontrado no webhook*",
+                    order_nsu=order_nsu,
+                    valor_centavos=amount
+                )
+            )
             return jsonify({
                 "success": False,
                 "message": "Pedido não encontrado"
             }), 400
 
+        plano = PLANOS.get(pedido.get("plano_key")) or {}
+        plano_nome = plano.get("nome")
+
         if pedido.get("status") == "paid":
+            logger.info(f"[WEBHOOK_PEDIDO_JA_PAGO] order_nsu={order_nsu}")
+            disparar_notificacao_admin(
+                montar_texto_admin_webhook(
+                    "ℹ️ *Webhook duplicado ignorado*",
+                    order_nsu=order_nsu,
+                    user_id=pedido.get("user_id"),
+                    plano_nome=plano_nome,
+                    valor_centavos=pedido.get("valor_centavos")
+                )
+            )
             return jsonify({
                 "success": True,
                 "message": None
@@ -1654,20 +1737,42 @@ def webhook_infinitepay():
             valor_recebido = 0
 
         if valor_recebido != valor_esperado:
-            logger.warning(
-                f"[WEBHOOK_VALOR_DIVERGENTE] order_nsu={order_nsu} esperado={valor_esperado} recebido={valor_recebido}"
+            detalhe = f"Esperado {valor_esperado} | Recebido {valor_recebido}"
+            logger.warning(f"[WEBHOOK_VALOR_DIVERGENTE] order_nsu={order_nsu} {detalhe}")
+            disparar_notificacao_admin(
+                montar_texto_admin_webhook(
+                    "❌ *Valor divergente no webhook*",
+                    order_nsu=order_nsu,
+                    user_id=pedido.get("user_id"),
+                    plano_nome=plano_nome,
+                    valor_centavos=valor_recebido,
+                    detalhe=detalhe
+                )
             )
             return jsonify({
                 "success": False,
                 "message": "Valor divergente"
             }), 400
 
-        plano = PLANOS.get(pedido.get("plano_key"))
         if not plano:
+            logger.warning(f"[WEBHOOK_PLANO_INVALIDO] order_nsu={order_nsu} plano_key={pedido.get('plano_key')}")
+            disparar_notificacao_admin(
+                montar_texto_admin_webhook(
+                    "❌ *Plano inválido no webhook*",
+                    order_nsu=order_nsu,
+                    user_id=pedido.get("user_id"),
+                    detalhe=f"plano_key={pedido.get('plano_key')}"
+                )
+            )
             return jsonify({
                 "success": False,
                 "message": "Plano inválido"
             }), 400
+
+        logger.info(
+            f"[WEBHOOK_PROCESSANDO] order_nsu={order_nsu} user_id={pedido['user_id']} "
+            f"plano={plano['nome']} valor={valor_recebido}"
+        )
 
         vip_ate = liberar_vip_por_plano(pedido["user_id"], plano)
 
@@ -1685,6 +1790,21 @@ def webhook_infinitepay():
             }
         )
 
+        logger.info(
+            f"[WEBHOOK_APROVADO] order_nsu={order_nsu} user_id={pedido['user_id']} "
+            f"plano={plano['nome']} vip_ate={vip_ate}"
+        )
+        disparar_notificacao_admin(
+            montar_texto_admin_webhook(
+                "✅ *Pagamento aprovado e VIP liberado*",
+                order_nsu=order_nsu,
+                user_id=pedido.get("user_id"),
+                plano_nome=plano.get("nome"),
+                valor_centavos=valor_recebido,
+                detalhe=f"VIP até: {vip_ate}"
+            )
+        )
+
         Thread(
             target=notificar_pagamento_confirmado,
             args=(pedido["user_id"], plano["nome"], vip_ate, receipt_url),
@@ -1698,10 +1818,17 @@ def webhook_infinitepay():
 
     except Exception as e:
         logger.error(f"[WEBHOOK_INFINITEPAY] erro={e}")
+        disparar_notificacao_admin(
+            montar_texto_admin_webhook(
+                "❌ *Erro interno no webhook*",
+                detalhe=str(e)
+            )
+        )
         return jsonify({
             "success": False,
             "message": "Erro interno no webhook"
         }), 400
+
 
 
 # =========================================
