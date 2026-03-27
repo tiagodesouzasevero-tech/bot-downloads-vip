@@ -364,6 +364,79 @@ def remuxar_para_mp4_faststart(arquivo_entrada):
     return arquivo_saida
 
 
+def arquivo_tem_codec_hevc(arquivo_entrada, info=None):
+    info = info or obter_info_midia(arquivo_entrada)
+    if not info:
+        return False
+
+    vcodec = (info.get("vcodec") or "").lower()
+    return vcodec in ("hevc", "h265", "hev1", "hvc1")
+
+
+def montar_vf_limite_720x1280_30fps(info=None):
+    info = info or {}
+    width = info.get("width") or 0
+    height = info.get("height") or 0
+    fps = info.get("fps") or 0
+
+    filtros = []
+
+    if width > 720 or height > 1280:
+        filtros.append("scale=720:1280:force_original_aspect_ratio=decrease:force_divisible_by=2")
+
+    if fps > 30.5:
+        filtros.append("fps=30")
+
+    return ",".join(filtros) if filtros else None
+
+
+def converter_para_h264_compativel(arquivo_entrada, info=None):
+    """
+    Fallback para compatibilidade: converte para MP4 H.264/AAC.
+    Mantém resolução/fps originais quando já estão dentro do limite,
+    e só reduz quando realmente necessário.
+    """
+    info = info or obter_info_midia(arquivo_entrada) or {}
+    base, _ = os.path.splitext(arquivo_entrada)
+    arquivo_saida = f"{base}_fallback_h264.mp4"
+
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i", arquivo_entrada,
+    ]
+
+    vf = montar_vf_limite_720x1280_30fps(info)
+    if vf:
+        cmd += ["-vf", vf]
+
+    cmd += [
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "25",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac",
+        "-b:a", "96k",
+        "-movflags", "+faststart",
+        arquivo_saida
+    ]
+
+    resultado = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True
+    )
+
+    if resultado.returncode != 0:
+        raise Exception(f"Falha no ffmpeg fallback H.264: {resultado.stderr[-1500:]}")
+
+    if not os.path.exists(arquivo_saida):
+        raise Exception("Arquivo fallback H.264 não foi gerado.")
+
+    return arquivo_saida
+
+
 def converter_para_720x1280_30fps(arquivo_entrada):
     """
     Garante saída final em no máximo 720x1280, 30fps, H.264/AAC.
@@ -482,10 +555,32 @@ def enviar_arquivo_com_fallback(chat_id, arquivo):
             bot.send_video(chat_id, f, caption="👉 Download concluído! Aqui está seu vídeo 👊")
         return True
     except Exception as e_video:
-        logger.warning(f"[SEND_VIDEO] Falhou, tentando como documento. erro={e_video}")
+        logger.warning(f"[SEND_VIDEO] Falhou no envio como vídeo. arquivo={arquivo} erro={e_video}")
+
+    info = obter_info_midia(arquivo)
+    arquivo_fallback = None
+
+    if arquivo_tem_codec_hevc(arquivo, info):
+        try:
+            logger.info(
+                f"[SEND_VIDEO] Tentando fallback automático HEVC -> H.264 | arquivo={arquivo} "
+                f"width={(info or {}).get('width')} height={(info or {}).get('height')} "
+                f"fps={(info or {}).get('fps')} vcodec={(info or {}).get('vcodec')}"
+            )
+            arquivo_fallback = converter_para_h264_compativel(arquivo, info)
+
+            with open(arquivo_fallback, "rb") as f:
+                bot.send_video(chat_id, f, caption="👉 Download concluído! Aqui está seu vídeo 👊")
+
+            logger.info(f"[SEND_VIDEO] Fallback H.264 enviado com sucesso | arquivo={arquivo_fallback}")
+            return True
+        except Exception as e_h264:
+            logger.warning(f"[SEND_VIDEO] Fallback H.264 também falhou. erro={e_h264}")
+
+    alvo_documento = arquivo_fallback if arquivo_fallback and os.path.exists(arquivo_fallback) else arquivo
 
     try:
-        with open(arquivo, "rb") as f:
+        with open(alvo_documento, "rb") as f:
             bot.send_document(chat_id, f, caption="👉 Download concluído! Aqui está seu arquivo 👊")
         return True
     except Exception as e_doc:
