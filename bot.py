@@ -44,6 +44,7 @@ ADMIN_ID = int(get_env_required("ADMIN_ID"))
 
 # InfinitePay
 INFINITEPAY_HANDLE = get_env_required("INFINITEPAY_HANDLE")
+INFINITEPAY_WEBHOOK_SECRET = get_env_required("INFINITEPAY_WEBHOOK_SECRET")
 APP_BASE_URL = get_env_required("APP_BASE_URL").rstrip("/")
 INFINITEPAY_CHECKOUT_URL = "https://api.infinitepay.io/invoices/public/checkout/links"
 
@@ -169,7 +170,7 @@ def redirect_url():
 
 
 def webhook_url():
-    return f"{APP_BASE_URL}/webhook/infinitepay"
+    return f"{APP_BASE_URL}/webhook/infinitepay?secret={INFINITEPAY_WEBHOOK_SECRET}"
 
 
 def extrair_primeira_url(texto):
@@ -803,7 +804,9 @@ def criar_checkout_infinitepay(order_nsu, plano):
         ]
     }
 
-    logger.info(f"[CHECKOUT_CREATE] order_nsu={order_nsu} payload={payload}")
+    payload_log = dict(payload)
+    payload_log["webhook_url"] = f"{APP_BASE_URL}/webhook/infinitepay?secret=***"
+    logger.info(f"[CHECKOUT_CREATE] order_nsu={order_nsu} payload={payload_log}")
 
     resp = requests.post(
         INFINITEPAY_CHECKOUT_URL,
@@ -1608,6 +1611,14 @@ def pagamento_sucesso():
 @app.route("/webhook/infinitepay", methods=["POST"])
 def webhook_infinitepay():
     try:
+        secret_recebido = (request.args.get("secret") or "").strip()
+        if secret_recebido != INFINITEPAY_WEBHOOK_SECRET:
+            logger.warning("[WEBHOOK_INFINITEPAY] acesso negado: secret inválido")
+            return jsonify({
+                "success": False,
+                "message": "Não autorizado"
+            }), 403
+
         payload = request.get_json(silent=True) or {}
         logger.info(f"[WEBHOOK_INFINITEPAY] payload={payload}")
 
