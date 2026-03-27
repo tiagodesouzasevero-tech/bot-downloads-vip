@@ -301,7 +301,7 @@ def obter_info_midia(arquivo_entrada):
     }
 
 
-def arquivo_ja_otimizado_para_envio(arquivo_entrada, info=None):
+def arquivo_ja_otimizado_para_envio(arquivo_entrada, info=None, permitir_hevc=True):
     info = info or obter_info_midia(arquivo_entrada)
     if not info:
         return False
@@ -313,16 +313,23 @@ def arquivo_ja_otimizado_para_envio(arquivo_entrada, info=None):
     vcodec = (info.get("vcodec") or "").lower()
     acodec = (info.get("acodec") or "none").lower()
 
-    # Aceita também HEVC/H.265 em MP4 quando já veio pequeno e dentro do padrão.
-    # Isso reduz MUITO o tamanho final porque evita reencodar para H.264 sem necessidade.
+    codecs_video_aceitos = {"h264", "avc1"}
+    if permitir_hevc:
+        codecs_video_aceitos.update({"hevc", "h265", "hev1", "hvc1"})
+
     return (
         ext == ".mp4"
         and width <= 720
         and height <= 1280
         and fps <= 30.5
-        and vcodec in ("h264", "avc1", "hevc", "h265", "hev1")
+        and vcodec in codecs_video_aceitos
         and acodec in ("aac", "none")
     )
+
+
+def permitir_hevc_por_plataforma(plataforma=None):
+    plataforma = (plataforma or "").strip().lower()
+    return plataforma in ("tiktok", "rednote")
 
 
 def codecs_compativeis_para_remux_mp4(info):
@@ -476,14 +483,15 @@ def converter_para_720x1280_30fps(arquivo_entrada):
     return arquivo_saida
 
 
-def preparar_arquivo_para_envio(arquivo_entrada):
+def preparar_arquivo_para_envio(arquivo_entrada, plataforma=None):
     info = obter_info_midia(arquivo_entrada)
+    permitir_hevc = permitir_hevc_por_plataforma(plataforma)
 
-    if arquivo_ja_otimizado_para_envio(arquivo_entrada, info):
+    if arquivo_ja_otimizado_para_envio(arquivo_entrada, info, permitir_hevc=permitir_hevc):
         logger.info(
-            f"[MIDIA] Enviando original sem reconversão (mp4 compatível) | arquivo={arquivo_entrada} "
+            f"[MIDIA] Enviando original sem reconversão | plataforma={plataforma} arquivo={arquivo_entrada} "
             f"width={info.get('width')} height={info.get('height')} fps={info.get('fps')} "
-            f"vcodec={info.get('vcodec')} acodec={info.get('acodec')}"
+            f"vcodec={info.get('vcodec')} acodec={info.get('acodec')} permitir_hevc={permitir_hevc}"
         )
         return arquivo_entrada
 
@@ -492,22 +500,28 @@ def preparar_arquivo_para_envio(arquivo_entrada):
         height = info.get("height") or 0
         fps = info.get("fps") or 0
         ext = os.path.splitext(arquivo_entrada)[1].lower()
+        vcodec = (info.get("vcodec") or "").lower()
+        acodec = (info.get("acodec") or "none").lower()
 
         if (
             width <= 720
             and height <= 1280
             and fps <= 30.5
-            and codecs_compativeis_para_remux_mp4(info)
             and ext != ".mp4"
+            and acodec in ("aac", "none")
+            and (vcodec in ("h264", "avc1") or (permitir_hevc and vcodec in ("hevc", "h265", "hev1", "hvc1")))
         ):
             logger.info(
-                f"[MIDIA] Fazendo apenas remux para MP4 | arquivo={arquivo_entrada} "
+                f"[MIDIA] Fazendo apenas remux para MP4 | plataforma={plataforma} arquivo={arquivo_entrada} "
                 f"width={width} height={height} fps={fps} "
-                f"vcodec={info.get('vcodec')} acodec={info.get('acodec')}"
+                f"vcodec={info.get('vcodec')} acodec={info.get('acodec')} permitir_hevc={permitir_hevc}"
             )
             return remuxar_para_mp4_faststart(arquivo_entrada)
 
-    logger.info(f"[MIDIA] Convertendo arquivo para padrão 720x1280 30fps | arquivo={arquivo_entrada} info={info}")
+    logger.info(
+        f"[MIDIA] Convertendo arquivo para padrão 720x1280 30fps | plataforma={plataforma} "
+        f"arquivo={arquivo_entrada} info={info} permitir_hevc={permitir_hevc}"
+    )
     return converter_para_720x1280_30fps(arquivo_entrada)
 
 
@@ -935,14 +949,7 @@ def resolver_link_pinterest(url):
 def baixar_pinterest_capado(url, prefix):
     url = resolver_link_pinterest(url)
 
-    formatos = [
-        "bestvideo[ext=mp4][width<=720][height<=1280][fps<=30]+bestaudio[ext=m4a]/bestvideo[width<=720][height<=1280][fps<=30]+bestaudio/best[ext=mp4][width<=720][height<=1280][fps<=30]/best[width<=720][height<=1280][fps<=30]",
-        "bestvideo[ext=mp4][width<=720][height<=1280]+bestaudio[ext=m4a]/bestvideo[width<=720][height<=1280]+bestaudio/best[ext=mp4][width<=720][height<=1280]/best[width<=720][height<=1280]",
-        "best[ext=mp4][width<=720][height<=1280][fps<=30]",
-        "best[ext=mp4][width<=720][height<=1280]",
-        "best[width<=720][height<=1280][fps<=30]",
-        "best[width<=720][height<=1280]"
-    ]
+    formatos = formatos_por_plataforma(is_pinterest=True)
 
     common_opts = montar_download_opts(prefix, is_pinterest=True)
     ultimo_erro = None
@@ -1318,6 +1325,34 @@ def formatos_capados_gerais():
     ]
 
 
+def formatos_por_plataforma(is_tiktok=False, is_instagram=False, is_pinterest=False, is_rednote=False):
+    if is_instagram:
+        return [
+            "bestvideo[ext=mp4][width<=720][height<=1280][fps<=30]+bestaudio[ext=m4a]/best[ext=mp4][width<=720][height<=1280][fps<=30]",
+            "bestvideo[ext=mp4][width<=720][height<=1280]+bestaudio[ext=m4a]/best[ext=mp4][width<=720][height<=1280]",
+            "best[ext=mp4][width<=720][height<=1280][fps<=30]",
+            "best[ext=mp4][width<=720][height<=1280]",
+            "best[ext=mp4]/best"
+        ]
+
+    if is_pinterest:
+        return [
+            "bestvideo[ext=mp4][width<=720][height<=1280][fps<=30]+bestaudio[ext=m4a]/bestvideo[width<=720][height<=1280][fps<=30]+bestaudio/best[ext=mp4][width<=720][height<=1280][fps<=30]/best[width<=720][height<=1280][fps<=30]",
+            "bestvideo[ext=mp4][width<=720][height<=1280]+bestaudio[ext=m4a]/bestvideo[width<=720][height<=1280]+bestaudio/best[ext=mp4][width<=720][height<=1280]/best[width<=720][height<=1280]",
+            "best[ext=mp4][width<=720][height<=1280][fps<=30]",
+            "best[ext=mp4][width<=720][height<=1280]",
+            "best[width<=720][height<=1280][fps<=30]",
+            "best[width<=720][height<=1280]"
+        ]
+
+    if is_tiktok or is_rednote:
+        return formatos_capados_gerais() + [
+            "best[ext=mp4]/best"
+        ]
+
+    return formatos_capados_gerais()
+
+
 @bot.message_handler(func=lambda message: message.text and "http" in message.text.lower())
 def handle_download(message):
     user = obter_usuario(message.from_user.id)
@@ -1424,7 +1459,12 @@ def handle_download(message):
             return
 
         common_opts = montar_download_opts(prefix, is_instagram=is_instagram)
-        formatos = ["best[ext=mp4]/best"] if is_instagram else formatos_capados_gerais()
+        formatos = formatos_por_plataforma(
+            is_tiktok=is_tiktok,
+            is_instagram=is_instagram,
+            is_pinterest=is_pinterest,
+            is_rednote=is_rednote,
+        )
         baixou = False
         ultimo_erro = None
 
@@ -1457,7 +1497,7 @@ def handle_download(message):
         if not ffmpeg_disponivel():
             raise Exception("ffmpeg não está instalado no servidor.")
 
-        arquivo_envio = preparar_arquivo_para_envio(arquivo_final)
+        arquivo_envio = preparar_arquivo_para_envio(arquivo_final, plataforma=plataforma)
 
         enviado = enviar_arquivo_com_fallback(message.chat.id, arquivo_envio)
         if not enviado:
