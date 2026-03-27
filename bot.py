@@ -185,6 +185,20 @@ def cleanup_download_dir_old_files(max_age_hours=6):
         logger.warning(f"[CLEANUP_OLD] Falha geral no diretório {DOWNLOAD_DIR}: {e}")
 
 
+def cleanup_download_dir_periodicamente(interval_minutes=60, max_age_hours=6):
+    intervalo_segundos = max(300, int(interval_minutes * 60))
+    logger.info(
+        f"[CLEANUP_LOOP] iniciado interval_minutes={interval_minutes} max_age_hours={max_age_hours}"
+    )
+
+    while True:
+        try:
+            cleanup_download_dir_old_files(max_age_hours=max_age_hours)
+        except Exception as e:
+            logger.warning(f"[CLEANUP_LOOP] erro={e}")
+        time.sleep(intervalo_segundos)
+
+
 def encontrar_arquivo_baixado(prefix):
     candidatos = []
     for arq in glob.glob(f"{prefix}*"):
@@ -1649,6 +1663,12 @@ def health():
 # =========================================
 if __name__ == "__main__":
     cleanup_download_dir_old_files(max_age_hours=6)
+
+    Thread(
+        target=cleanup_download_dir_periodicamente,
+        kwargs={"interval_minutes": 60, "max_age_hours": 6},
+        daemon=True
+    ).start()
 
     Thread(
         target=lambda: app.run(
