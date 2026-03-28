@@ -1493,14 +1493,17 @@ def painel_admin(message):
         pedidos_pendentes = pedidos_col.count_documents({"status": "pending"})
         pedidos_pagos = pedidos_col.count_documents({"status": "paid"})
 
-        texto_admin = (
-            "🛠 *PAINEL DE CONTROLE ADMIN*\n\n"
-            f"👤 Usuários Totais: `{total_users}`\n"
-            f"💎 VIPs Ativos: `{vips_ativos}`\n"
-            f"📥 Downloads Hoje: `{downloads_totais_hoje}`\n"
-            f"🧾 Pedidos Pendentes: `{pedidos_pendentes}`\n"
-            f"✅ Pedidos Pagos: `{pedidos_pagos}`\n\n"
-            "🚀 *COMANDOS DISPONÍVEIS:*\n"
+        resumo_admin = (
+            "⚙️ *Painel Admin*\n\n"
+            f"👥 Usuários: `{total_users}`\n"
+            f"💎 VIPs: `{vips_ativos}`\n"
+            f"📥 Downloads hoje: `{downloads_totais_hoje}`\n"
+            f"🕒 Pendentes: `{pedidos_pendentes}`\n"
+            f"✅ Pagos: `{pedidos_pagos}`"
+        )
+
+        comandos_admin = (
+            "*Comandos:*\n"
             "• `/darvip [ID] [Dias]`\n"
             "• `/zerar [ID]`\n"
             "• `/avisogeral [Mensagem]`\n"
@@ -1510,10 +1513,12 @@ def painel_admin(message):
             "• `/backupgeral`"
         )
 
-        safe_send_message(message.chat.id, texto_admin, parse_mode="Markdown")
+        safe_send_message(message.chat.id, resumo_admin, parse_mode="Markdown")
+        safe_send_message(message.chat.id, comandos_admin, parse_mode="Markdown")
     except Exception as e:
         logger.error(f"[PAINEL_ADMIN] erro={e}")
         safe_send_message(message.chat.id, "❌ Erro ao abrir painel admin.")
+
 
 
 # =========================================
