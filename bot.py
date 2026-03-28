@@ -1412,12 +1412,9 @@ def processar_aviso_geral(admin_chat_id, msg_texto):
             except Exception as e:
                 falhas += 1
                 logger.warning(f"[AVISOGERAL_ITEM] user_id={u.get('_id')} erro={e}")
-
         safe_send_message(
             admin_chat_id,
-            f"📢 Aviso finalizado.
-✅ Enviados: {enviados}
-❌ Falhas: {falhas}"
+            f"📢 Aviso finalizado\n✅ Enviados: {enviados}\n❌ Falhas: {falhas}"
         )
         logger.info(f"[AVISOGERAL_LOOP] finalizado enviados={enviados} falhas={falhas}")
     except Exception as e:
