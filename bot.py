@@ -2197,6 +2197,40 @@ def webhook_infinitepay():
 
 
 
+
+
+def obter_metricas_health():
+    metricas = {
+        "ffmpeg_available": ffmpeg_disponivel(),
+        "ffprobe_available": ffprobe_disponivel(),
+        "mongo_status": "unknown",
+        "users_total": None,
+        "active_vips": None,
+        "pending_orders": None,
+        "paid_orders": None,
+    }
+
+    try:
+        client.admin.command("ping")
+        metricas["mongo_status"] = "ok"
+
+        hoje = hoje_str()
+        metricas["users_total"] = usuarios_col.count_documents({})
+        metricas["active_vips"] = usuarios_col.count_documents({
+            "$or": [
+                {"vip_ate": "Vitalício"},
+                {"vip_ate": {"$gte": hoje}}
+            ]
+        })
+        metricas["pending_orders"] = pedidos_col.count_documents({"status": "pending"})
+        metricas["paid_orders"] = pedidos_col.count_documents({"status": "paid"})
+    except Exception as e:
+        metricas["mongo_status"] = f"error: {str(e)[:150]}"
+        logger.warning(f"[HEALTH_METRICS] erro={e}")
+
+    return metricas
+
+
 # =========================================
 # HEALTHCHECK
 # =========================================
@@ -2206,6 +2240,8 @@ def root_status():
 
 @app.route("/health")
 def health():
+    metricas = obter_metricas_health()
+
     return jsonify({
         "status": "ok",
         "service": SERVICE_NAME,
@@ -2214,7 +2250,14 @@ def health():
         "environment": ENVIRONMENT_NAME,
         "started_at": APP_STARTED_AT,
         "bot": "running",
-        "flask": "running"
+        "flask": "running",
+        "ffmpeg_available": metricas["ffmpeg_available"],
+        "ffprobe_available": metricas["ffprobe_available"],
+        "mongo_status": metricas["mongo_status"],
+        "users_total": metricas["users_total"],
+        "active_vips": metricas["active_vips"],
+        "pending_orders": metricas["pending_orders"],
+        "paid_orders": metricas["paid_orders"]
     }), 200
 
 
