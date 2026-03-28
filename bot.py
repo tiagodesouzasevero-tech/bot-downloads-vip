@@ -87,6 +87,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger("afiliadotools")
 
+
+class YtDlpQuietLogger:
+    def debug(self, msg):
+        pass
+
+    def warning(self, msg):
+        pass
+
+    def error(self, msg):
+        pass
+
 # =========================================
 # DB / BOT / APP
 # =========================================
@@ -698,6 +709,14 @@ def get_instagram_cookiefile():
 
     INSTAGRAM_COOKIEFILE_PATH = cookie_path
     return cookie_path
+
+
+def aplicar_silencio_ytdlp(opts):
+    opts["quiet"] = True
+    opts["no_warnings"] = True
+    opts["noprogress"] = True
+    opts["logger"] = YtDlpQuietLogger()
+    return opts
 
 
 def montar_info_opts(is_instagram=False, is_pinterest=False):
@@ -1743,10 +1762,7 @@ def formatos_capados_gerais():
 def formatos_por_plataforma(is_tiktok=False, is_instagram=False, is_pinterest=False, is_rednote=False):
     if is_instagram:
         return [
-            "bestvideo[ext=mp4][width<=720][height<=1280][fps<=30]+bestaudio[ext=m4a]/best[ext=mp4][width<=720][height<=1280][fps<=30]",
             "bestvideo[ext=mp4][width<=720][height<=1280]+bestaudio[ext=m4a]/best[ext=mp4][width<=720][height<=1280]",
-            "best[ext=mp4][width<=720][height<=1280][fps<=30]",
-            "best[ext=mp4][width<=720][height<=1280]",
             "best[ext=mp4]/best"
         ]
 
@@ -1895,6 +1911,9 @@ def handle_download(message):
 
                 arquivo_baixado = encontrar_arquivo_baixado(prefix)
                 if arquivo_baixado and os.path.exists(arquivo_baixado):
+                    logger.info(
+                        f"[DOWNLOAD_OK] plataforma={plataforma} formato={fmt} arquivo={arquivo_baixado}"
+                    )
                     baixou = True
                     break
 
