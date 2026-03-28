@@ -4,7 +4,7 @@ import glob
 import uuid
 import time
 import logging
-from threading import Thread
+from threading import Thread, Lock
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -98,6 +98,10 @@ class YtDlpQuietLogger:
 
     def error(self, msg):
         pass
+
+
+DOWNLOADS_EM_ANDAMENTO = {}
+DOWNLOADS_EM_ANDAMENTO_LOCK = Lock()
 
 # =========================================
 # DB / BOT / APP
@@ -613,6 +617,75 @@ def safe_delete_message(chat_id, message_id):
         bot.delete_message(chat_id, message_id)
     except Exception as e:
         logger.warning(f"[DELETE_MESSAGE] chat_id={chat_id} message_id={message_id} erro={e}")
+
+
+def contar_downloads_em_andamento():
+    with DOWNLOADS_EM_ANDAMENTO_LOCK:
+        return sum(1 for estado in DOWNLOADS_EM_ANDAMENTO.values() if estado.get("active"))
+
+
+def iniciar_controle_download_usuario(user_id, message_date=None):
+    uid = str(user_id)
+    agora_ts = int(time.time())
+
+    try:
+        message_ts = int(message_date) if message_date is not None else agora_ts
+    except Exception:
+        message_ts = agora_ts
+
+    with DOWNLOADS_EM_ANDAMENTO_LOCK:
+        estado = DOWNLOADS_EM_ANDAMENTO.get(uid, {})
+        last_started_at = int(estado.get("last_started_at") or 0)
+        last_finished_at = int(estado.get("last_finished_at") or 0)
+
+        if estado.get("active"):
+            logger.info(
+                f"[ANTI_FLOOD_BLOCK] user_id={uid} reason=active_now "
+                f"msg_ts={message_ts} last_started_at={last_started_at}"
+            )
+            return False
+
+        if last_started_at and last_finished_at and last_started_at <= message_ts < last_finished_at:
+            logger.info(
+                f"[ANTI_FLOOD_BLOCK] user_id={uid} reason=queued_during_previous "
+                f"msg_ts={message_ts} last_started_at={last_started_at} last_finished_at={last_finished_at}"
+            )
+            return False
+
+        DOWNLOADS_EM_ANDAMENTO[uid] = {
+            "active": True,
+            "last_started_at": agora_ts,
+            "active_message_ts": message_ts,
+            "last_finished_at": last_finished_at,
+        }
+
+        active_total = sum(1 for item in DOWNLOADS_EM_ANDAMENTO.values() if item.get("active"))
+
+        logger.info(
+            f"[ANTI_FLOOD_START] user_id={uid} msg_ts={message_ts} active_total={active_total}"
+        )
+        return True
+
+
+def finalizar_controle_download_usuario(user_id):
+    uid = str(user_id)
+    agora_ts = int(time.time())
+
+    with DOWNLOADS_EM_ANDAMENTO_LOCK:
+        estado = DOWNLOADS_EM_ANDAMENTO.get(uid)
+        if not estado:
+            return
+
+        estado["active"] = False
+        estado["last_finished_at"] = agora_ts
+        estado["active_message_ts"] = None
+        DOWNLOADS_EM_ANDAMENTO[uid] = estado
+
+        active_total = sum(1 for item in DOWNLOADS_EM_ANDAMENTO.values() if item.get("active"))
+
+        logger.info(
+            f"[ANTI_FLOOD_END] user_id={uid} finished_at={agora_ts} active_total={active_total}"
+        )
 
 
 def safe_answer_callback(call_id):
@@ -1623,6 +1696,7 @@ def enviar_painel_admin(chat_id):
         pedidos_expirados = pedidos_col.count_documents({"status": "expired"})
         pedidos_checkout_error = pedidos_col.count_documents({"status": "checkout_error"})
         pedidos_creating = pedidos_col.count_documents({"status": "creating"})
+        downloads_em_andamento = contar_downloads_em_andamento()
 
         mongo_status = "ok"
         try:
@@ -1640,7 +1714,8 @@ def enviar_painel_admin(chat_id):
             "*Usuários e uso*\n"
             f"👥 Usuários: `{total_users}`\n"
             f"💎 VIPs ativos: `{vips_ativos}`\n"
-            f"📥 Downloads hoje: `{downloads_totais_hoje}`\n\n"
+            f"📥 Downloads hoje: `{downloads_totais_hoje}`\n"
+            f"🚦 Em andamento: `{downloads_em_andamento}`\n\n"
             "*Pedidos*\n"
             f"🕒 Pendentes: `{pedidos_pendentes}`\n"
             f"⏳ Criando checkout: `{pedidos_creating}`\n"
@@ -1910,6 +1985,7 @@ def handle_download(message):
     user = obter_usuario(message.from_user.id)
     vip_status = is_vip_user(user)
     prefix = None
+    controle_download_ativo = False
 
     if not vip_status and user.get("downloads_hoje", 0) >= FREE_DAILY_LIMIT:
         safe_reply_to(
@@ -1923,6 +1999,14 @@ def handle_download(message):
     url = extrair_primeira_url(message.text)
     if not url:
         return safe_reply_to(message, "❌ Não encontrei um link válido na sua mensagem.")
+
+    if not iniciar_controle_download_usuario(message.from_user.id, getattr(message, "date", None)):
+        return safe_reply_to(
+            message,
+            "⏳ Já estou processando seu link anterior. Aguarde concluir para enviar outro."
+        )
+
+    controle_download_ativo = True
 
     status_msg = safe_reply_to(
         message,
@@ -1969,7 +2053,7 @@ def handle_download(message):
             try:
                 arquivo_final = baixar_pinterest_capado(url, prefix)
 
-                enviado = enviar_arquivo_com_fallback(message.chat.id, arquivo_final, plataforma=plataforma)
+                enviado = enviar_arquivo_com_fallback(message.chat.id, arquivo_final)
                 if not enviado:
                     raise Exception("Falha ao enviar arquivo ao Telegram")
 
@@ -2054,7 +2138,7 @@ def handle_download(message):
 
         arquivo_envio = preparar_arquivo_para_envio(arquivo_final, plataforma=plataforma)
 
-        enviado = enviar_arquivo_com_fallback(message.chat.id, arquivo_envio, plataforma=plataforma)
+        enviado = enviar_arquivo_com_fallback(message.chat.id, arquivo_envio)
         if not enviado:
             raise Exception("Falha ao enviar arquivo ao Telegram")
 
@@ -2076,6 +2160,8 @@ def handle_download(message):
     finally:
         if prefix:
             cleanup_prefix(prefix)
+        if controle_download_ativo:
+            finalizar_controle_download_usuario(message.from_user.id)
 
 
 # =========================================
@@ -2296,6 +2382,7 @@ def obter_metricas_health():
         "pending_orders": None,
         "expired_orders": None,
         "paid_orders": None,
+        "downloads_in_progress": contar_downloads_em_andamento(),
     }
 
     try:
@@ -2347,7 +2434,8 @@ def health():
         "active_vips": metricas["active_vips"],
         "pending_orders": metricas["pending_orders"],
         "expired_orders": metricas["expired_orders"],
-        "paid_orders": metricas["paid_orders"]
+        "paid_orders": metricas["paid_orders"],
+        "downloads_in_progress": metricas["downloads_in_progress"]
     }), 200
 
 
