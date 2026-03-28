@@ -1396,20 +1396,30 @@ def zerar_contador(message):
 def processar_aviso_geral(admin_chat_id, msg_texto):
     try:
         usuarios = usuarios_col.find({}, {"_id": 1})
-        cont = 0
+        enviados = 0
+        falhas = 0
 
         logger.info("[AVISOGERAL_LOOP] iniciado")
 
         for u in usuarios:
             try:
-                safe_send_message(int(u["_id"]), msg_texto, parse_mode="Markdown")
-                cont += 1
+                resp = safe_send_message(int(u["_id"]), msg_texto)
+                if resp:
+                    enviados += 1
+                else:
+                    falhas += 1
                 time.sleep(0.05)
-            except Exception:
-                pass
+            except Exception as e:
+                falhas += 1
+                logger.warning(f"[AVISOGERAL_ITEM] user_id={u.get('_id')} erro={e}")
 
-        safe_send_message(admin_chat_id, f"📢 Aviso enviado para {cont} usuários!")
-        logger.info(f"[AVISOGERAL_LOOP] finalizado enviados={cont}")
+        safe_send_message(
+            admin_chat_id,
+            f"📢 Aviso finalizado.
+✅ Enviados: {enviados}
+❌ Falhas: {falhas}"
+        )
+        logger.info(f"[AVISOGERAL_LOOP] finalizado enviados={enviados} falhas={falhas}")
     except Exception as e:
         logger.error(f"[AVISOGERAL_LOOP] erro={e}")
         safe_send_message(admin_chat_id, "❌ Erro ao enviar aviso geral.")
