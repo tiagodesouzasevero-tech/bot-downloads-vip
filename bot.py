@@ -1602,7 +1602,6 @@ def _admin_code(valor, max_len=None):
         return texto[:max_len] + "..."
     return texto
 
-
 def enviar_painel_admin(chat_id):
     try:
         hoje = hoje_str()
@@ -1633,32 +1632,33 @@ def enviar_painel_admin(chat_id):
 
         resumo_admin = (
             "⚙️ *Painel Admin*\n\n"
-            f"🧩 Serviço: `{{_admin_code(SERVICE_NAME, 28)}}`\n"
-            f"🌎 Ambiente: `{{_admin_code(ENVIRONMENT_NAME, 20)}}`\n"
-            f"🆔 Deploy: `{{_admin_code(DEPLOYMENT_ID, 18)}}`\n"
-            f"🔖 Versão: `{{_admin_code(APP_VERSION, 18)}}`\n\n"
-            "*Usuários e uso:*\n"
-            f"👥 Usuários: `{{total_users}}`\n"
-            f"💎 VIPs ativos: `{{vips_ativos}}`\n"
-            f"📥 Downloads hoje: `{{downloads_totais_hoje}}`\n\n"
-            "*Pedidos:*\n"
-            f"🕒 Pendentes: `{{pedidos_pendentes}}`\n"
-            f"⏳ Criando checkout: `{{pedidos_creating}}`\n"
-            f"❌ Checkout com erro: `{{pedidos_checkout_error}}`\n"
-            f"⌛ Expirados: `{{pedidos_expirados}}`\n"
-            f"✅ Pagos: `{{pedidos_pagos}}`\n\n"
-            "*Infra:*\n"
-            f"🗄 Mongo: `{{_admin_code(mongo_status, 28)}}`\n"
-            f"🎬 ffmpeg: `{{'ok' if ffmpeg_disponivel() else 'off'}}`\n"
-            f"🔎 ffprobe: `{{'ok' if ffprobe_disponivel() else 'off'}}`\n\n"
-            "*Config atual:*\n"
-            f"🆓 Limite grátis: `{{FREE_DAILY_LIMIT}}/dia`\n"
-            f"⏱ Duração máx: `{{MAX_DURATION_SECONDS}}s`\n"
-            f"⌛ Expiração pendentes: `{{PENDING_ORDER_EXPIRATION_HOURS}}h`"
+            "*Sistema*\n"
+            f"🧩 Serviço: `{_admin_code(SERVICE_NAME, 28)}`\n"
+            f"🌎 Ambiente: `{_admin_code(ENVIRONMENT_NAME, 20)}`\n"
+            f"🆔 Deploy: `{_admin_code(DEPLOYMENT_ID, 18)}`\n"
+            f"🔖 Versão: `{_admin_code(APP_VERSION, 18)}`\n\n"
+            "*Usuários e uso*\n"
+            f"👥 Usuários: `{total_users}`\n"
+            f"💎 VIPs ativos: `{vips_ativos}`\n"
+            f"📥 Downloads hoje: `{downloads_totais_hoje}`\n\n"
+            "*Pedidos*\n"
+            f"🕒 Pendentes: `{pedidos_pendentes}`\n"
+            f"⏳ Criando checkout: `{pedidos_creating}`\n"
+            f"❌ Checkout com erro: `{pedidos_checkout_error}`\n"
+            f"⌛ Expirados: `{pedidos_expirados}`\n"
+            f"✅ Pagos: `{pedidos_pagos}`\n\n"
+            "*Infra*\n"
+            f"🗄 Mongo: `{_admin_code(mongo_status, 28)}`\n"
+            f"🎬 ffmpeg: `{'ok' if ffmpeg_disponivel() else 'off'}`\n"
+            f"🔎 ffprobe: `{'ok' if ffprobe_disponivel() else 'off'}`\n\n"
+            "*Config atual*\n"
+            f"🆓 Limite grátis: `{FREE_DAILY_LIMIT}/dia`\n"
+            f"⏱ Duração máx: `{MAX_DURATION_SECONDS}s`\n"
+            f"⌛ Expiração pendentes: `{PENDING_ORDER_EXPIRATION_HOURS}h`"
         )
 
         comandos_admin = (
-            "*Comandos:*\n"
+            "*Comandos*\n"
             "• `/admin` ou botão *⚙️ Painel Admin*\n"
             "• `/darvip [ID] [Dias]`\n"
             "• `/zerar [ID]`\n"
