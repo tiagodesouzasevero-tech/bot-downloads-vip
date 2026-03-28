@@ -73,6 +73,7 @@ APP_STARTED_AT = datetime.now(TZ).isoformat()
 FREE_DAILY_LIMIT = 3
 MAX_DURATION_SECONDS = 90
 PENDING_ORDER_EXPIRATION_HOURS = max(1, int(os.environ.get("PENDING_ORDER_EXPIRATION_HOURS", "24")))
+DUPLICATE_LINK_COOLDOWN_SECONDS = max(10, int(os.environ.get("DUPLICATE_LINK_COOLDOWN_SECONDS", "120")))
 
 INSTAGRAM_COOKIES_TEXT = os.environ.get("INSTAGRAM_COOKIES_TEXT", "").strip()
 INSTAGRAM_COOKIEFILE_PATH = None
@@ -102,6 +103,8 @@ class YtDlpQuietLogger:
 
 DOWNLOADS_EM_ANDAMENTO = {}
 DOWNLOADS_EM_ANDAMENTO_LOCK = Lock()
+ULTIMO_LINK_PROCESSADO = {}
+ULTIMO_LINK_PROCESSADO_LOCK = Lock()
 
 # =========================================
 # DB / BOT / APP
@@ -622,6 +625,52 @@ def safe_delete_message(chat_id, message_id):
 def contar_downloads_em_andamento():
     with DOWNLOADS_EM_ANDAMENTO_LOCK:
         return sum(1 for estado in DOWNLOADS_EM_ANDAMENTO.values() if estado.get("active"))
+
+
+def normalizar_url_para_duplicado(url):
+    url = (url or "").strip()
+    if not url:
+        return ""
+    return url.rstrip("/").lower()
+
+
+def bloquear_link_duplicado_recente(user_id, url, cooldown_seconds=DUPLICATE_LINK_COOLDOWN_SECONDS):
+    uid = str(user_id)
+    url_norm = normalizar_url_para_duplicado(url)
+    agora_ts = int(time.time())
+
+    if not url_norm:
+        return False
+
+    with ULTIMO_LINK_PROCESSADO_LOCK:
+        estado = ULTIMO_LINK_PROCESSADO.get(uid) or {}
+        ultima_url = estado.get("url")
+        finished_at = int(estado.get("finished_at") or 0)
+
+        if ultima_url == url_norm and finished_at and (agora_ts - finished_at) < int(cooldown_seconds):
+            restante = int(cooldown_seconds) - (agora_ts - finished_at)
+            logger.info(
+                f"[DUPLICATE_LINK_BLOCK] user_id={uid} cooldown_seconds={cooldown_seconds} remaining={restante} url={url_norm}"
+            )
+            return True
+
+    return False
+
+
+def registrar_link_processado(user_id, url):
+    uid = str(user_id)
+    url_norm = normalizar_url_para_duplicado(url)
+
+    if not url_norm:
+        return
+
+    with ULTIMO_LINK_PROCESSADO_LOCK:
+        ULTIMO_LINK_PROCESSADO[uid] = {
+            "url": url_norm,
+            "finished_at": int(time.time())
+        }
+
+    logger.info(f"[DUPLICATE_LINK_SAVE] user_id={uid} url={url_norm}")
 
 
 def iniciar_controle_download_usuario(user_id, message_date=None):
@@ -2208,6 +2257,12 @@ def handle_download(message):
     if not url:
         return safe_reply_to(message, "❌ Não encontrei um link válido na sua mensagem.")
 
+    if bloquear_link_duplicado_recente(message.from_user.id, url):
+        return safe_reply_to(
+            message,
+            "🔁 Esse mesmo link já foi processado há instantes. Aguarde um pouco antes de enviar novamente."
+        )
+
     if not iniciar_controle_download_usuario(message.from_user.id, getattr(message, "date", None)):
         return safe_reply_to(
             message,
@@ -2267,6 +2322,8 @@ def handle_download(message):
 
                 if not vip_status:
                     incrementar_download_gratis(user, message.chat.id, message.from_user.id)
+
+                registrar_link_processado(message.from_user.id, url)
 
                 if status_msg:
                     safe_delete_message(message.chat.id, status_msg.message_id)
@@ -2352,6 +2409,8 @@ def handle_download(message):
 
         if not vip_status:
             incrementar_download_gratis(user, message.chat.id, message.from_user.id)
+
+        registrar_link_processado(message.from_user.id, url)
 
         if status_msg:
             safe_delete_message(message.chat.id, status_msg.message_id)
