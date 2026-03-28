@@ -12,6 +12,7 @@ import requests
 import telebot
 import yt_dlp
 import subprocess
+import json
 
 from flask import Flask, request, jsonify
 from telebot import types
@@ -1096,6 +1097,197 @@ def mostrar_planos_chat(chat_id, user_id):
     safe_send_message(chat_id, texto, parse_mode="Markdown", reply_markup=markup)
 
 
+
+def serializar_para_json(valor):
+    if isinstance(valor, datetime):
+        return valor.isoformat()
+
+    if isinstance(valor, dict):
+        return {str(k): serializar_para_json(v) for k, v in valor.items()}
+
+    if isinstance(valor, list):
+        return [serializar_para_json(v) for v in valor]
+
+    if isinstance(valor, tuple):
+        return [serializar_para_json(v) for v in valor]
+
+    if isinstance(valor, (str, int, float, bool)) or valor is None:
+        return valor
+
+    return str(valor)
+
+
+def construir_payload_backup(nome, documentos):
+    docs_serializados = [serializar_para_json(doc) for doc in documentos]
+    return {
+        "generated_at": agora_tz().isoformat(),
+        "service": SERVICE_NAME,
+        "environment": ENVIRONMENT_NAME,
+        "backup_type": nome,
+        "count": len(docs_serializados),
+        "documents": docs_serializados,
+    }
+
+
+def salvar_backup_json(nome_arquivo_base, payload):
+    timestamp = agora_tz().strftime("%Y%m%d_%H%M%S")
+    caminho = os.path.join(DOWNLOAD_DIR, f"{nome_arquivo_base}_{timestamp}.json")
+
+    with open(caminho, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+    return caminho
+
+
+def enviar_documento_privado_admin(caminho_arquivo, legenda=None):
+    with open(caminho_arquivo, "rb") as f:
+        bot.send_document(ADMIN_ID, f, caption=legenda)
+
+
+def consultar_docs_backup(tipo):
+    hoje = hoje_str()
+
+    if tipo == "usuarios":
+        docs = list(
+            usuarios_col.find(
+                {},
+                {"_id": 1, "vip_ate": 1, "downloads_hoje": 1, "ultima_data": 1}
+            ).sort("_id", 1)
+        )
+        return docs, "backup_usuarios", "📦 Backup de usuários gerado"
+
+    if tipo == "vips":
+        docs = list(
+            usuarios_col.find(
+                {
+                    "$or": [
+                        {"vip_ate": "Vitalício"},
+                        {"vip_ate": {"$gte": hoje}}
+                    ]
+                },
+                {"_id": 1, "vip_ate": 1, "downloads_hoje": 1, "ultima_data": 1}
+            ).sort("vip_ate", -1)
+        )
+        return docs, "backup_vips_ativos", "💎 Backup de VIPs ativos gerado"
+
+    if tipo == "pedidos":
+        docs = list(
+            pedidos_col.find(
+                {},
+                {
+                    "_id": 0,
+                    "order_nsu": 1,
+                    "user_id": 1,
+                    "plano_key": 1,
+                    "plano_nome": 1,
+                    "valor_centavos": 1,
+                    "status": 1,
+                    "created_at": 1,
+                    "paid_at": 1,
+                    "transaction_nsu": 1,
+                    "receipt_url": 1,
+                    "capture_method": 1,
+                    "vip_liberado_ate": 1,
+                    "checkout_url": 1,
+                }
+            ).sort("created_at", -1)
+        )
+        return docs, "backup_pedidos", "🧾 Backup de pedidos gerado"
+
+    if tipo == "geral":
+        usuarios_docs = list(
+            usuarios_col.find(
+                {},
+                {"_id": 1, "vip_ate": 1, "downloads_hoje": 1, "ultima_data": 1}
+            ).sort("_id", 1)
+        )
+        vips_docs = list(
+            usuarios_col.find(
+                {
+                    "$or": [
+                        {"vip_ate": "Vitalício"},
+                        {"vip_ate": {"$gte": hoje}}
+                    ]
+                },
+                {"_id": 1, "vip_ate": 1, "downloads_hoje": 1, "ultima_data": 1}
+            ).sort("vip_ate", -1)
+        )
+        pedidos_docs = list(
+            pedidos_col.find(
+                {},
+                {
+                    "_id": 0,
+                    "order_nsu": 1,
+                    "user_id": 1,
+                    "plano_key": 1,
+                    "plano_nome": 1,
+                    "valor_centavos": 1,
+                    "status": 1,
+                    "created_at": 1,
+                    "paid_at": 1,
+                    "transaction_nsu": 1,
+                    "receipt_url": 1,
+                    "capture_method": 1,
+                    "vip_liberado_ate": 1,
+                    "checkout_url": 1,
+                }
+            ).sort("created_at", -1)
+        )
+        payload = {
+            "generated_at": agora_tz().isoformat(),
+            "service": SERVICE_NAME,
+            "environment": ENVIRONMENT_NAME,
+            "backup_type": "geral",
+            "usuarios_count": len(usuarios_docs),
+            "vips_ativos_count": len(vips_docs),
+            "pedidos_count": len(pedidos_docs),
+            "usuarios": [serializar_para_json(doc) for doc in usuarios_docs],
+            "vips_ativos": [serializar_para_json(doc) for doc in vips_docs],
+            "pedidos": [serializar_para_json(doc) for doc in pedidos_docs],
+        }
+        return payload, "backup_geral", "🗂 Backup geral gerado"
+
+    raise ValueError("Tipo de backup inválido")
+
+
+def processar_backup_admin(tipo, origem_chat_id=None):
+    caminho_arquivo = None
+    try:
+        resultado, nome_base, legenda = consultar_docs_backup(tipo)
+
+        if tipo == "geral":
+            payload = resultado
+            total = (
+                int(payload.get("usuarios_count", 0))
+                + int(payload.get("vips_ativos_count", 0))
+                + int(payload.get("pedidos_count", 0))
+            )
+        else:
+            documentos = resultado
+            payload = construir_payload_backup(tipo, documentos)
+            total = payload["count"]
+
+        caminho_arquivo = salvar_backup_json(nome_base, payload)
+        enviar_documento_privado_admin(caminho_arquivo, legenda=f"{legenda} | registros: {total}")
+
+        mensagem_ok = f"✅ {legenda} e enviado no seu privado. Registros: {total}"
+        safe_send_message(ADMIN_ID, mensagem_ok)
+
+        if origem_chat_id and origem_chat_id != ADMIN_ID:
+            safe_send_message(origem_chat_id, "✅ Backup gerado e enviado no privado do ADM.")
+    except Exception as e:
+        logger.error(f"[BACKUP_ADMIN] tipo={tipo} erro={e}")
+        safe_send_message(ADMIN_ID, f"❌ Erro ao gerar backup `{tipo}`.", parse_mode="Markdown")
+        if origem_chat_id and origem_chat_id != ADMIN_ID:
+            safe_send_message(origem_chat_id, "❌ Erro ao gerar backup do ADM.")
+    finally:
+        if caminho_arquivo and os.path.exists(caminho_arquivo):
+            try:
+                os.remove(caminho_arquivo)
+            except Exception as e:
+                logger.warning(f"[BACKUP_ADMIN_CLEANUP] arquivo={caminho_arquivo} erro={e}")
+
+
 # =========================================
 # COMANDOS ADMIN
 # =========================================
@@ -1222,6 +1414,62 @@ def aviso_geral(message):
         safe_reply_to(message, "❌ Erro ao iniciar aviso geral.")
 
 
+@bot.message_handler(commands=["backupusuarios"])
+def backup_usuarios(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    Thread(
+        target=processar_backup_admin,
+        args=("usuarios", message.chat.id),
+        daemon=True
+    ).start()
+
+    safe_reply_to(message, "📦 Gerando backup de usuários e enviando no seu privado...")
+
+
+@bot.message_handler(commands=["backupvips"])
+def backup_vips(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    Thread(
+        target=processar_backup_admin,
+        args=("vips", message.chat.id),
+        daemon=True
+    ).start()
+
+    safe_reply_to(message, "💎 Gerando backup de VIPs ativos e enviando no seu privado...")
+
+
+@bot.message_handler(commands=["backuppedidos"])
+def backup_pedidos(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    Thread(
+        target=processar_backup_admin,
+        args=("pedidos", message.chat.id),
+        daemon=True
+    ).start()
+
+    safe_reply_to(message, "🧾 Gerando backup de pedidos e enviando no seu privado...")
+
+
+@bot.message_handler(commands=["backupgeral"])
+def backup_geral(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    Thread(
+        target=processar_backup_admin,
+        args=("geral", message.chat.id),
+        daemon=True
+    ).start()
+
+    safe_reply_to(message, "🗂 Gerando backup geral e enviando no seu privado...")
+
+
 @bot.message_handler(func=lambda m: m.text == "⚙️ Painel Admin")
 def painel_admin(message):
     if message.from_user.id != ADMIN_ID:
@@ -1255,7 +1503,11 @@ def painel_admin(message):
             "🚀 *COMANDOS DISPONÍVEIS:*\n"
             "• `/darvip [ID] [Dias]`\n"
             "• `/zerar [ID]`\n"
-            "• `/avisogeral [Mensagem]`"
+            "• `/avisogeral [Mensagem]`\n"
+            "• `/backupusuarios`\n"
+            "• `/backupvips`\n"
+            "• `/backuppedidos`\n"
+            "• `/backupgeral`"
         )
 
         safe_send_message(message.chat.id, texto_admin, parse_mode="Markdown")
