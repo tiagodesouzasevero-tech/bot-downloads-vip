@@ -1054,6 +1054,45 @@ def _escape_md(texto):
     return texto
 
 
+def formatar_valor_centavos(valor_centavos):
+    try:
+        valor = int(valor_centavos or 0) / 100
+        return f"R$ {valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    except Exception:
+        return str(valor_centavos)
+
+
+def formatar_data_admin(valor):
+    if not valor:
+        return "-"
+
+    if isinstance(valor, str):
+        return valor
+
+    try:
+        if isinstance(valor, datetime):
+            if valor.tzinfo is None:
+                valor = valor.replace(tzinfo=TZ)
+            else:
+                valor = valor.astimezone(TZ)
+            return valor.strftime("%d/%m/%Y %H:%M:%S")
+    except Exception:
+        pass
+
+    return str(valor)
+
+
+def formatar_status_pedido(status):
+    mapa = {
+        "pending": "pendente",
+        "paid": "pago",
+        "expired": "expirado",
+        "checkout_error": "erro no checkout",
+        "creating": "criando checkout",
+    }
+    return mapa.get(str(status or "").strip().lower(), str(status or "-"))
+
+
 def notificar_admin_privado(texto):
     try:
         safe_send_message(ADMIN_ID, texto, parse_mode="Markdown", disable_web_page_preview=True)
@@ -1731,10 +1770,12 @@ def enviar_painel_admin(chat_id):
             f"⏱ Duração máx: `{MAX_DURATION_SECONDS}s`\n"
             f"⌛ Expiração pendentes: `{PENDING_ORDER_EXPIRATION_HOURS}h`"
         )
-
         comandos_admin = (
             "*Comandos*\n"
             "• `/admin` ou botão *⚙️ Painel Admin*\n"
+            "• `/stats`\n"
+            "• `/pedido [ORDER_NSU]`\n"
+            "• `/user [ID]`\n"
             "• `/darvip [ID] [Dias]`\n"
             "• `/zerar [ID]`\n"
             "• `/avisogeral [Mensagem]`\n"
@@ -1764,6 +1805,173 @@ def painel_admin(message):
         return
     enviar_painel_admin(message.chat.id)
 
+
+@bot.message_handler(commands=["stats"])
+def admin_stats(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    try:
+        hoje = hoje_str()
+        total_users = usuarios_col.count_documents({})
+        vips_ativos = usuarios_col.count_documents({
+            "$or": [
+                {"vip_ate": "Vitalício"},
+                {"vip_ate": {"$gte": hoje}}
+            ]
+        })
+
+        pipeline = [{"$group": {"_id": None, "total": {"$sum": "$downloads_hoje"}}}]
+        res_downloads = list(usuarios_col.aggregate(pipeline))
+        downloads_totais_hoje = res_downloads[0]["total"] if res_downloads else 0
+
+        pedidos_pendentes = pedidos_col.count_documents({"status": "pending"})
+        pedidos_pagos = pedidos_col.count_documents({"status": "paid"})
+        pedidos_expirados = pedidos_col.count_documents({"status": "expired"})
+        pedidos_checkout_error = pedidos_col.count_documents({"status": "checkout_error"})
+        pedidos_creating = pedidos_col.count_documents({"status": "creating"})
+        downloads_em_andamento = contar_downloads_em_andamento()
+
+        mongo_status = "ok"
+        try:
+            client.admin.command("ping")
+        except Exception as e:
+            mongo_status = f"erro: {str(e)[:80]}"
+
+        texto = (
+            "📊 *Stats rápidas*\n\n"
+            f"👥 Usuários: `{total_users}`\n"
+            f"💎 VIPs ativos: `{vips_ativos}`\n"
+            f"📥 Downloads hoje: `{downloads_totais_hoje}`\n"
+            f"🚦 Em andamento: `{downloads_em_andamento}`\n\n"
+            "💳 *Pedidos*\n"
+            f"🕒 Pendentes: `{pedidos_pendentes}`\n"
+            f"⏳ Criando checkout: `{pedidos_creating}`\n"
+            f"❌ Checkout com erro: `{pedidos_checkout_error}`\n"
+            f"⌛ Expirados: `{pedidos_expirados}`\n"
+            f"✅ Pagos: `{pedidos_pagos}`\n\n"
+            "🖥 *Infra*\n"
+            f"🗄 Mongo: `{_admin_code(mongo_status, 28)}`\n"
+            f"🎬 ffmpeg: `{'ok' if ffmpeg_disponivel() else 'off'}`\n"
+            f"🔎 ffprobe: `{'ok' if ffprobe_disponivel() else 'off'}`"
+        )
+
+        safe_send_message(message.chat.id, texto, parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"[ADMIN_STATS] erro={e}")
+        safe_send_message(message.chat.id, "❌ Erro ao consultar stats.")
+
+
+@bot.message_handler(commands=["pedido"])
+def admin_pedido(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    try:
+        args = message.text.split(maxsplit=1)
+        if len(args) < 2 or not args[1].strip():
+            return safe_reply_to(message, "❌ Use: `/pedido ORDER_NSU`", parse_mode="Markdown")
+
+        order_nsu = args[1].strip()
+        pedido = pedidos_col.find_one({"order_nsu": order_nsu})
+
+        if not pedido:
+            return safe_send_message(message.chat.id, "❌ Pedido não encontrado.")
+
+        markup = None
+        links = []
+        if pedido.get("checkout_url"):
+            links.append(types.InlineKeyboardButton("💳 Checkout", url=pedido["checkout_url"]))
+        if pedido.get("receipt_url"):
+            links.append(types.InlineKeyboardButton("🧾 Comprovante", url=pedido["receipt_url"]))
+        if links:
+            markup = types.InlineKeyboardMarkup(row_width=2)
+            markup.add(*links)
+
+        texto = (
+            "🧾 *Consulta de pedido*\n\n"
+            f"🔖 NSU: `{_admin_code(pedido.get('order_nsu'), 64)}`\n"
+            f"👤 Usuário: `{_admin_code(pedido.get('user_id'), 24)}`\n"
+            f"💳 Plano: *{_escape_md(pedido.get('plano_nome') or '-')}*\n"
+            f"💰 Valor: *{_escape_md(formatar_valor_centavos(pedido.get('valor_centavos')))}*\n"
+            f"📌 Status: *{_escape_md(formatar_status_pedido(pedido.get('status')))}*\n"
+            f"🕒 Criado em: `{_admin_code(formatar_data_admin(pedido.get('created_at')), 24)}`\n"
+            f"✅ Pago em: `{_admin_code(formatar_data_admin(pedido.get('paid_at')), 24)}`\n"
+            f"🔁 Transação: `{_admin_code(pedido.get('transaction_nsu') or '-', 32)}`\n"
+            f"💎 VIP liberado até: `{_admin_code(pedido.get('vip_liberado_ate') or '-', 24)}`\n"
+            f"⌛ Expirado em: `{_admin_code(formatar_data_admin(pedido.get('expired_at')), 24)}`\n"
+            f"⚙️ Forma: `{_admin_code(pedido.get('capture_method') or '-', 24)}`"
+        )
+
+        safe_send_message(message.chat.id, texto, parse_mode="Markdown", reply_markup=markup)
+    except Exception as e:
+        logger.error(f"[ADMIN_PEDIDO] erro={e}")
+        safe_send_message(message.chat.id, "❌ Erro ao consultar pedido.")
+
+
+@bot.message_handler(commands=["user"])
+def admin_user(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    try:
+        args = message.text.split(maxsplit=1)
+        if len(args) < 2 or not args[1].strip():
+            return safe_reply_to(message, "❌ Use: `/user ID`", parse_mode="Markdown")
+
+        alvo_id = args[1].strip()
+        user_bruto = usuarios_col.find_one({"_id": str(alvo_id)})
+        if not user_bruto:
+            return safe_send_message(message.chat.id, "❌ Usuário não encontrado.")
+
+        user = obter_usuario(alvo_id)
+        vip = is_vip_user(user)
+
+        pedidos_usuario = list(
+            pedidos_col.find(
+                {"user_id": str(alvo_id)},
+                {
+                    "_id": 0,
+                    "order_nsu": 1,
+                    "plano_nome": 1,
+                    "valor_centavos": 1,
+                    "status": 1,
+                    "created_at": 1,
+                    "vip_liberado_ate": 1,
+                }
+            ).sort("created_at", -1).limit(5)
+        )
+
+        if pedidos_usuario:
+            linhas_pedidos = []
+            for pedido in pedidos_usuario:
+                linhas_pedidos.append(
+                    "• "
+                    f"`{_admin_code(pedido.get('order_nsu') or '-', 18)}` | "
+                    f"*{_escape_md(formatar_status_pedido(pedido.get('status')))}* | "
+                    f"{_escape_md(pedido.get('plano_nome') or '-')} | "
+                    f"{_escape_md(formatar_valor_centavos(pedido.get('valor_centavos')))} | "
+                    f"`{_admin_code(formatar_data_admin(pedido.get('created_at')), 16)}`"
+                )
+            resumo_pedidos = "\n".join(linhas_pedidos)
+        else:
+            resumo_pedidos = "Nenhum pedido encontrado."
+
+        texto = (
+            "👤 *Consulta de usuário*\n\n"
+            f"🆔 ID: `{_admin_code(alvo_id, 24)}`\n"
+            f"💎 VIP ativo: *{'sim' if vip else 'não'}*\n"
+            f"📅 VIP até: `{_admin_code(user.get('vip_ate') or '-', 24)}`\n"
+            f"📥 Downloads hoje: `{int(user.get('downloads_hoje', 0) or 0)}`\n"
+            f"🗓 Última data: `{_admin_code(user.get('ultima_data') or '-', 16)}`\n\n"
+            "🧾 *Últimos pedidos*\n"
+            f"{resumo_pedidos}"
+        )
+
+        safe_send_message(message.chat.id, texto, parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"[ADMIN_USER] erro={e}")
+        safe_send_message(message.chat.id, "❌ Erro ao consultar usuário.")
 
 
 # =========================================
