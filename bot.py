@@ -74,6 +74,7 @@ FREE_DAILY_LIMIT = 3
 MAX_DURATION_SECONDS = 90
 
 INSTAGRAM_COOKIES_TEXT = os.environ.get("INSTAGRAM_COOKIES_TEXT", "").strip()
+INSTAGRAM_COOKIEFILE_PATH = None
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
@@ -669,12 +670,34 @@ def nome_plataforma(is_pinterest, is_tiktok, is_instagram, is_rednote):
 
 
 def get_instagram_cookiefile():
-    if INSTAGRAM_COOKIES_TEXT:
-        cookie_path = os.path.join(DOWNLOAD_DIR, "instagram_cookies.txt")
+    global INSTAGRAM_COOKIEFILE_PATH
+
+    if not INSTAGRAM_COOKIES_TEXT:
+        return None
+
+    cookie_path = os.path.join(DOWNLOAD_DIR, "instagram_cookies.txt")
+
+    if INSTAGRAM_COOKIEFILE_PATH and os.path.exists(INSTAGRAM_COOKIEFILE_PATH):
+        return INSTAGRAM_COOKIEFILE_PATH
+
+    precisa_escrever = True
+
+    if os.path.exists(cookie_path):
+        try:
+            with open(cookie_path, "r", encoding="utf-8") as f:
+                conteudo_atual = f.read()
+            if conteudo_atual == INSTAGRAM_COOKIES_TEXT:
+                precisa_escrever = False
+        except Exception as e:
+            logger.warning(f"[INSTAGRAM_COOKIEFILE_READ] erro={e}")
+
+    if precisa_escrever:
         with open(cookie_path, "w", encoding="utf-8", newline="\n") as f:
             f.write(INSTAGRAM_COOKIES_TEXT)
-        return cookie_path
-    return None
+        logger.info("[INSTAGRAM_COOKIEFILE] arquivo de cookies atualizado")
+
+    INSTAGRAM_COOKIEFILE_PATH = cookie_path
+    return cookie_path
 
 
 def montar_info_opts(is_instagram=False, is_pinterest=False):
