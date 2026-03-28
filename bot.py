@@ -722,6 +722,9 @@ def aplicar_silencio_ytdlp(opts):
 def montar_info_opts(is_instagram=False, is_pinterest=False):
     opts = {
         "quiet": True,
+        "no_warnings": True,
+        "noprogress": True,
+        "verbose": False,
         "nocheckcertificate": True,
         "noplaylist": True,
         "socket_timeout": 20,
@@ -736,7 +739,7 @@ def montar_info_opts(is_instagram=False, is_pinterest=False):
     elif is_pinterest:
         opts["http_headers"] = PINTEREST_HEADERS
 
-    return opts
+    return aplicar_silencio_ytdlp(opts)
 
 
 def montar_download_opts(prefix, is_instagram=False, is_pinterest=False):
@@ -744,6 +747,9 @@ def montar_download_opts(prefix, is_instagram=False, is_pinterest=False):
         "outtmpl": f"{prefix}.%(ext)s",
         "nocheckcertificate": True,
         "quiet": True,
+        "no_warnings": True,
+        "noprogress": True,
+        "verbose": False,
         "noplaylist": True,
         "merge_output_format": "mp4",
         "retries": 2,
@@ -760,7 +766,7 @@ def montar_download_opts(prefix, is_instagram=False, is_pinterest=False):
     elif is_pinterest:
         opts["http_headers"] = PINTEREST_HEADERS
 
-    return opts
+    return aplicar_silencio_ytdlp(opts)
 
 
 def mapear_erro_download(err_text, plataforma="geral"):
