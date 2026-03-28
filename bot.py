@@ -1612,6 +1612,8 @@ def suporte(message):
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("pay_"))
 def checkout_automatico(call):
+    order_nsu = None
+
     try:
         valor = call.data.split("_", 1)[1]
         plano = obter_plano_por_callback(valor)
@@ -1628,11 +1630,12 @@ def checkout_automatico(call):
             "plano_key": valor,
             "plano_nome": plano["nome"],
             "valor_centavos": int(plano["preco_centavos"]),
-            "status": "pending",
+            "status": "creating",
             "created_at": agora_tz(),
             "checkout_url": None,
             "transaction_nsu": None,
-            "receipt_url": None
+            "receipt_url": None,
+            "checkout_error": None
         }
 
         pedidos_col.insert_one(pedido)
@@ -1641,7 +1644,14 @@ def checkout_automatico(call):
 
         pedidos_col.update_one(
             {"order_nsu": order_nsu},
-            {"$set": {"checkout_url": checkout_url}}
+            {
+                "$set": {
+                    "status": "pending",
+                    "checkout_url": checkout_url,
+                    "checkout_created_at": agora_tz(),
+                    "checkout_error": None
+                }
+            }
         )
 
         markup = types.InlineKeyboardMarkup()
@@ -1663,6 +1673,22 @@ def checkout_automatico(call):
 
     except Exception as e:
         logger.error(f"[CHECKOUT_CALLBACK] erro={e}")
+
+        if order_nsu:
+            try:
+                pedidos_col.update_one(
+                    {"order_nsu": order_nsu},
+                    {
+                        "$set": {
+                            "status": "checkout_error",
+                            "checkout_error": str(e)[:500],
+                            "checkout_error_at": agora_tz()
+                        }
+                    }
+                )
+            except Exception as e2:
+                logger.error(f"[CHECKOUT_CALLBACK_UPDATE_ERROR] order_nsu={order_nsu} erro={e2}")
+
         safe_send_message(
             call.message.chat.id,
             "❌ Não consegui gerar seu link de pagamento agora.\n"
