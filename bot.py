@@ -70,7 +70,7 @@ ENVIRONMENT_NAME = get_first_env(
 )
 APP_STARTED_AT = datetime.now(TZ).isoformat()
 
-FREE_DAILY_LIMIT = 5
+FREE_DAILY_LIMIT = 3
 MAX_DURATION_SECONDS = 90
 
 INSTAGRAM_COOKIES_TEXT = os.environ.get("INSTAGRAM_COOKIES_TEXT", "").strip()
@@ -140,15 +140,15 @@ PLANOS = {
         "dias": 30,
         "descricao": "VIP Mensal 30 dias"
     },
-    "69.90": {
+    "79.90": {
         "nome": "VIP Anual",
-        "preco_centavos": 6990,
+        "preco_centavos": 7990,
         "dias": 365,
         "descricao": "VIP Anual 365 dias"
     },
-    "197.00": {
+    "297.00": {
         "nome": "VIP Vitalício",
-        "preco_centavos": 19700,
+        "preco_centavos": 29700,
         "dias": None,
         "descricao": "VIP Vitalício",
         "vitalicio": True
@@ -1080,8 +1080,8 @@ def mostrar_planos_chat(chat_id, user_id):
     markup = types.InlineKeyboardMarkup(row_width=1)
     markup.add(
         types.InlineKeyboardButton("💳 VIP Mensal - R$ 10,00", callback_data="pay_10.00"),
-        types.InlineKeyboardButton("💳 VIP Anual - R$ 69,90", callback_data="pay_69.90"),
-        types.InlineKeyboardButton("💎 VIP Vitalício - R$ 197,00", callback_data="pay_197.00")
+        types.InlineKeyboardButton("💳 VIP Anual - R$ 79,90", callback_data="pay_79.90"),
+        types.InlineKeyboardButton("💎 VIP Vitalício - R$ 297,00", callback_data="pay_297.00")
     )
 
     texto = (
