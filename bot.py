@@ -621,42 +621,70 @@ def safe_answer_callback(call_id):
         logger.warning(f"[CALLBACK_ANSWER] erro={e}")
 
 
-def enviar_arquivo_com_fallback(chat_id, arquivo):
+def enviar_arquivo_com_fallback(chat_id, arquivo, plataforma=None):
+    info = obter_info_midia(arquivo)
+    arquivo_fallback = None
+
     try:
         with open(arquivo, "rb") as f:
             bot.send_video(chat_id, f, caption="👉 Download concluído! Aqui está seu vídeo 👊")
+
+        logger.info(
+            f"[SEND_VIDEO_OK] plataforma={plataforma} modo=video_direto arquivo={arquivo} "
+            f"width={(info or {}).get('width')} height={(info or {}).get('height')} "
+            f"fps={(info or {}).get('fps')} vcodec={(info or {}).get('vcodec')} "
+            f"acodec={(info or {}).get('acodec')}"
+        )
         return True
     except Exception as e_video:
-        logger.warning(f"[SEND_VIDEO] Falhou no envio como vídeo. arquivo={arquivo} erro={e_video}")
-
-    info = obter_info_midia(arquivo)
-    arquivo_fallback = None
+        logger.warning(
+            f"[SEND_VIDEO_FAIL] plataforma={plataforma} modo=video_direto arquivo={arquivo} "
+            f"width={(info or {}).get('width')} height={(info or {}).get('height')} "
+            f"fps={(info or {}).get('fps')} vcodec={(info or {}).get('vcodec')} erro={e_video}"
+        )
 
     if arquivo_tem_codec_hevc(arquivo, info):
         try:
             logger.info(
-                f"[SEND_VIDEO] Tentando fallback automático HEVC -> H.264 | arquivo={arquivo} "
+                f"[SEND_VIDEO] Tentando fallback automático HEVC -> H.264 | plataforma={plataforma} arquivo={arquivo} "
                 f"width={(info or {}).get('width')} height={(info or {}).get('height')} "
                 f"fps={(info or {}).get('fps')} vcodec={(info or {}).get('vcodec')}"
             )
             arquivo_fallback = converter_para_h264_compativel(arquivo, info)
+            info_fallback = obter_info_midia(arquivo_fallback)
 
             with open(arquivo_fallback, "rb") as f:
                 bot.send_video(chat_id, f, caption="👉 Download concluído! Aqui está seu vídeo 👊")
 
-            logger.info(f"[SEND_VIDEO] Fallback H.264 enviado com sucesso | arquivo={arquivo_fallback}")
+            logger.info(
+                f"[SEND_VIDEO_OK] plataforma={plataforma} modo=fallback_h264 arquivo_original={arquivo} "
+                f"arquivo_enviado={arquivo_fallback} width={(info_fallback or {}).get('width')} "
+                f"height={(info_fallback or {}).get('height')} fps={(info_fallback or {}).get('fps')} "
+                f"vcodec={(info_fallback or {}).get('vcodec')} acodec={(info_fallback or {}).get('acodec')}"
+            )
             return True
         except Exception as e_h264:
-            logger.warning(f"[SEND_VIDEO] Fallback H.264 também falhou. erro={e_h264}")
+            logger.warning(f"[SEND_VIDEO] Fallback H.264 também falhou. plataforma={plataforma} erro={e_h264}")
 
     alvo_documento = arquivo_fallback if arquivo_fallback and os.path.exists(arquivo_fallback) else arquivo
+    origem_documento = "fallback_h264" if alvo_documento == arquivo_fallback and arquivo_fallback else "arquivo_original"
+    info_documento = obter_info_midia(alvo_documento)
 
     try:
         with open(alvo_documento, "rb") as f:
             bot.send_document(chat_id, f, caption="👉 Download concluído! Aqui está seu arquivo 👊")
+
+        logger.info(
+            f"[SEND_DOCUMENT_OK] plataforma={plataforma} origem={origem_documento} arquivo={alvo_documento} "
+            f"width={(info_documento or {}).get('width')} height={(info_documento or {}).get('height')} "
+            f"fps={(info_documento or {}).get('fps')} vcodec={(info_documento or {}).get('vcodec')} "
+            f"acodec={(info_documento or {}).get('acodec')}"
+        )
         return True
     except Exception as e_doc:
-        logger.error(f"[SEND_DOCUMENT] Também falhou. erro={e_doc}")
+        logger.error(
+            f"[SEND_DOCUMENT_FAIL] plataforma={plataforma} origem={origem_documento} arquivo={alvo_documento} erro={e_doc}"
+        )
         return False
 
 
@@ -1854,7 +1882,7 @@ def handle_download(message):
             try:
                 arquivo_final = baixar_pinterest_capado(url, prefix)
 
-                enviado = enviar_arquivo_com_fallback(message.chat.id, arquivo_final)
+                enviado = enviar_arquivo_com_fallback(message.chat.id, arquivo_final, plataforma=plataforma)
                 if not enviado:
                     raise Exception("Falha ao enviar arquivo ao Telegram")
 
@@ -1939,7 +1967,7 @@ def handle_download(message):
 
         arquivo_envio = preparar_arquivo_para_envio(arquivo_final, plataforma=plataforma)
 
-        enviado = enviar_arquivo_com_fallback(message.chat.id, arquivo_envio)
+        enviado = enviar_arquivo_com_fallback(message.chat.id, arquivo_envio, plataforma=plataforma)
         if not enviado:
             raise Exception("Falha ao enviar arquivo ao Telegram")
 
