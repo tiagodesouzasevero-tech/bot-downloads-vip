@@ -72,6 +72,7 @@ APP_STARTED_AT = datetime.now(TZ).isoformat()
 
 FREE_DAILY_LIMIT = 3
 MAX_DURATION_SECONDS = 90
+PENDING_ORDER_EXPIRATION_HOURS = max(1, int(os.environ.get("PENDING_ORDER_EXPIRATION_HOURS", "24")))
 
 INSTAGRAM_COOKIES_TEXT = os.environ.get("INSTAGRAM_COOKIES_TEXT", "").strip()
 INSTAGRAM_COOKIEFILE_PATH = None
@@ -1011,6 +1012,48 @@ def montar_texto_admin_webhook(status, order_nsu=None, user_id=None, plano_nome=
     return "\n".join(linhas)
 
 
+def expirar_pedidos_antigos(expiration_hours=PENDING_ORDER_EXPIRATION_HOURS):
+    try:
+        limite = agora_tz() - timedelta(hours=max(1, int(expiration_hours)))
+        filtro = {
+            "status": {"$in": ["pending", "creating"]},
+            "created_at": {"$lt": limite}
+        }
+        atualizacao = {
+            "$set": {
+                "status": "expired",
+                "expired_at": agora_tz(),
+                "expired_reason": f"timeout_{int(expiration_hours)}h"
+            }
+        }
+
+        resultado = pedidos_col.update_many(filtro, atualizacao)
+
+        if resultado.modified_count:
+            logger.info(
+                f"[PEDIDOS_EXPIRED] expirados={resultado.modified_count} limite_horas={int(expiration_hours)}"
+            )
+
+        return resultado.modified_count
+    except Exception as e:
+        logger.warning(f"[PEDIDOS_EXPIRED] erro={e}")
+        return 0
+
+
+def loop_expirar_pedidos_antigos(interval_minutes=60, expiration_hours=PENDING_ORDER_EXPIRATION_HOURS):
+    intervalo_segundos = max(300, int(interval_minutes * 60))
+    logger.info(
+        f"[PEDIDOS_EXPIRED_LOOP] iniciado interval_minutes={interval_minutes} expiration_hours={int(expiration_hours)}"
+    )
+
+    while True:
+        try:
+            expirar_pedidos_antigos(expiration_hours=expiration_hours)
+        except Exception as e:
+            logger.warning(f"[PEDIDOS_EXPIRED_LOOP] erro={e}")
+        time.sleep(intervalo_segundos)
+
+
 # =========================================
 # USUÁRIO / VIP
 # =========================================
@@ -1575,6 +1618,7 @@ def painel_admin(message):
 
         pedidos_pendentes = pedidos_col.count_documents({"status": "pending"})
         pedidos_pagos = pedidos_col.count_documents({"status": "paid"})
+        pedidos_expirados = pedidos_col.count_documents({"status": "expired"})
 
         resumo_admin = (
             "⚙️ *Painel Admin*\n\n"
@@ -1582,6 +1626,7 @@ def painel_admin(message):
             f"💎 VIPs: `{vips_ativos}`\n"
             f"📥 Downloads hoje: `{downloads_totais_hoje}`\n"
             f"🕒 Pendentes: `{pedidos_pendentes}`\n"
+            f"⌛ Expirados: `{pedidos_expirados}`\n"
             f"✅ Pagos: `{pedidos_pagos}`"
         )
 
@@ -2207,6 +2252,7 @@ def obter_metricas_health():
         "users_total": None,
         "active_vips": None,
         "pending_orders": None,
+        "expired_orders": None,
         "paid_orders": None,
     }
 
@@ -2223,6 +2269,7 @@ def obter_metricas_health():
             ]
         })
         metricas["pending_orders"] = pedidos_col.count_documents({"status": "pending"})
+        metricas["expired_orders"] = pedidos_col.count_documents({"status": "expired"})
         metricas["paid_orders"] = pedidos_col.count_documents({"status": "paid"})
     except Exception as e:
         metricas["mongo_status"] = f"error: {str(e)[:150]}"
@@ -2257,6 +2304,7 @@ def health():
         "users_total": metricas["users_total"],
         "active_vips": metricas["active_vips"],
         "pending_orders": metricas["pending_orders"],
+        "expired_orders": metricas["expired_orders"],
         "paid_orders": metricas["paid_orders"]
     }), 200
 
@@ -2266,10 +2314,17 @@ def health():
 # =========================================
 if __name__ == "__main__":
     cleanup_download_dir_old_files(max_age_hours=6)
+    expirar_pedidos_antigos(expiration_hours=PENDING_ORDER_EXPIRATION_HOURS)
 
     Thread(
         target=cleanup_download_dir_periodicamente,
         kwargs={"interval_minutes": 60, "max_age_hours": 6},
+        daemon=True
+    ).start()
+
+    Thread(
+        target=loop_expirar_pedidos_antigos,
+        kwargs={"interval_minutes": 60, "expiration_hours": PENDING_ORDER_EXPIRATION_HOURS},
         daemon=True
     ).start()
 
