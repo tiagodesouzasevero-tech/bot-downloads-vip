@@ -74,6 +74,7 @@ FREE_DAILY_LIMIT = 3
 MAX_DURATION_SECONDS = 90
 PENDING_ORDER_EXPIRATION_HOURS = max(1, int(os.environ.get("PENDING_ORDER_EXPIRATION_HOURS", "24")))
 DUPLICATE_LINK_COOLDOWN_SECONDS = max(10, int(os.environ.get("DUPLICATE_LINK_COOLDOWN_SECONDS", "120")))
+LINK_METADATA_CACHE_SECONDS = max(30, int(os.environ.get("LINK_METADATA_CACHE_SECONDS", "300")))
 
 INSTAGRAM_COOKIES_TEXT = os.environ.get("INSTAGRAM_COOKIES_TEXT", "").strip()
 INSTAGRAM_COOKIEFILE_PATH = None
@@ -105,6 +106,8 @@ DOWNLOADS_EM_ANDAMENTO = {}
 DOWNLOADS_EM_ANDAMENTO_LOCK = Lock()
 ULTIMO_LINK_PROCESSADO = {}
 ULTIMO_LINK_PROCESSADO_LOCK = Lock()
+LINK_METADATA_CACHE = {}
+LINK_METADATA_CACHE_LOCK = Lock()
 
 # =========================================
 # DB / BOT / APP
@@ -671,6 +674,82 @@ def registrar_link_processado(user_id, url):
         }
 
     logger.info(f"[DUPLICATE_LINK_SAVE] user_id={uid} url={url_norm}")
+
+
+def extrair_metadados_basicos(info):
+    info = info or {}
+    return {
+        "duration": info.get("duration"),
+        "id": info.get("id"),
+        "extractor": info.get("extractor_key") or info.get("extractor"),
+        "webpage_url": info.get("webpage_url") or info.get("original_url"),
+    }
+
+
+def limpar_metadata_cache_expirado_unlocked(ttl_seconds=LINK_METADATA_CACHE_SECONDS):
+    agora_ts = int(time.time())
+    removidos = 0
+
+    for cache_key, estado in list(LINK_METADATA_CACHE.items()):
+        saved_at = int((estado or {}).get("saved_at") or 0)
+        if not saved_at or (agora_ts - saved_at) >= int(ttl_seconds):
+            LINK_METADATA_CACHE.pop(cache_key, None)
+            removidos += 1
+
+    return removidos
+
+
+def limpar_metadata_cache_expirado(ttl_seconds=LINK_METADATA_CACHE_SECONDS):
+    with LINK_METADATA_CACHE_LOCK:
+        removidos = limpar_metadata_cache_expirado_unlocked(ttl_seconds=ttl_seconds)
+
+    if removidos > 0:
+        logger.info(f"[META_CACHE_CLEANUP] removidos={removidos} ttl_seconds={ttl_seconds}")
+
+    return removidos
+
+
+def contar_metadados_em_cache():
+    with LINK_METADATA_CACHE_LOCK:
+        limpar_metadata_cache_expirado_unlocked(ttl_seconds=LINK_METADATA_CACHE_SECONDS)
+        return len(LINK_METADATA_CACHE)
+
+
+def obter_metadados_link_com_cache(url, is_instagram=False, is_pinterest=False):
+    cache_key = normalizar_url_para_duplicado(url)
+    agora_ts = int(time.time())
+
+    if cache_key:
+        with LINK_METADATA_CACHE_LOCK:
+            limpar_metadata_cache_expirado_unlocked(ttl_seconds=LINK_METADATA_CACHE_SECONDS)
+            estado = LINK_METADATA_CACHE.get(cache_key) or {}
+            saved_at = int(estado.get("saved_at") or 0)
+            metadata = estado.get("metadata")
+
+            if metadata and saved_at and (agora_ts - saved_at) < int(LINK_METADATA_CACHE_SECONDS):
+                idade = agora_ts - saved_at
+                logger.info(
+                    f"[META_CACHE_HIT] url={cache_key} age_seconds={idade} ttl_seconds={LINK_METADATA_CACHE_SECONDS}"
+                )
+                return dict(metadata)
+
+    with yt_dlp.YoutubeDL(montar_info_opts(is_instagram=is_instagram, is_pinterest=is_pinterest)) as ydl:
+        info = ydl.extract_info(url, download=False)
+
+    metadata = extrair_metadados_basicos(info)
+
+    if cache_key:
+        with LINK_METADATA_CACHE_LOCK:
+            LINK_METADATA_CACHE[cache_key] = {
+                "saved_at": agora_ts,
+                "metadata": metadata,
+            }
+
+        logger.info(
+            f"[META_CACHE_SAVE] url={cache_key} ttl_seconds={LINK_METADATA_CACHE_SECONDS} duration={metadata.get('duration')}"
+        )
+
+    return metadata
 
 
 def iniciar_controle_download_usuario(user_id, message_date=None):
@@ -1785,6 +1864,7 @@ def enviar_painel_admin(chat_id):
         pedidos_checkout_error = pedidos_col.count_documents({"status": "checkout_error"})
         pedidos_creating = pedidos_col.count_documents({"status": "creating"})
         downloads_em_andamento = contar_downloads_em_andamento()
+        metadados_em_cache = contar_metadados_em_cache()
 
         mongo_status = "ok"
         try:
@@ -1817,7 +1897,8 @@ def enviar_painel_admin(chat_id):
             "*Config atual*\n"
             f"🆓 Limite grátis: `{FREE_DAILY_LIMIT}/dia`\n"
             f"⏱ Duração máx: `{MAX_DURATION_SECONDS}s`\n"
-            f"⌛ Expiração pendentes: `{PENDING_ORDER_EXPIRATION_HOURS}h`"
+            f"⌛ Expiração pendentes: `{PENDING_ORDER_EXPIRATION_HOURS}h`\n"
+            f"🧠 Cache metadados: `{LINK_METADATA_CACHE_SECONDS}s`"
         )
         comandos_admin = (
             "*Comandos*\n"
@@ -1880,6 +1961,7 @@ def admin_stats(message):
         pedidos_checkout_error = pedidos_col.count_documents({"status": "checkout_error"})
         pedidos_creating = pedidos_col.count_documents({"status": "creating"})
         downloads_em_andamento = contar_downloads_em_andamento()
+        metadados_em_cache = contar_metadados_em_cache()
 
         mongo_status = "ok"
         try:
@@ -1902,7 +1984,8 @@ def admin_stats(message):
             "🖥 *Infra*\n"
             f"🗄 Mongo: `{_admin_code(mongo_status, 28)}`\n"
             f"🎬 ffmpeg: `{'ok' if ffmpeg_disponivel() else 'off'}`\n"
-            f"🔎 ffprobe: `{'ok' if ffprobe_disponivel() else 'off'}`"
+            f"🔎 ffprobe: `{'ok' if ffprobe_disponivel() else 'off'}`\n"
+            f"🧠 Cache meta: `{metadados_em_cache}`"
         )
 
         safe_send_message(message.chat.id, texto, parse_mode="Markdown")
@@ -2296,8 +2379,7 @@ def handle_download(message):
             url_resolvida = resolver_link_pinterest(url)
 
             try:
-                with yt_dlp.YoutubeDL(montar_info_opts(is_pinterest=True)) as ydl:
-                    info = ydl.extract_info(url_resolvida, download=False)
+                info = obter_metadados_link_com_cache(url_resolvida, is_pinterest=True)
 
                 duracao = info.get("duration")
                 logger.info(f"[META] plataforma=Pinterest user_id={message.from_user.id} duration={duracao}")
@@ -2345,8 +2427,7 @@ def handle_download(message):
 
         prefix = os.path.join(DOWNLOAD_DIR, f"v_{message.from_user.id}_{uuid.uuid4().hex}")
 
-        with yt_dlp.YoutubeDL(montar_info_opts(is_instagram=is_instagram)) as ydl:
-            info = ydl.extract_info(url, download=False)
+        info = obter_metadados_link_com_cache(url, is_instagram=is_instagram)
 
         duracao = info.get("duration")
         logger.info(f"[META] plataforma={plataforma} user_id={message.from_user.id} duration={duracao}")
@@ -2650,6 +2731,7 @@ def obter_metricas_health():
         "expired_orders": None,
         "paid_orders": None,
         "downloads_in_progress": contar_downloads_em_andamento(),
+        "metadata_cache_entries": contar_metadados_em_cache(),
     }
 
     try:
@@ -2702,7 +2784,9 @@ def health():
         "pending_orders": metricas["pending_orders"],
         "expired_orders": metricas["expired_orders"],
         "paid_orders": metricas["paid_orders"],
-        "downloads_in_progress": metricas["downloads_in_progress"]
+        "downloads_in_progress": metricas["downloads_in_progress"],
+        "metadata_cache_entries": metricas["metadata_cache_entries"],
+        "metadata_cache_ttl_seconds": LINK_METADATA_CACHE_SECONDS
     }), 200
 
 
