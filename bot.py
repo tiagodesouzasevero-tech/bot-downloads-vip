@@ -7,6 +7,7 @@ import logging
 from threading import Thread, Lock
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode, unquote
 
 import requests
 import telebot
@@ -641,11 +642,140 @@ def montar_mensagem_lotacao_global(active_total):
     )
 
 
+def _normalizar_host_url(host):
+    host = (host or "").strip().lower()
+    if not host:
+        return ""
+
+    aliases = {
+        "www.instagram.com": "instagram.com",
+        "m.instagram.com": "instagram.com",
+        "instagr.am": "instagram.com",
+        "www.tiktok.com": "tiktok.com",
+        "m.tiktok.com": "tiktok.com",
+        "www.pinterest.com": "pinterest.com",
+        "br.pinterest.com": "pinterest.com",
+        "pt-br.pinterest.com": "pinterest.com",
+        "www.xiaohongshu.com": "xiaohongshu.com",
+    }
+
+    return aliases.get(host, host)
+
+
+def _normalizar_path_url(path):
+    path = unquote((path or "").strip())
+    path = re.sub(r"/{2,}", "/", path)
+    if path and not path.startswith("/"):
+        path = "/" + path
+    path = path.rstrip("/")
+    return path or "/"
+
+
+def _filtrar_query_generica(query):
+    ignorar = {
+        "igsh",
+        "igshid",
+        "si",
+        "spm",
+        "feature",
+        "feature_share",
+        "is_copy_url",
+        "is_from_webapp",
+        "sender_device",
+        "share_app_id",
+        "share_iid",
+        "share_link_id",
+        "share_item_id",
+        "sharer_language",
+        "social_share_type",
+        "source",
+        "src",
+        "s",
+        "t",
+        "u_code",
+        "u_id",
+        "sec_uid",
+        "sec_user_id",
+        "timestamp",
+        "referer",
+        "ref",
+        "fbclid",
+        "gclid",
+        "mc_cid",
+        "mc_eid",
+    }
+
+    filtrados = []
+    vistos = set()
+
+    for chave, valor in parse_qsl(query or "", keep_blank_values=False):
+        chave_limpa = (chave or "").strip().lower()
+        valor_limpo = (valor or "").strip()
+
+        if not chave_limpa:
+            continue
+        if chave_limpa.startswith("utm_"):
+            continue
+        if chave_limpa in ignorar:
+            continue
+
+        item = (chave_limpa, valor_limpo)
+        if item in vistos:
+            continue
+
+        vistos.add(item)
+        filtrados.append(item)
+
+    filtrados.sort(key=lambda item: (item[0], item[1]))
+    return urlencode(filtrados, doseq=True)
+
+
 def normalizar_url_para_duplicado(url):
     url = (url or "").strip()
     if not url:
         return ""
-    return url.rstrip("/").lower()
+
+    try:
+        partes = urlsplit(url)
+    except Exception:
+        return url.rstrip("/").lower()
+
+    scheme = (partes.scheme or "https").lower()
+    host = _normalizar_host_url(partes.netloc)
+    path = _normalizar_path_url(partes.path)
+    query = partes.query or ""
+
+    ref_lower = f"{host}{path}".lower()
+
+    if "instagram.com" in host:
+        match = re.search(r"/(reel|reels|p|tv)/([^/?#]+)", path, re.IGNORECASE)
+        if match:
+            path = f"/{match.group(1).lower()}/{match.group(2)}"
+        query = ""
+
+    elif "tiktok.com" in host:
+        match = re.search(r"/(?:@[^/]+/video|embed|v)/([0-9]+)", path, re.IGNORECASE)
+        if match:
+            path = f"/video/{match.group(1)}"
+        query = ""
+
+    elif "pinterest.com" in host or "pin.it" in host:
+        match = re.search(r"/pin/([0-9]+)", path, re.IGNORECASE)
+        if match:
+            path = f"/pin/{match.group(1)}"
+        query = ""
+
+    elif "xiaohongshu.com" in host or "xhslink.com" in host or "rednote" in ref_lower:
+        match = re.search(r"/(?:explore|discovery/item|item|note)/([^/?#]+)", path, re.IGNORECASE)
+        if match:
+            path = f"/note/{match.group(1)}"
+        query = ""
+
+    else:
+        query = _filtrar_query_generica(query)
+
+    url_normalizada = urlunsplit((scheme, host, path, query, ""))
+    return url_normalizada.rstrip("/")
 
 
 def bloquear_link_duplicado_recente(user_id, url, cooldown_seconds=DUPLICATE_LINK_COOLDOWN_SECONDS):
@@ -2360,6 +2490,10 @@ def handle_download(message):
     url = extrair_primeira_url(message.text)
     if not url:
         return safe_reply_to(message, "❌ Não encontrei um link válido na sua mensagem.")
+
+    url_normalizada = normalizar_url_para_duplicado(url)
+    if url_normalizada and url_normalizada != url.rstrip("/"):
+        logger.info(f"[URL_NORMALIZED] original={url} normalized={url_normalizada}")
 
     if bloquear_link_duplicado_recente(message.from_user.id, url):
         return safe_reply_to(
