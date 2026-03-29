@@ -77,6 +77,10 @@ PENDING_ORDER_EXPIRATION_HOURS = max(1, int(os.environ.get("PENDING_ORDER_EXPIRA
 DUPLICATE_LINK_COOLDOWN_SECONDS = max(10, int(os.environ.get("DUPLICATE_LINK_COOLDOWN_SECONDS", "120")))
 LINK_METADATA_CACHE_SECONDS = max(30, int(os.environ.get("LINK_METADATA_CACHE_SECONDS", "300")))
 GLOBAL_DOWNLOAD_CONCURRENCY_LIMIT = max(1, int(os.environ.get("GLOBAL_DOWNLOAD_CONCURRENCY_LIMIT", "2")))
+TEMP_MEMORY_CLEANUP_INTERVAL_SECONDS = max(60, int(os.environ.get("TEMP_MEMORY_CLEANUP_INTERVAL_SECONDS", "300")))
+DOWNLOAD_ACTIVE_STALE_SECONDS = max(300, int(os.environ.get("DOWNLOAD_ACTIVE_STALE_SECONDS", "1800")))
+DOWNLOAD_STATE_RETENTION_SECONDS = max(300, int(os.environ.get("DOWNLOAD_STATE_RETENTION_SECONDS", "1800")))
+DUPLICATE_LINK_STATE_RETENTION_SECONDS = max(DUPLICATE_LINK_COOLDOWN_SECONDS, int(os.environ.get("DUPLICATE_LINK_STATE_RETENTION_SECONDS", "1800")))
 
 INSTAGRAM_COOKIES_TEXT = os.environ.get("INSTAGRAM_COOKIES_TEXT", "").strip()
 INSTAGRAM_COOKIEFILE_PATH = None
@@ -110,6 +114,8 @@ ULTIMO_LINK_PROCESSADO = {}
 ULTIMO_LINK_PROCESSADO_LOCK = Lock()
 LINK_METADATA_CACHE = {}
 LINK_METADATA_CACHE_LOCK = Lock()
+TEMP_MEMORY_CLEANUP_LOCK = Lock()
+TEMP_MEMORY_CLEANUP_LAST_TS = 0
 
 # =========================================
 # DB / BOT / APP
@@ -627,9 +633,112 @@ def safe_delete_message(chat_id, message_id):
         logger.warning(f"[DELETE_MESSAGE] chat_id={chat_id} message_id={message_id} erro={e}")
 
 
+def limpar_downloads_em_andamento_unlocked(now_ts=None):
+    agora_ts = int(now_ts or time.time())
+    removidos = 0
+
+    for uid, estado in list(DOWNLOADS_EM_ANDAMENTO.items()):
+        estado = estado or {}
+        active = bool(estado.get("active"))
+        started_at = int(estado.get("last_started_at") or 0)
+        finished_at = int(estado.get("last_finished_at") or 0)
+
+        if active and started_at and (agora_ts - started_at) >= DOWNLOAD_ACTIVE_STALE_SECONDS:
+            DOWNLOADS_EM_ANDAMENTO.pop(uid, None)
+            removidos += 1
+            continue
+
+        if (not active) and finished_at and (agora_ts - finished_at) >= DOWNLOAD_STATE_RETENTION_SECONDS:
+            DOWNLOADS_EM_ANDAMENTO.pop(uid, None)
+            removidos += 1
+            continue
+
+        if not active and not finished_at and not started_at:
+            DOWNLOADS_EM_ANDAMENTO.pop(uid, None)
+            removidos += 1
+
+    return removidos
+
+
+def limpar_links_duplicados_unlocked(now_ts=None):
+    agora_ts = int(now_ts or time.time())
+    removidos = 0
+
+    for uid, estado in list(ULTIMO_LINK_PROCESSADO.items()):
+        estado = estado or {}
+        finished_at = int(estado.get("finished_at") or 0)
+        url = (estado.get("url") or "").strip()
+
+        if not url or not finished_at or (agora_ts - finished_at) >= DUPLICATE_LINK_STATE_RETENTION_SECONDS:
+            ULTIMO_LINK_PROCESSADO.pop(uid, None)
+            removidos += 1
+
+    return removidos
+
+
+def limpar_memorias_temporarias(force=False, reason="auto"):
+    global TEMP_MEMORY_CLEANUP_LAST_TS
+
+    agora_ts = int(time.time())
+
+    with TEMP_MEMORY_CLEANUP_LOCK:
+        if not force and TEMP_MEMORY_CLEANUP_LAST_TS and (agora_ts - TEMP_MEMORY_CLEANUP_LAST_TS) < TEMP_MEMORY_CLEANUP_INTERVAL_SECONDS:
+            return {
+                "downloads_state_removed": 0,
+                "duplicate_links_removed": 0,
+                "metadata_cache_removed": 0,
+                "total_removed": 0,
+                "skipped": True,
+            }
+
+        TEMP_MEMORY_CLEANUP_LAST_TS = agora_ts
+
+    with DOWNLOADS_EM_ANDAMENTO_LOCK:
+        downloads_state_removed = limpar_downloads_em_andamento_unlocked(now_ts=agora_ts)
+
+    with ULTIMO_LINK_PROCESSADO_LOCK:
+        duplicate_links_removed = limpar_links_duplicados_unlocked(now_ts=agora_ts)
+
+    with LINK_METADATA_CACHE_LOCK:
+        metadata_cache_removed = limpar_metadata_cache_expirado_unlocked(ttl_seconds=LINK_METADATA_CACHE_SECONDS)
+
+    total_removed = downloads_state_removed + duplicate_links_removed + metadata_cache_removed
+
+    if total_removed > 0:
+        logger.info(
+            f"[TEMP_MEMORY_CLEANUP] reason={reason} downloads_state_removed={downloads_state_removed} "
+
+            f"duplicate_links_removed={duplicate_links_removed} metadata_cache_removed={metadata_cache_removed}"
+        )
+
+    return {
+        "downloads_state_removed": downloads_state_removed,
+        "duplicate_links_removed": duplicate_links_removed,
+        "metadata_cache_removed": metadata_cache_removed,
+        "total_removed": total_removed,
+        "skipped": False,
+    }
+
+
 def contar_downloads_em_andamento():
+    limpar_memorias_temporarias(reason="count_downloads")
+
     with DOWNLOADS_EM_ANDAMENTO_LOCK:
         return sum(1 for estado in DOWNLOADS_EM_ANDAMENTO.values() if estado.get("active"))
+
+
+def contar_estados_download_memoria():
+    limpar_memorias_temporarias(reason="count_download_states")
+
+    with DOWNLOADS_EM_ANDAMENTO_LOCK:
+        return len(DOWNLOADS_EM_ANDAMENTO)
+
+
+def contar_links_duplicados_memoria():
+    limpar_memorias_temporarias(reason="count_duplicate_links")
+
+    with ULTIMO_LINK_PROCESSADO_LOCK:
+        return len(ULTIMO_LINK_PROCESSADO)
 
 
 def montar_mensagem_lotacao_global(active_total):
@@ -779,6 +888,7 @@ def normalizar_url_para_duplicado(url):
 
 
 def bloquear_link_duplicado_recente(user_id, url, cooldown_seconds=DUPLICATE_LINK_COOLDOWN_SECONDS):
+    limpar_memorias_temporarias(reason="duplicate_block_check")
     uid = str(user_id)
     url_norm = normalizar_url_para_duplicado(url)
     agora_ts = int(time.time())
@@ -802,6 +912,7 @@ def bloquear_link_duplicado_recente(user_id, url, cooldown_seconds=DUPLICATE_LIN
 
 
 def registrar_link_processado(user_id, url):
+    limpar_memorias_temporarias(reason="duplicate_save_before")
     uid = str(user_id)
     url_norm = normalizar_url_para_duplicado(url)
 
@@ -851,12 +962,15 @@ def limpar_metadata_cache_expirado(ttl_seconds=LINK_METADATA_CACHE_SECONDS):
 
 
 def contar_metadados_em_cache():
+    limpar_memorias_temporarias(reason="count_metadata_cache")
+
     with LINK_METADATA_CACHE_LOCK:
         limpar_metadata_cache_expirado_unlocked(ttl_seconds=LINK_METADATA_CACHE_SECONDS)
         return len(LINK_METADATA_CACHE)
 
 
 def obter_metadados_link_com_cache(url, is_instagram=False, is_pinterest=False):
+    limpar_memorias_temporarias(reason="metadata_lookup")
     cache_key = normalizar_url_para_duplicado(url)
     agora_ts = int(time.time())
 
@@ -894,6 +1008,7 @@ def obter_metadados_link_com_cache(url, is_instagram=False, is_pinterest=False):
 
 
 def iniciar_controle_download_usuario(user_id, message_date=None):
+    limpar_memorias_temporarias(reason="anti_flood_start")
     uid = str(user_id)
     agora_ts = int(time.time())
 
@@ -946,6 +1061,7 @@ def iniciar_controle_download_usuario(user_id, message_date=None):
 
 
 def finalizar_controle_download_usuario(user_id):
+    limpar_memorias_temporarias(reason="anti_flood_end_before")
     uid = str(user_id)
     agora_ts = int(time.time())
 
@@ -964,6 +1080,8 @@ def finalizar_controle_download_usuario(user_id):
         logger.info(
             f"[ANTI_FLOOD_END] user_id={uid} finished_at={agora_ts} active_total={active_total}"
         )
+
+    limpar_memorias_temporarias(reason="anti_flood_end_after")
 
 
 def safe_answer_callback(call_id):
@@ -2015,6 +2133,8 @@ def enviar_painel_admin(chat_id):
         pedidos_creating = pedidos_col.count_documents({"status": "creating"})
         downloads_em_andamento = contar_downloads_em_andamento()
         metadados_em_cache = contar_metadados_em_cache()
+        estados_download_memoria = contar_estados_download_memoria()
+        links_duplicados_memoria = contar_links_duplicados_memoria()
 
         mongo_status = "ok"
         try:
@@ -2049,7 +2169,12 @@ def enviar_painel_admin(chat_id):
             f"⏱ Duração máx: `{MAX_DURATION_SECONDS}s`\n"
             f"⌛ Expiração pendentes: `{PENDING_ORDER_EXPIRATION_HOURS}h`\n"
             f"🚦 Limite global: `{GLOBAL_DOWNLOAD_CONCURRENCY_LIMIT}`\n"
-            f"🧠 Cache metadados: `{LINK_METADATA_CACHE_SECONDS}s`"
+            f"🧠 Cache metadados: `{LINK_METADATA_CACHE_SECONDS}s`\n"
+            f"🧹 Limpeza memórias: `{TEMP_MEMORY_CLEANUP_INTERVAL_SECONDS}s`\n\n"
+            "*Memórias temporárias*\n"
+            f"🚦 Estados download: `{estados_download_memoria}`\n"
+            f"🔁 Links duplicados: `{links_duplicados_memoria}`\n"
+            f"🧠 Entradas meta cache: `{metadados_em_cache}`"
         )
         comandos_admin = (
             "*Comandos*\n"
@@ -2113,6 +2238,8 @@ def admin_stats(message):
         pedidos_creating = pedidos_col.count_documents({"status": "creating"})
         downloads_em_andamento = contar_downloads_em_andamento()
         metadados_em_cache = contar_metadados_em_cache()
+        estados_download_memoria = contar_estados_download_memoria()
+        links_duplicados_memoria = contar_links_duplicados_memoria()
 
         mongo_status = "ok"
         try:
@@ -2136,7 +2263,10 @@ def admin_stats(message):
             f"🗄 Mongo: `{_admin_code(mongo_status, 28)}`\n"
             f"🎬 ffmpeg: `{'ok' if ffmpeg_disponivel() else 'off'}`\n"
             f"🔎 ffprobe: `{'ok' if ffprobe_disponivel() else 'off'}`\n"
-            f"🧠 Cache meta: `{metadados_em_cache}`"
+            f"🧠 Cache meta: `{metadados_em_cache}`\n"
+            f"🚦 Estados download: `{estados_download_memoria}`\n"
+            f"🔁 Links duplicados: `{links_duplicados_memoria}`\n"
+            f"🧹 Limpeza memórias: `{TEMP_MEMORY_CLEANUP_INTERVAL_SECONDS}s`"
         )
 
         safe_send_message(message.chat.id, texto, parse_mode="Markdown")
@@ -2894,6 +3024,8 @@ def obter_metricas_health():
         "expired_orders": None,
         "paid_orders": None,
         "downloads_in_progress": contar_downloads_em_andamento(),
+        "download_state_entries": contar_estados_download_memoria(),
+        "duplicate_link_entries": contar_links_duplicados_memoria(),
         "metadata_cache_entries": contar_metadados_em_cache(),
         "global_download_limit": GLOBAL_DOWNLOAD_CONCURRENCY_LIMIT,
     }
@@ -2951,6 +3083,12 @@ def health():
         "downloads_in_progress": metricas["downloads_in_progress"],
         "metadata_cache_entries": metricas["metadata_cache_entries"],
         "metadata_cache_ttl_seconds": LINK_METADATA_CACHE_SECONDS,
+        "download_state_entries": metricas["download_state_entries"],
+        "duplicate_link_entries": metricas["duplicate_link_entries"],
+        "temp_memory_cleanup_interval_seconds": TEMP_MEMORY_CLEANUP_INTERVAL_SECONDS,
+        "download_active_stale_seconds": DOWNLOAD_ACTIVE_STALE_SECONDS,
+        "download_state_retention_seconds": DOWNLOAD_STATE_RETENTION_SECONDS,
+        "duplicate_link_state_retention_seconds": DUPLICATE_LINK_STATE_RETENTION_SECONDS,
         "global_download_limit": metricas["global_download_limit"]
     }), 200
 
@@ -2960,6 +3098,7 @@ def health():
 # =========================================
 if __name__ == "__main__":
     cleanup_download_dir_old_files(max_age_hours=6)
+    limpar_memorias_temporarias(force=True, reason="startup")
     expirar_pedidos_antigos(expiration_hours=PENDING_ORDER_EXPIRATION_HOURS)
 
     Thread(
