@@ -75,6 +75,7 @@ MAX_DURATION_SECONDS = 90
 PENDING_ORDER_EXPIRATION_HOURS = max(1, int(os.environ.get("PENDING_ORDER_EXPIRATION_HOURS", "24")))
 DUPLICATE_LINK_COOLDOWN_SECONDS = max(10, int(os.environ.get("DUPLICATE_LINK_COOLDOWN_SECONDS", "120")))
 LINK_METADATA_CACHE_SECONDS = max(30, int(os.environ.get("LINK_METADATA_CACHE_SECONDS", "300")))
+GLOBAL_DOWNLOAD_CONCURRENCY_LIMIT = max(1, int(os.environ.get("GLOBAL_DOWNLOAD_CONCURRENCY_LIMIT", "2")))
 
 INSTAGRAM_COOKIES_TEXT = os.environ.get("INSTAGRAM_COOKIES_TEXT", "").strip()
 INSTAGRAM_COOKIEFILE_PATH = None
@@ -630,6 +631,16 @@ def contar_downloads_em_andamento():
         return sum(1 for estado in DOWNLOADS_EM_ANDAMENTO.values() if estado.get("active"))
 
 
+def montar_mensagem_lotacao_global(active_total):
+    ativos = max(0, int(active_total or 0))
+    return (
+        "⏳ O bot está com alta demanda agora.\n\n"
+        f"🚦 Downloads em andamento: {ativos}/{GLOBAL_DOWNLOAD_CONCURRENCY_LIMIT}\n"
+        "🔁 Aguarde alguns instantes e envie o link novamente.\n"
+        "💡 Não precisa enviar várias vezes o mesmo link."
+    )
+
+
 def normalizar_url_para_duplicado(url):
     url = (url or "").strip()
     if not url:
@@ -765,20 +776,28 @@ def iniciar_controle_download_usuario(user_id, message_date=None):
         estado = DOWNLOADS_EM_ANDAMENTO.get(uid, {})
         last_started_at = int(estado.get("last_started_at") or 0)
         last_finished_at = int(estado.get("last_finished_at") or 0)
+        active_total_atual = sum(1 for item in DOWNLOADS_EM_ANDAMENTO.values() if item.get("active"))
 
         if estado.get("active"):
             logger.info(
                 f"[ANTI_FLOOD_BLOCK] user_id={uid} reason=active_now "
                 f"msg_ts={message_ts} last_started_at={last_started_at}"
             )
-            return False
+            return {"status": "user_active", "active_total": active_total_atual}
 
         if last_started_at and last_finished_at and last_started_at <= message_ts < last_finished_at:
             logger.info(
                 f"[ANTI_FLOOD_BLOCK] user_id={uid} reason=queued_during_previous "
                 f"msg_ts={message_ts} last_started_at={last_started_at} last_finished_at={last_finished_at}"
             )
-            return False
+            return {"status": "user_queued", "active_total": active_total_atual}
+
+        if active_total_atual >= GLOBAL_DOWNLOAD_CONCURRENCY_LIMIT:
+            logger.info(
+                f"[GLOBAL_DOWNLOAD_BLOCK] user_id={uid} active_total={active_total_atual} "
+                f"limit={GLOBAL_DOWNLOAD_CONCURRENCY_LIMIT} msg_ts={message_ts}"
+            )
+            return {"status": "global_limit", "active_total": active_total_atual}
 
         DOWNLOADS_EM_ANDAMENTO[uid] = {
             "active": True,
@@ -790,9 +809,10 @@ def iniciar_controle_download_usuario(user_id, message_date=None):
         active_total = sum(1 for item in DOWNLOADS_EM_ANDAMENTO.values() if item.get("active"))
 
         logger.info(
-            f"[ANTI_FLOOD_START] user_id={uid} msg_ts={message_ts} active_total={active_total}"
+            f"[ANTI_FLOOD_START] user_id={uid} msg_ts={message_ts} active_total={active_total} "
+            f"global_limit={GLOBAL_DOWNLOAD_CONCURRENCY_LIMIT}"
         )
-        return True
+        return {"status": "started", "active_total": active_total}
 
 
 def finalizar_controle_download_usuario(user_id):
@@ -1883,7 +1903,7 @@ def enviar_painel_admin(chat_id):
             f"👥 Usuários: `{total_users}`\n"
             f"💎 VIPs ativos: `{vips_ativos}`\n"
             f"📥 Downloads hoje: `{downloads_totais_hoje}`\n"
-            f"🚦 Em andamento: `{downloads_em_andamento}`\n\n"
+            f"🚦 Em andamento: `{downloads_em_andamento}/{GLOBAL_DOWNLOAD_CONCURRENCY_LIMIT}`\n\n"
             "*Pedidos*\n"
             f"🕒 Pendentes: `{pedidos_pendentes}`\n"
             f"⏳ Criando checkout: `{pedidos_creating}`\n"
@@ -1898,6 +1918,7 @@ def enviar_painel_admin(chat_id):
             f"🆓 Limite grátis: `{FREE_DAILY_LIMIT}/dia`\n"
             f"⏱ Duração máx: `{MAX_DURATION_SECONDS}s`\n"
             f"⌛ Expiração pendentes: `{PENDING_ORDER_EXPIRATION_HOURS}h`\n"
+            f"🚦 Limite global: `{GLOBAL_DOWNLOAD_CONCURRENCY_LIMIT}`\n"
             f"🧠 Cache metadados: `{LINK_METADATA_CACHE_SECONDS}s`"
         )
         comandos_admin = (
@@ -1974,7 +1995,7 @@ def admin_stats(message):
             f"👥 Usuários: `{total_users}`\n"
             f"💎 VIPs ativos: `{vips_ativos}`\n"
             f"📥 Downloads hoje: `{downloads_totais_hoje}`\n"
-            f"🚦 Em andamento: `{downloads_em_andamento}`\n\n"
+            f"🚦 Em andamento: `{downloads_em_andamento}/{GLOBAL_DOWNLOAD_CONCURRENCY_LIMIT}`\n\n"
             "💳 *Pedidos*\n"
             f"🕒 Pendentes: `{pedidos_pendentes}`\n"
             f"⏳ Criando checkout: `{pedidos_creating}`\n"
@@ -2346,7 +2367,15 @@ def handle_download(message):
             "🔁 Esse mesmo link já foi processado há instantes. Aguarde um pouco antes de enviar novamente."
         )
 
-    if not iniciar_controle_download_usuario(message.from_user.id, getattr(message, "date", None)):
+    controle_info = iniciar_controle_download_usuario(message.from_user.id, getattr(message, "date", None))
+    controle_status = (controle_info or {}).get("status")
+    if controle_status == "global_limit":
+        return safe_reply_to(
+            message,
+            montar_mensagem_lotacao_global((controle_info or {}).get("active_total", 0))
+        )
+
+    if controle_status != "started":
         return safe_reply_to(
             message,
             "⏳ Já estou processando seu link anterior. Aguarde concluir para enviar outro."
@@ -2732,6 +2761,7 @@ def obter_metricas_health():
         "paid_orders": None,
         "downloads_in_progress": contar_downloads_em_andamento(),
         "metadata_cache_entries": contar_metadados_em_cache(),
+        "global_download_limit": GLOBAL_DOWNLOAD_CONCURRENCY_LIMIT,
     }
 
     try:
@@ -2786,7 +2816,8 @@ def health():
         "paid_orders": metricas["paid_orders"],
         "downloads_in_progress": metricas["downloads_in_progress"],
         "metadata_cache_entries": metricas["metadata_cache_entries"],
-        "metadata_cache_ttl_seconds": LINK_METADATA_CACHE_SECONDS
+        "metadata_cache_ttl_seconds": LINK_METADATA_CACHE_SECONDS,
+        "global_download_limit": metricas["global_download_limit"]
     }), 200
 
 
