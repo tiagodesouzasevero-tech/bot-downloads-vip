@@ -459,14 +459,20 @@ def arquivo_tem_codec_hevc(arquivo_entrada, info=None):
 
 def montar_vf_limite_720x1280_30fps(info=None):
     info = info or {}
-    width = info.get("width") or 0
-    height = info.get("height") or 0
+    width = int(info.get("width") or 0)
+    height = int(info.get("height") or 0)
     fps = info.get("fps") or 0
 
     filtros = []
+    precisa_limitar_tamanho = width > 720 or height > 1280
+    precisa_ajustar_paridade = (
+        width > 0 and height > 0 and (width % 2 != 0 or height % 2 != 0)
+    )
 
-    if width > 720 or height > 1280:
+    if precisa_limitar_tamanho:
         filtros.append("scale=720:1280:force_original_aspect_ratio=decrease:force_divisible_by=2")
+    elif precisa_ajustar_paridade:
+        filtros.append("scale=trunc(iw/2)*2:trunc(ih/2)*2")
 
     if fps > 30.5:
         filtros.append("fps=30")
@@ -521,11 +527,13 @@ def converter_para_h264_compativel(arquivo_entrada, info=None):
     return arquivo_saida
 
 
-def converter_para_720x1280_30fps(arquivo_entrada):
+def converter_para_720x1280_30fps(arquivo_entrada, info=None):
     """
     Garante saída final em no máximo 720x1280, 30fps, H.264/AAC.
+    Não faz upscale quando o vídeo já é menor que o limite.
     Mantém a proporção original sem adicionar bordas.
     """
+    info = info or obter_info_midia(arquivo_entrada) or {}
     base, _ = os.path.splitext(arquivo_entrada)
     arquivo_saida = f"{base}_720x1280_30fps.mp4"
 
@@ -533,7 +541,13 @@ def converter_para_720x1280_30fps(arquivo_entrada):
         "ffmpeg",
         "-y",
         "-i", arquivo_entrada,
-        "-vf", "scale=720:1280:force_original_aspect_ratio=decrease:force_divisible_by=2,fps=30",
+    ]
+
+    vf = montar_vf_limite_720x1280_30fps(info)
+    if vf:
+        cmd += ["-vf", vf]
+
+    cmd += [
         "-c:v", "libx264",
         "-preset", "veryfast",
         "-crf", "25",
@@ -599,7 +613,7 @@ def preparar_arquivo_para_envio(arquivo_entrada, plataforma=None):
         f"[MIDIA] Convertendo arquivo para padrão 720x1280 30fps | plataforma={plataforma} "
         f"arquivo={arquivo_entrada} info={info} permitir_hevc={permitir_hevc}"
     )
-    return converter_para_720x1280_30fps(arquivo_entrada)
+    return converter_para_720x1280_30fps(arquivo_entrada, info=info)
 
 
 def safe_send_message(chat_id, texto, **kwargs):
