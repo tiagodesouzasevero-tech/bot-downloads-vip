@@ -4,10 +4,9 @@ import glob
 import uuid
 import time
 import logging
-from threading import Thread, Lock
+from threading import Thread
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode, unquote
 
 import requests
 import telebot
@@ -73,17 +72,8 @@ APP_STARTED_AT = datetime.now(TZ).isoformat()
 
 FREE_DAILY_LIMIT = 3
 MAX_DURATION_SECONDS = 90
-PENDING_ORDER_EXPIRATION_HOURS = max(1, int(os.environ.get("PENDING_ORDER_EXPIRATION_HOURS", "24")))
-DUPLICATE_LINK_COOLDOWN_SECONDS = max(10, int(os.environ.get("DUPLICATE_LINK_COOLDOWN_SECONDS", "120")))
-LINK_METADATA_CACHE_SECONDS = max(30, int(os.environ.get("LINK_METADATA_CACHE_SECONDS", "300")))
-GLOBAL_DOWNLOAD_CONCURRENCY_LIMIT = max(1, int(os.environ.get("GLOBAL_DOWNLOAD_CONCURRENCY_LIMIT", "2")))
-TEMP_MEMORY_CLEANUP_INTERVAL_SECONDS = max(60, int(os.environ.get("TEMP_MEMORY_CLEANUP_INTERVAL_SECONDS", "300")))
-DOWNLOAD_ACTIVE_STALE_SECONDS = max(300, int(os.environ.get("DOWNLOAD_ACTIVE_STALE_SECONDS", "1800")))
-DOWNLOAD_STATE_RETENTION_SECONDS = max(300, int(os.environ.get("DOWNLOAD_STATE_RETENTION_SECONDS", "1800")))
-DUPLICATE_LINK_STATE_RETENTION_SECONDS = max(DUPLICATE_LINK_COOLDOWN_SECONDS, int(os.environ.get("DUPLICATE_LINK_STATE_RETENTION_SECONDS", "1800")))
 
 INSTAGRAM_COOKIES_TEXT = os.environ.get("INSTAGRAM_COOKIES_TEXT", "").strip()
-INSTAGRAM_COOKIEFILE_PATH = None
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
@@ -95,27 +85,6 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
 logger = logging.getLogger("afiliadotools")
-
-
-class YtDlpQuietLogger:
-    def debug(self, msg):
-        pass
-
-    def warning(self, msg):
-        pass
-
-    def error(self, msg):
-        pass
-
-
-DOWNLOADS_EM_ANDAMENTO = {}
-DOWNLOADS_EM_ANDAMENTO_LOCK = Lock()
-ULTIMO_LINK_PROCESSADO = {}
-ULTIMO_LINK_PROCESSADO_LOCK = Lock()
-LINK_METADATA_CACHE = {}
-LINK_METADATA_CACHE_LOCK = Lock()
-TEMP_MEMORY_CLEANUP_LOCK = Lock()
-TEMP_MEMORY_CLEANUP_LAST_TS = 0
 
 # =========================================
 # DB / BOT / APP
@@ -274,32 +243,6 @@ def encontrar_arquivo_baixado(prefix):
     return candidatos[0]
 
 
-def ffmpeg_disponivel():
-    try:
-        r = subprocess.run(
-            ["ffmpeg", "-version"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
-        )
-        return r.returncode == 0
-    except Exception:
-        return False
-
-
-def ffprobe_disponivel():
-    try:
-        r = subprocess.run(
-            ["ffprobe", "-version"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
-        )
-        return r.returncode == 0
-    except Exception:
-        return False
-
-
 def parse_fps(valor):
     try:
         if not valor or valor in ("0/0", "N/A"):
@@ -317,8 +260,6 @@ def parse_fps(valor):
 
 
 def obter_info_midia(arquivo_entrada):
-    if not ffprobe_disponivel():
-        return None
 
     cmd = [
         "ffprobe",
@@ -409,16 +350,6 @@ def permitir_hevc_por_plataforma(plataforma=None):
     return plataforma in ("tiktok", "rednote")
 
 
-def codecs_compativeis_para_remux_mp4(info):
-    if not info:
-        return False
-
-    vcodec = (info.get("vcodec") or "").lower()
-    acodec = (info.get("acodec") or "none").lower()
-
-    return vcodec in ("h264", "avc1", "hevc", "h265", "hev1") and acodec in ("aac", "none")
-
-
 def remuxar_para_mp4_faststart(arquivo_entrada):
     base, _ = os.path.splitext(arquivo_entrada)
     arquivo_saida = f"{base}_remux.mp4"
@@ -459,20 +390,14 @@ def arquivo_tem_codec_hevc(arquivo_entrada, info=None):
 
 def montar_vf_limite_720x1280_30fps(info=None):
     info = info or {}
-    width = int(info.get("width") or 0)
-    height = int(info.get("height") or 0)
+    width = info.get("width") or 0
+    height = info.get("height") or 0
     fps = info.get("fps") or 0
 
     filtros = []
-    precisa_limitar_tamanho = width > 720 or height > 1280
-    precisa_ajustar_paridade = (
-        width > 0 and height > 0 and (width % 2 != 0 or height % 2 != 0)
-    )
 
-    if precisa_limitar_tamanho:
+    if width > 720 or height > 1280:
         filtros.append("scale=720:1280:force_original_aspect_ratio=decrease:force_divisible_by=2")
-    elif precisa_ajustar_paridade:
-        filtros.append("scale=trunc(iw/2)*2:trunc(ih/2)*2")
 
     if fps > 30.5:
         filtros.append("fps=30")
@@ -527,13 +452,11 @@ def converter_para_h264_compativel(arquivo_entrada, info=None):
     return arquivo_saida
 
 
-def converter_para_720x1280_30fps(arquivo_entrada, info=None):
+def converter_para_720x1280_30fps(arquivo_entrada):
     """
     Garante saída final em no máximo 720x1280, 30fps, H.264/AAC.
-    Não faz upscale quando o vídeo já é menor que o limite.
     Mantém a proporção original sem adicionar bordas.
     """
-    info = info or obter_info_midia(arquivo_entrada) or {}
     base, _ = os.path.splitext(arquivo_entrada)
     arquivo_saida = f"{base}_720x1280_30fps.mp4"
 
@@ -541,13 +464,7 @@ def converter_para_720x1280_30fps(arquivo_entrada, info=None):
         "ffmpeg",
         "-y",
         "-i", arquivo_entrada,
-    ]
-
-    vf = montar_vf_limite_720x1280_30fps(info)
-    if vf:
-        cmd += ["-vf", vf]
-
-    cmd += [
+        "-vf", "scale=720:1280:force_original_aspect_ratio=decrease:force_divisible_by=2,fps=30",
         "-c:v", "libx264",
         "-preset", "veryfast",
         "-crf", "25",
@@ -613,7 +530,7 @@ def preparar_arquivo_para_envio(arquivo_entrada, plataforma=None):
         f"[MIDIA] Convertendo arquivo para padrão 720x1280 30fps | plataforma={plataforma} "
         f"arquivo={arquivo_entrada} info={info} permitir_hevc={permitir_hevc}"
     )
-    return converter_para_720x1280_30fps(arquivo_entrada, info=info)
+    return converter_para_720x1280_30fps(arquivo_entrada)
 
 
 def safe_send_message(chat_id, texto, **kwargs):
@@ -647,457 +564,6 @@ def safe_delete_message(chat_id, message_id):
         logger.warning(f"[DELETE_MESSAGE] chat_id={chat_id} message_id={message_id} erro={e}")
 
 
-def limpar_downloads_em_andamento_unlocked(now_ts=None):
-    agora_ts = int(now_ts or time.time())
-    removidos = 0
-
-    for uid, estado in list(DOWNLOADS_EM_ANDAMENTO.items()):
-        estado = estado or {}
-        active = bool(estado.get("active"))
-        started_at = int(estado.get("last_started_at") or 0)
-        finished_at = int(estado.get("last_finished_at") or 0)
-
-        if active and started_at and (agora_ts - started_at) >= DOWNLOAD_ACTIVE_STALE_SECONDS:
-            DOWNLOADS_EM_ANDAMENTO.pop(uid, None)
-            removidos += 1
-            continue
-
-        if (not active) and finished_at and (agora_ts - finished_at) >= DOWNLOAD_STATE_RETENTION_SECONDS:
-            DOWNLOADS_EM_ANDAMENTO.pop(uid, None)
-            removidos += 1
-            continue
-
-        if not active and not finished_at and not started_at:
-            DOWNLOADS_EM_ANDAMENTO.pop(uid, None)
-            removidos += 1
-
-    return removidos
-
-
-def limpar_links_duplicados_unlocked(now_ts=None):
-    agora_ts = int(now_ts or time.time())
-    removidos = 0
-
-    for uid, estado in list(ULTIMO_LINK_PROCESSADO.items()):
-        estado = estado or {}
-        finished_at = int(estado.get("finished_at") or 0)
-        url = (estado.get("url") or "").strip()
-
-        if not url or not finished_at or (agora_ts - finished_at) >= DUPLICATE_LINK_STATE_RETENTION_SECONDS:
-            ULTIMO_LINK_PROCESSADO.pop(uid, None)
-            removidos += 1
-
-    return removidos
-
-
-def limpar_memorias_temporarias(force=False, reason="auto"):
-    global TEMP_MEMORY_CLEANUP_LAST_TS
-
-    agora_ts = int(time.time())
-
-    with TEMP_MEMORY_CLEANUP_LOCK:
-        if not force and TEMP_MEMORY_CLEANUP_LAST_TS and (agora_ts - TEMP_MEMORY_CLEANUP_LAST_TS) < TEMP_MEMORY_CLEANUP_INTERVAL_SECONDS:
-            return {
-                "downloads_state_removed": 0,
-                "duplicate_links_removed": 0,
-                "metadata_cache_removed": 0,
-                "total_removed": 0,
-                "skipped": True,
-            }
-
-        TEMP_MEMORY_CLEANUP_LAST_TS = agora_ts
-
-    with DOWNLOADS_EM_ANDAMENTO_LOCK:
-        downloads_state_removed = limpar_downloads_em_andamento_unlocked(now_ts=agora_ts)
-
-    with ULTIMO_LINK_PROCESSADO_LOCK:
-        duplicate_links_removed = limpar_links_duplicados_unlocked(now_ts=agora_ts)
-
-    with LINK_METADATA_CACHE_LOCK:
-        metadata_cache_removed = limpar_metadata_cache_expirado_unlocked(ttl_seconds=LINK_METADATA_CACHE_SECONDS)
-
-    total_removed = downloads_state_removed + duplicate_links_removed + metadata_cache_removed
-
-    if total_removed > 0:
-        logger.info(
-            f"[TEMP_MEMORY_CLEANUP] reason={reason} downloads_state_removed={downloads_state_removed} "
-
-            f"duplicate_links_removed={duplicate_links_removed} metadata_cache_removed={metadata_cache_removed}"
-        )
-
-    return {
-        "downloads_state_removed": downloads_state_removed,
-        "duplicate_links_removed": duplicate_links_removed,
-        "metadata_cache_removed": metadata_cache_removed,
-        "total_removed": total_removed,
-        "skipped": False,
-    }
-
-
-def contar_downloads_em_andamento():
-    limpar_memorias_temporarias(reason="count_downloads")
-
-    with DOWNLOADS_EM_ANDAMENTO_LOCK:
-        return sum(1 for estado in DOWNLOADS_EM_ANDAMENTO.values() if estado.get("active"))
-
-
-def contar_estados_download_memoria():
-    limpar_memorias_temporarias(reason="count_download_states")
-
-    with DOWNLOADS_EM_ANDAMENTO_LOCK:
-        return len(DOWNLOADS_EM_ANDAMENTO)
-
-
-def contar_links_duplicados_memoria():
-    limpar_memorias_temporarias(reason="count_duplicate_links")
-
-    with ULTIMO_LINK_PROCESSADO_LOCK:
-        return len(ULTIMO_LINK_PROCESSADO)
-
-
-def montar_mensagem_lotacao_global(active_total):
-    ativos = max(0, int(active_total or 0))
-    return (
-        "⏳ O bot está com alta demanda agora.\n\n"
-        f"🚦 Downloads em andamento: {ativos}/{GLOBAL_DOWNLOAD_CONCURRENCY_LIMIT}\n"
-        "🔁 Aguarde alguns instantes e envie o link novamente.\n"
-        "💡 Não precisa enviar várias vezes o mesmo link."
-    )
-
-
-def _normalizar_host_url(host):
-    host = (host or "").strip().lower()
-    if not host:
-        return ""
-
-    aliases = {
-        "www.instagram.com": "instagram.com",
-        "m.instagram.com": "instagram.com",
-        "instagr.am": "instagram.com",
-        "www.tiktok.com": "tiktok.com",
-        "m.tiktok.com": "tiktok.com",
-        "www.pinterest.com": "pinterest.com",
-        "br.pinterest.com": "pinterest.com",
-        "pt-br.pinterest.com": "pinterest.com",
-        "www.xiaohongshu.com": "xiaohongshu.com",
-    }
-
-    return aliases.get(host, host)
-
-
-def _normalizar_path_url(path):
-    path = unquote((path or "").strip())
-    path = re.sub(r"/{2,}", "/", path)
-    if path and not path.startswith("/"):
-        path = "/" + path
-    path = path.rstrip("/")
-    return path or "/"
-
-
-def _filtrar_query_generica(query):
-    ignorar = {
-        "igsh",
-        "igshid",
-        "si",
-        "spm",
-        "feature",
-        "feature_share",
-        "is_copy_url",
-        "is_from_webapp",
-        "sender_device",
-        "share_app_id",
-        "share_iid",
-        "share_link_id",
-        "share_item_id",
-        "sharer_language",
-        "social_share_type",
-        "source",
-        "src",
-        "s",
-        "t",
-        "u_code",
-        "u_id",
-        "sec_uid",
-        "sec_user_id",
-        "timestamp",
-        "referer",
-        "ref",
-        "fbclid",
-        "gclid",
-        "mc_cid",
-        "mc_eid",
-    }
-
-    filtrados = []
-    vistos = set()
-
-    for chave, valor in parse_qsl(query or "", keep_blank_values=False):
-        chave_limpa = (chave or "").strip().lower()
-        valor_limpo = (valor or "").strip()
-
-        if not chave_limpa:
-            continue
-        if chave_limpa.startswith("utm_"):
-            continue
-        if chave_limpa in ignorar:
-            continue
-
-        item = (chave_limpa, valor_limpo)
-        if item in vistos:
-            continue
-
-        vistos.add(item)
-        filtrados.append(item)
-
-    filtrados.sort(key=lambda item: (item[0], item[1]))
-    return urlencode(filtrados, doseq=True)
-
-
-def normalizar_url_para_duplicado(url):
-    url = (url or "").strip()
-    if not url:
-        return ""
-
-    try:
-        partes = urlsplit(url)
-    except Exception:
-        return url.rstrip("/").lower()
-
-    scheme = (partes.scheme or "https").lower()
-    host = _normalizar_host_url(partes.netloc)
-    path = _normalizar_path_url(partes.path)
-    query = partes.query or ""
-
-    ref_lower = f"{host}{path}".lower()
-
-    if "instagram.com" in host:
-        match = re.search(r"/(reel|reels|p|tv)/([^/?#]+)", path, re.IGNORECASE)
-        if match:
-            path = f"/{match.group(1).lower()}/{match.group(2)}"
-        query = ""
-
-    elif "tiktok.com" in host:
-        match = re.search(r"/(?:@[^/]+/video|embed|v)/([0-9]+)", path, re.IGNORECASE)
-        if match:
-            path = f"/video/{match.group(1)}"
-        query = ""
-
-    elif "pinterest.com" in host or "pin.it" in host:
-        match = re.search(r"/pin/([0-9]+)", path, re.IGNORECASE)
-        if match:
-            path = f"/pin/{match.group(1)}"
-        query = ""
-
-    elif "xiaohongshu.com" in host or "xhslink.com" in host or "rednote" in ref_lower:
-        match = re.search(r"/(?:explore|discovery/item|item|note)/([^/?#]+)", path, re.IGNORECASE)
-        if match:
-            path = f"/note/{match.group(1)}"
-        query = ""
-
-    else:
-        query = _filtrar_query_generica(query)
-
-    url_normalizada = urlunsplit((scheme, host, path, query, ""))
-    return url_normalizada.rstrip("/")
-
-
-def bloquear_link_duplicado_recente(user_id, url, cooldown_seconds=DUPLICATE_LINK_COOLDOWN_SECONDS):
-    limpar_memorias_temporarias(reason="duplicate_block_check")
-    uid = str(user_id)
-    url_norm = normalizar_url_para_duplicado(url)
-    agora_ts = int(time.time())
-
-    if not url_norm:
-        return False
-
-    with ULTIMO_LINK_PROCESSADO_LOCK:
-        estado = ULTIMO_LINK_PROCESSADO.get(uid) or {}
-        ultima_url = estado.get("url")
-        finished_at = int(estado.get("finished_at") or 0)
-
-        if ultima_url == url_norm and finished_at and (agora_ts - finished_at) < int(cooldown_seconds):
-            restante = int(cooldown_seconds) - (agora_ts - finished_at)
-            logger.info(
-                f"[DUPLICATE_LINK_BLOCK] user_id={uid} cooldown_seconds={cooldown_seconds} remaining={restante} url={url_norm}"
-            )
-            return True
-
-    return False
-
-
-def registrar_link_processado(user_id, url):
-    limpar_memorias_temporarias(reason="duplicate_save_before")
-    uid = str(user_id)
-    url_norm = normalizar_url_para_duplicado(url)
-
-    if not url_norm:
-        return
-
-    with ULTIMO_LINK_PROCESSADO_LOCK:
-        ULTIMO_LINK_PROCESSADO[uid] = {
-            "url": url_norm,
-            "finished_at": int(time.time())
-        }
-
-    logger.info(f"[DUPLICATE_LINK_SAVE] user_id={uid} url={url_norm}")
-
-
-def extrair_metadados_basicos(info):
-    info = info or {}
-    return {
-        "duration": info.get("duration"),
-        "id": info.get("id"),
-        "extractor": info.get("extractor_key") or info.get("extractor"),
-        "webpage_url": info.get("webpage_url") or info.get("original_url"),
-    }
-
-
-def limpar_metadata_cache_expirado_unlocked(ttl_seconds=LINK_METADATA_CACHE_SECONDS):
-    agora_ts = int(time.time())
-    removidos = 0
-
-    for cache_key, estado in list(LINK_METADATA_CACHE.items()):
-        saved_at = int((estado or {}).get("saved_at") or 0)
-        if not saved_at or (agora_ts - saved_at) >= int(ttl_seconds):
-            LINK_METADATA_CACHE.pop(cache_key, None)
-            removidos += 1
-
-    return removidos
-
-
-def limpar_metadata_cache_expirado(ttl_seconds=LINK_METADATA_CACHE_SECONDS):
-    with LINK_METADATA_CACHE_LOCK:
-        removidos = limpar_metadata_cache_expirado_unlocked(ttl_seconds=ttl_seconds)
-
-    if removidos > 0:
-        logger.info(f"[META_CACHE_CLEANUP] removidos={removidos} ttl_seconds={ttl_seconds}")
-
-    return removidos
-
-
-def contar_metadados_em_cache():
-    limpar_memorias_temporarias(reason="count_metadata_cache")
-
-    with LINK_METADATA_CACHE_LOCK:
-        limpar_metadata_cache_expirado_unlocked(ttl_seconds=LINK_METADATA_CACHE_SECONDS)
-        return len(LINK_METADATA_CACHE)
-
-
-def obter_metadados_link_com_cache(url, is_instagram=False, is_pinterest=False):
-    limpar_memorias_temporarias(reason="metadata_lookup")
-    cache_key = normalizar_url_para_duplicado(url)
-    agora_ts = int(time.time())
-
-    if cache_key:
-        with LINK_METADATA_CACHE_LOCK:
-            limpar_metadata_cache_expirado_unlocked(ttl_seconds=LINK_METADATA_CACHE_SECONDS)
-            estado = LINK_METADATA_CACHE.get(cache_key) or {}
-            saved_at = int(estado.get("saved_at") or 0)
-            metadata = estado.get("metadata")
-
-            if metadata and saved_at and (agora_ts - saved_at) < int(LINK_METADATA_CACHE_SECONDS):
-                idade = agora_ts - saved_at
-                logger.info(
-                    f"[META_CACHE_HIT] url={cache_key} age_seconds={idade} ttl_seconds={LINK_METADATA_CACHE_SECONDS}"
-                )
-                return dict(metadata)
-
-    with yt_dlp.YoutubeDL(montar_info_opts(is_instagram=is_instagram, is_pinterest=is_pinterest)) as ydl:
-        info = ydl.extract_info(url, download=False)
-
-    metadata = extrair_metadados_basicos(info)
-
-    if cache_key:
-        with LINK_METADATA_CACHE_LOCK:
-            LINK_METADATA_CACHE[cache_key] = {
-                "saved_at": agora_ts,
-                "metadata": metadata,
-            }
-
-        logger.info(
-            f"[META_CACHE_SAVE] url={cache_key} ttl_seconds={LINK_METADATA_CACHE_SECONDS} duration={metadata.get('duration')}"
-        )
-
-    return metadata
-
-
-def iniciar_controle_download_usuario(user_id, message_date=None):
-    limpar_memorias_temporarias(reason="anti_flood_start")
-    uid = str(user_id)
-    agora_ts = int(time.time())
-
-    try:
-        message_ts = int(message_date) if message_date is not None else agora_ts
-    except Exception:
-        message_ts = agora_ts
-
-    with DOWNLOADS_EM_ANDAMENTO_LOCK:
-        estado = DOWNLOADS_EM_ANDAMENTO.get(uid, {})
-        last_started_at = int(estado.get("last_started_at") or 0)
-        last_finished_at = int(estado.get("last_finished_at") or 0)
-        active_total_atual = sum(1 for item in DOWNLOADS_EM_ANDAMENTO.values() if item.get("active"))
-
-        if estado.get("active"):
-            logger.info(
-                f"[ANTI_FLOOD_BLOCK] user_id={uid} reason=active_now "
-                f"msg_ts={message_ts} last_started_at={last_started_at}"
-            )
-            return {"status": "user_active", "active_total": active_total_atual}
-
-        if last_started_at and last_finished_at and last_started_at <= message_ts < last_finished_at:
-            logger.info(
-                f"[ANTI_FLOOD_BLOCK] user_id={uid} reason=queued_during_previous "
-                f"msg_ts={message_ts} last_started_at={last_started_at} last_finished_at={last_finished_at}"
-            )
-            return {"status": "user_queued", "active_total": active_total_atual}
-
-        if active_total_atual >= GLOBAL_DOWNLOAD_CONCURRENCY_LIMIT:
-            logger.info(
-                f"[GLOBAL_DOWNLOAD_BLOCK] user_id={uid} active_total={active_total_atual} "
-                f"limit={GLOBAL_DOWNLOAD_CONCURRENCY_LIMIT} msg_ts={message_ts}"
-            )
-            return {"status": "global_limit", "active_total": active_total_atual}
-
-        DOWNLOADS_EM_ANDAMENTO[uid] = {
-            "active": True,
-            "last_started_at": agora_ts,
-            "active_message_ts": message_ts,
-            "last_finished_at": last_finished_at,
-        }
-
-        active_total = sum(1 for item in DOWNLOADS_EM_ANDAMENTO.values() if item.get("active"))
-
-        logger.info(
-            f"[ANTI_FLOOD_START] user_id={uid} msg_ts={message_ts} active_total={active_total} "
-            f"global_limit={GLOBAL_DOWNLOAD_CONCURRENCY_LIMIT}"
-        )
-        return {"status": "started", "active_total": active_total}
-
-
-def finalizar_controle_download_usuario(user_id):
-    limpar_memorias_temporarias(reason="anti_flood_end_before")
-    uid = str(user_id)
-    agora_ts = int(time.time())
-
-    with DOWNLOADS_EM_ANDAMENTO_LOCK:
-        estado = DOWNLOADS_EM_ANDAMENTO.get(uid)
-        if not estado:
-            return
-
-        estado["active"] = False
-        estado["last_finished_at"] = agora_ts
-        estado["active_message_ts"] = None
-        DOWNLOADS_EM_ANDAMENTO[uid] = estado
-
-        active_total = sum(1 for item in DOWNLOADS_EM_ANDAMENTO.values() if item.get("active"))
-
-        logger.info(
-            f"[ANTI_FLOOD_END] user_id={uid} finished_at={agora_ts} active_total={active_total}"
-        )
-
-    limpar_memorias_temporarias(reason="anti_flood_end_after")
-
-
 def safe_answer_callback(call_id):
     try:
         bot.answer_callback_query(call_id)
@@ -1105,70 +571,42 @@ def safe_answer_callback(call_id):
         logger.warning(f"[CALLBACK_ANSWER] erro={e}")
 
 
-def enviar_arquivo_com_fallback(chat_id, arquivo, plataforma=None):
-    info = obter_info_midia(arquivo)
-    arquivo_fallback = None
-
+def enviar_arquivo_com_fallback(chat_id, arquivo):
     try:
         with open(arquivo, "rb") as f:
             bot.send_video(chat_id, f, caption="👉 Download concluído! Aqui está seu vídeo 👊")
-
-        logger.info(
-            f"[SEND_VIDEO_OK] plataforma={plataforma} modo=video_direto arquivo={arquivo} "
-            f"width={(info or {}).get('width')} height={(info or {}).get('height')} "
-            f"fps={(info or {}).get('fps')} vcodec={(info or {}).get('vcodec')} "
-            f"acodec={(info or {}).get('acodec')}"
-        )
         return True
     except Exception as e_video:
-        logger.warning(
-            f"[SEND_VIDEO_FAIL] plataforma={plataforma} modo=video_direto arquivo={arquivo} "
-            f"width={(info or {}).get('width')} height={(info or {}).get('height')} "
-            f"fps={(info or {}).get('fps')} vcodec={(info or {}).get('vcodec')} erro={e_video}"
-        )
+        logger.warning(f"[SEND_VIDEO] Falhou no envio como vídeo. arquivo={arquivo} erro={e_video}")
+
+    info = obter_info_midia(arquivo)
+    arquivo_fallback = None
 
     if arquivo_tem_codec_hevc(arquivo, info):
         try:
             logger.info(
-                f"[SEND_VIDEO] Tentando fallback automático HEVC -> H.264 | plataforma={plataforma} arquivo={arquivo} "
+                f"[SEND_VIDEO] Tentando fallback automático HEVC -> H.264 | arquivo={arquivo} "
                 f"width={(info or {}).get('width')} height={(info or {}).get('height')} "
                 f"fps={(info or {}).get('fps')} vcodec={(info or {}).get('vcodec')}"
             )
             arquivo_fallback = converter_para_h264_compativel(arquivo, info)
-            info_fallback = obter_info_midia(arquivo_fallback)
 
             with open(arquivo_fallback, "rb") as f:
                 bot.send_video(chat_id, f, caption="👉 Download concluído! Aqui está seu vídeo 👊")
 
-            logger.info(
-                f"[SEND_VIDEO_OK] plataforma={plataforma} modo=fallback_h264 arquivo_original={arquivo} "
-                f"arquivo_enviado={arquivo_fallback} width={(info_fallback or {}).get('width')} "
-                f"height={(info_fallback or {}).get('height')} fps={(info_fallback or {}).get('fps')} "
-                f"vcodec={(info_fallback or {}).get('vcodec')} acodec={(info_fallback or {}).get('acodec')}"
-            )
+            logger.info(f"[SEND_VIDEO] Fallback H.264 enviado com sucesso | arquivo={arquivo_fallback}")
             return True
         except Exception as e_h264:
-            logger.warning(f"[SEND_VIDEO] Fallback H.264 também falhou. plataforma={plataforma} erro={e_h264}")
+            logger.warning(f"[SEND_VIDEO] Fallback H.264 também falhou. erro={e_h264}")
 
     alvo_documento = arquivo_fallback if arquivo_fallback and os.path.exists(arquivo_fallback) else arquivo
-    origem_documento = "fallback_h264" if alvo_documento == arquivo_fallback and arquivo_fallback else "arquivo_original"
-    info_documento = obter_info_midia(alvo_documento)
 
     try:
         with open(alvo_documento, "rb") as f:
             bot.send_document(chat_id, f, caption="👉 Download concluído! Aqui está seu arquivo 👊")
-
-        logger.info(
-            f"[SEND_DOCUMENT_OK] plataforma={plataforma} origem={origem_documento} arquivo={alvo_documento} "
-            f"width={(info_documento or {}).get('width')} height={(info_documento or {}).get('height')} "
-            f"fps={(info_documento or {}).get('fps')} vcodec={(info_documento or {}).get('vcodec')} "
-            f"acodec={(info_documento or {}).get('acodec')}"
-        )
         return True
     except Exception as e_doc:
-        logger.error(
-            f"[SEND_DOCUMENT_FAIL] plataforma={plataforma} origem={origem_documento} arquivo={alvo_documento} erro={e_doc}"
-        )
+        logger.error(f"[SEND_DOCUMENT] Também falhou. erro={e_doc}")
         return False
 
 
@@ -1193,50 +631,17 @@ def nome_plataforma(is_pinterest, is_tiktok, is_instagram, is_rednote):
 
 
 def get_instagram_cookiefile():
-    global INSTAGRAM_COOKIEFILE_PATH
-
-    if not INSTAGRAM_COOKIES_TEXT:
-        return None
-
-    cookie_path = os.path.join(DOWNLOAD_DIR, "instagram_cookies.txt")
-
-    if INSTAGRAM_COOKIEFILE_PATH and os.path.exists(INSTAGRAM_COOKIEFILE_PATH):
-        return INSTAGRAM_COOKIEFILE_PATH
-
-    precisa_escrever = True
-
-    if os.path.exists(cookie_path):
-        try:
-            with open(cookie_path, "r", encoding="utf-8") as f:
-                conteudo_atual = f.read()
-            if conteudo_atual == INSTAGRAM_COOKIES_TEXT:
-                precisa_escrever = False
-        except Exception as e:
-            logger.warning(f"[INSTAGRAM_COOKIEFILE_READ] erro={e}")
-
-    if precisa_escrever:
+    if INSTAGRAM_COOKIES_TEXT:
+        cookie_path = os.path.join(DOWNLOAD_DIR, "instagram_cookies.txt")
         with open(cookie_path, "w", encoding="utf-8", newline="\n") as f:
             f.write(INSTAGRAM_COOKIES_TEXT)
-        logger.info("[INSTAGRAM_COOKIEFILE] arquivo de cookies atualizado")
-
-    INSTAGRAM_COOKIEFILE_PATH = cookie_path
-    return cookie_path
-
-
-def aplicar_silencio_ytdlp(opts):
-    opts["quiet"] = True
-    opts["no_warnings"] = True
-    opts["noprogress"] = True
-    opts["logger"] = YtDlpQuietLogger()
-    return opts
+        return cookie_path
+    return None
 
 
 def montar_info_opts(is_instagram=False, is_pinterest=False):
     opts = {
         "quiet": True,
-        "no_warnings": True,
-        "noprogress": True,
-        "verbose": False,
         "nocheckcertificate": True,
         "noplaylist": True,
         "socket_timeout": 20,
@@ -1251,7 +656,7 @@ def montar_info_opts(is_instagram=False, is_pinterest=False):
     elif is_pinterest:
         opts["http_headers"] = PINTEREST_HEADERS
 
-    return aplicar_silencio_ytdlp(opts)
+    return opts
 
 
 def montar_download_opts(prefix, is_instagram=False, is_pinterest=False):
@@ -1259,9 +664,6 @@ def montar_download_opts(prefix, is_instagram=False, is_pinterest=False):
         "outtmpl": f"{prefix}.%(ext)s",
         "nocheckcertificate": True,
         "quiet": True,
-        "no_warnings": True,
-        "noprogress": True,
-        "verbose": False,
         "noplaylist": True,
         "merge_output_format": "mp4",
         "retries": 2,
@@ -1278,7 +680,7 @@ def montar_download_opts(prefix, is_instagram=False, is_pinterest=False):
     elif is_pinterest:
         opts["http_headers"] = PINTEREST_HEADERS
 
-    return aplicar_silencio_ytdlp(opts)
+    return opts
 
 
 def mapear_erro_download(err_text, plataforma="geral"):
@@ -1464,45 +866,6 @@ def _escape_md(texto):
     return texto
 
 
-def formatar_valor_centavos(valor_centavos):
-    try:
-        valor = int(valor_centavos or 0) / 100
-        return f"R$ {valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-    except Exception:
-        return str(valor_centavos)
-
-
-def formatar_data_admin(valor):
-    if not valor:
-        return "-"
-
-    if isinstance(valor, str):
-        return valor
-
-    try:
-        if isinstance(valor, datetime):
-            if valor.tzinfo is None:
-                valor = valor.replace(tzinfo=TZ)
-            else:
-                valor = valor.astimezone(TZ)
-            return valor.strftime("%d/%m/%Y %H:%M:%S")
-    except Exception:
-        pass
-
-    return str(valor)
-
-
-def formatar_status_pedido(status):
-    mapa = {
-        "pending": "pendente",
-        "paid": "pago",
-        "expired": "expirado",
-        "checkout_error": "erro no checkout",
-        "creating": "criando checkout",
-    }
-    return mapa.get(str(status or "").strip().lower(), str(status or "-"))
-
-
 def notificar_admin_privado(texto):
     try:
         safe_send_message(ADMIN_ID, texto, parse_mode="Markdown", disable_web_page_preview=True)
@@ -1532,48 +895,6 @@ def montar_texto_admin_webhook(status, order_nsu=None, user_id=None, plano_nome=
     if detalhe:
         linhas.append(f"Detalhe: {_escape_md(detalhe)}")
     return "\n".join(linhas)
-
-
-def expirar_pedidos_antigos(expiration_hours=PENDING_ORDER_EXPIRATION_HOURS):
-    try:
-        limite = agora_tz() - timedelta(hours=max(1, int(expiration_hours)))
-        filtro = {
-            "status": {"$in": ["pending", "creating"]},
-            "created_at": {"$lt": limite}
-        }
-        atualizacao = {
-            "$set": {
-                "status": "expired",
-                "expired_at": agora_tz(),
-                "expired_reason": f"timeout_{int(expiration_hours)}h"
-            }
-        }
-
-        resultado = pedidos_col.update_many(filtro, atualizacao)
-
-        if resultado.modified_count:
-            logger.info(
-                f"[PEDIDOS_EXPIRED] expirados={resultado.modified_count} limite_horas={int(expiration_hours)}"
-            )
-
-        return resultado.modified_count
-    except Exception as e:
-        logger.warning(f"[PEDIDOS_EXPIRED] erro={e}")
-        return 0
-
-
-def loop_expirar_pedidos_antigos(interval_minutes=60, expiration_hours=PENDING_ORDER_EXPIRATION_HOURS):
-    intervalo_segundos = max(300, int(interval_minutes * 60))
-    logger.info(
-        f"[PEDIDOS_EXPIRED_LOOP] iniciado interval_minutes={interval_minutes} expiration_hours={int(expiration_hours)}"
-    )
-
-    while True:
-        try:
-            expirar_pedidos_antigos(expiration_hours=expiration_hours)
-        except Exception as e:
-            logger.warning(f"[PEDIDOS_EXPIRED_LOOP] erro={e}")
-        time.sleep(intervalo_segundos)
 
 
 # =========================================
@@ -2014,27 +1335,20 @@ def zerar_contador(message):
 def processar_aviso_geral(admin_chat_id, msg_texto):
     try:
         usuarios = usuarios_col.find({}, {"_id": 1})
-        enviados = 0
-        falhas = 0
+        cont = 0
 
         logger.info("[AVISOGERAL_LOOP] iniciado")
 
         for u in usuarios:
             try:
-                resp = safe_send_message(int(u["_id"]), msg_texto)
-                if resp:
-                    enviados += 1
-                else:
-                    falhas += 1
+                safe_send_message(int(u["_id"]), msg_texto, parse_mode="Markdown")
+                cont += 1
                 time.sleep(0.05)
-            except Exception as e:
-                falhas += 1
-                logger.warning(f"[AVISOGERAL_ITEM] user_id={u.get('_id')} erro={e}")
-        safe_send_message(
-            admin_chat_id,
-            f"📢 Aviso finalizado\n✅ Enviados: {enviados}\n❌ Falhas: {falhas}"
-        )
-        logger.info(f"[AVISOGERAL_LOOP] finalizado enviados={enviados} falhas={falhas}")
+            except Exception:
+                pass
+
+        safe_send_message(admin_chat_id, f"📢 Aviso enviado para {cont} usuários!")
+        logger.info(f"[AVISOGERAL_LOOP] finalizado enviados={cont}")
     except Exception as e:
         logger.error(f"[AVISOGERAL_LOOP] erro={e}")
         safe_send_message(admin_chat_id, "❌ Erro ao enviar aviso geral.")
@@ -2118,13 +1432,11 @@ def backup_geral(message):
     safe_reply_to(message, "🗂 Gerando backup geral e enviando no seu privado...")
 
 
-def _admin_code(valor, max_len=None):
-    texto = str(valor).replace("`", "'")
-    if max_len and len(texto) > max_len:
-        return texto[:max_len] + "..."
-    return texto
+@bot.message_handler(func=lambda m: m.text == "⚙️ Painel Admin")
+def painel_admin(message):
+    if message.from_user.id != ADMIN_ID:
+        return
 
-def enviar_painel_admin(chat_id):
     try:
         hoje = hoje_str()
         total_users = usuarios_col.count_documents({})
@@ -2142,60 +1454,18 @@ def enviar_painel_admin(chat_id):
 
         pedidos_pendentes = pedidos_col.count_documents({"status": "pending"})
         pedidos_pagos = pedidos_col.count_documents({"status": "paid"})
-        pedidos_expirados = pedidos_col.count_documents({"status": "expired"})
-        pedidos_checkout_error = pedidos_col.count_documents({"status": "checkout_error"})
-        pedidos_creating = pedidos_col.count_documents({"status": "creating"})
-        downloads_em_andamento = contar_downloads_em_andamento()
-        metadados_em_cache = contar_metadados_em_cache()
-        estados_download_memoria = contar_estados_download_memoria()
-        links_duplicados_memoria = contar_links_duplicados_memoria()
-
-        mongo_status = "ok"
-        try:
-            client.admin.command("ping")
-        except Exception as e:
-            mongo_status = f"erro: {str(e)[:80]}"
 
         resumo_admin = (
             "⚙️ *Painel Admin*\n\n"
-            "*Sistema*\n"
-            f"🧩 Serviço: `{_admin_code(SERVICE_NAME, 28)}`\n"
-            f"🌎 Ambiente: `{_admin_code(ENVIRONMENT_NAME, 20)}`\n"
-            f"🆔 Deploy: `{_admin_code(DEPLOYMENT_ID, 18)}`\n"
-            f"🔖 Versão: `{_admin_code(APP_VERSION, 18)}`\n\n"
-            "*Usuários e uso*\n"
             f"👥 Usuários: `{total_users}`\n"
-            f"💎 VIPs ativos: `{vips_ativos}`\n"
+            f"💎 VIPs: `{vips_ativos}`\n"
             f"📥 Downloads hoje: `{downloads_totais_hoje}`\n"
-            f"🚦 Em andamento: `{downloads_em_andamento}/{GLOBAL_DOWNLOAD_CONCURRENCY_LIMIT}`\n\n"
-            "*Pedidos*\n"
             f"🕒 Pendentes: `{pedidos_pendentes}`\n"
-            f"⏳ Criando checkout: `{pedidos_creating}`\n"
-            f"❌ Checkout com erro: `{pedidos_checkout_error}`\n"
-            f"⌛ Expirados: `{pedidos_expirados}`\n"
-            f"✅ Pagos: `{pedidos_pagos}`\n\n"
-            "*Infra*\n"
-            f"🗄 Mongo: `{_admin_code(mongo_status, 28)}`\n"
-            f"🎬 ffmpeg: `{'ok' if ffmpeg_disponivel() else 'off'}`\n"
-            f"🔎 ffprobe: `{'ok' if ffprobe_disponivel() else 'off'}`\n\n"
-            "*Config atual*\n"
-            f"🆓 Limite grátis: `{FREE_DAILY_LIMIT}/dia`\n"
-            f"⏱ Duração máx: `{MAX_DURATION_SECONDS}s`\n"
-            f"⌛ Expiração pendentes: `{PENDING_ORDER_EXPIRATION_HOURS}h`\n"
-            f"🚦 Limite global: `{GLOBAL_DOWNLOAD_CONCURRENCY_LIMIT}`\n"
-            f"🧠 Cache metadados: `{LINK_METADATA_CACHE_SECONDS}s`\n"
-            f"🧹 Limpeza memórias: `{TEMP_MEMORY_CLEANUP_INTERVAL_SECONDS}s`\n\n"
-            "*Memórias temporárias*\n"
-            f"🚦 Estados download: `{estados_download_memoria}`\n"
-            f"🔁 Links duplicados: `{links_duplicados_memoria}`\n"
-            f"🧠 Entradas meta cache: `{metadados_em_cache}`"
+            f"✅ Pagos: `{pedidos_pagos}`"
         )
+
         comandos_admin = (
-            "*Comandos*\n"
-            "• `/admin` ou botão *⚙️ Painel Admin*\n"
-            "• `/stats`\n"
-            "• `/pedido [ORDER_NSU]`\n"
-            "• `/user [ID]`\n"
+            "*Comandos:*\n"
             "• `/darvip [ID] [Dias]`\n"
             "• `/zerar [ID]`\n"
             "• `/avisogeral [Mensagem]`\n"
@@ -2205,200 +1475,12 @@ def enviar_painel_admin(chat_id):
             "• `/backupgeral`"
         )
 
-        safe_send_message(chat_id, resumo_admin, parse_mode="Markdown")
-        safe_send_message(chat_id, comandos_admin, parse_mode="Markdown")
+        safe_send_message(message.chat.id, resumo_admin, parse_mode="Markdown")
+        safe_send_message(message.chat.id, comandos_admin, parse_mode="Markdown")
     except Exception as e:
         logger.error(f"[PAINEL_ADMIN] erro={e}")
-        safe_send_message(chat_id, "❌ Erro ao abrir painel admin.")
+        safe_send_message(message.chat.id, "❌ Erro ao abrir painel admin.")
 
-
-@bot.message_handler(commands=["admin", "paineladmin"])
-def painel_admin_cmd(message):
-    if message.from_user.id != ADMIN_ID:
-        return
-    enviar_painel_admin(message.chat.id)
-
-
-@bot.message_handler(func=lambda m: m.text == "⚙️ Painel Admin")
-def painel_admin(message):
-    if message.from_user.id != ADMIN_ID:
-        return
-    enviar_painel_admin(message.chat.id)
-
-
-@bot.message_handler(commands=["stats"])
-def admin_stats(message):
-    if message.from_user.id != ADMIN_ID:
-        return
-
-    try:
-        hoje = hoje_str()
-        total_users = usuarios_col.count_documents({})
-        vips_ativos = usuarios_col.count_documents({
-            "$or": [
-                {"vip_ate": "Vitalício"},
-                {"vip_ate": {"$gte": hoje}}
-            ]
-        })
-
-        pipeline = [{"$group": {"_id": None, "total": {"$sum": "$downloads_hoje"}}}]
-        res_downloads = list(usuarios_col.aggregate(pipeline))
-        downloads_totais_hoje = res_downloads[0]["total"] if res_downloads else 0
-
-        pedidos_pendentes = pedidos_col.count_documents({"status": "pending"})
-        pedidos_pagos = pedidos_col.count_documents({"status": "paid"})
-        pedidos_expirados = pedidos_col.count_documents({"status": "expired"})
-        pedidos_checkout_error = pedidos_col.count_documents({"status": "checkout_error"})
-        pedidos_creating = pedidos_col.count_documents({"status": "creating"})
-        downloads_em_andamento = contar_downloads_em_andamento()
-        metadados_em_cache = contar_metadados_em_cache()
-        estados_download_memoria = contar_estados_download_memoria()
-        links_duplicados_memoria = contar_links_duplicados_memoria()
-
-        mongo_status = "ok"
-        try:
-            client.admin.command("ping")
-        except Exception as e:
-            mongo_status = f"erro: {str(e)[:80]}"
-
-        texto = (
-            "📊 *Stats rápidas*\n\n"
-            f"👥 Usuários: `{total_users}`\n"
-            f"💎 VIPs ativos: `{vips_ativos}`\n"
-            f"📥 Downloads hoje: `{downloads_totais_hoje}`\n"
-            f"🚦 Em andamento: `{downloads_em_andamento}/{GLOBAL_DOWNLOAD_CONCURRENCY_LIMIT}`\n\n"
-            "💳 *Pedidos*\n"
-            f"🕒 Pendentes: `{pedidos_pendentes}`\n"
-            f"⏳ Criando checkout: `{pedidos_creating}`\n"
-            f"❌ Checkout com erro: `{pedidos_checkout_error}`\n"
-            f"⌛ Expirados: `{pedidos_expirados}`\n"
-            f"✅ Pagos: `{pedidos_pagos}`\n\n"
-            "🖥 *Infra*\n"
-            f"🗄 Mongo: `{_admin_code(mongo_status, 28)}`\n"
-            f"🎬 ffmpeg: `{'ok' if ffmpeg_disponivel() else 'off'}`\n"
-            f"🔎 ffprobe: `{'ok' if ffprobe_disponivel() else 'off'}`\n"
-            f"🧠 Cache meta: `{metadados_em_cache}`\n"
-            f"🚦 Estados download: `{estados_download_memoria}`\n"
-            f"🔁 Links duplicados: `{links_duplicados_memoria}`\n"
-            f"🧹 Limpeza memórias: `{TEMP_MEMORY_CLEANUP_INTERVAL_SECONDS}s`"
-        )
-
-        safe_send_message(message.chat.id, texto, parse_mode="Markdown")
-    except Exception as e:
-        logger.error(f"[ADMIN_STATS] erro={e}")
-        safe_send_message(message.chat.id, "❌ Erro ao consultar stats.")
-
-
-@bot.message_handler(commands=["pedido"])
-def admin_pedido(message):
-    if message.from_user.id != ADMIN_ID:
-        return
-
-    try:
-        args = message.text.split(maxsplit=1)
-        if len(args) < 2 or not args[1].strip():
-            return safe_reply_to(message, "❌ Use: `/pedido ORDER_NSU`", parse_mode="Markdown")
-
-        order_nsu = args[1].strip()
-        pedido = pedidos_col.find_one({"order_nsu": order_nsu})
-
-        if not pedido:
-            return safe_send_message(message.chat.id, "❌ Pedido não encontrado.")
-
-        markup = None
-        links = []
-        if pedido.get("checkout_url"):
-            links.append(types.InlineKeyboardButton("💳 Checkout", url=pedido["checkout_url"]))
-        if pedido.get("receipt_url"):
-            links.append(types.InlineKeyboardButton("🧾 Comprovante", url=pedido["receipt_url"]))
-        if links:
-            markup = types.InlineKeyboardMarkup(row_width=2)
-            markup.add(*links)
-
-        texto = (
-            "🧾 *Consulta de pedido*\n\n"
-            f"🔖 NSU: `{_admin_code(pedido.get('order_nsu'), 64)}`\n"
-            f"👤 Usuário: `{_admin_code(pedido.get('user_id'), 24)}`\n"
-            f"💳 Plano: *{_escape_md(pedido.get('plano_nome') or '-')}*\n"
-            f"💰 Valor: *{_escape_md(formatar_valor_centavos(pedido.get('valor_centavos')))}*\n"
-            f"📌 Status: *{_escape_md(formatar_status_pedido(pedido.get('status')))}*\n"
-            f"🕒 Criado em: `{_admin_code(formatar_data_admin(pedido.get('created_at')), 24)}`\n"
-            f"✅ Pago em: `{_admin_code(formatar_data_admin(pedido.get('paid_at')), 24)}`\n"
-            f"🔁 Transação: `{_admin_code(pedido.get('transaction_nsu') or '-', 32)}`\n"
-            f"💎 VIP liberado até: `{_admin_code(pedido.get('vip_liberado_ate') or '-', 24)}`\n"
-            f"⌛ Expirado em: `{_admin_code(formatar_data_admin(pedido.get('expired_at')), 24)}`\n"
-            f"⚙️ Forma: `{_admin_code(pedido.get('capture_method') or '-', 24)}`"
-        )
-
-        safe_send_message(message.chat.id, texto, parse_mode="Markdown", reply_markup=markup)
-    except Exception as e:
-        logger.error(f"[ADMIN_PEDIDO] erro={e}")
-        safe_send_message(message.chat.id, "❌ Erro ao consultar pedido.")
-
-
-@bot.message_handler(commands=["user"])
-def admin_user(message):
-    if message.from_user.id != ADMIN_ID:
-        return
-
-    try:
-        args = message.text.split(maxsplit=1)
-        if len(args) < 2 or not args[1].strip():
-            return safe_reply_to(message, "❌ Use: `/user ID`", parse_mode="Markdown")
-
-        alvo_id = args[1].strip()
-        user_bruto = usuarios_col.find_one({"_id": str(alvo_id)})
-        if not user_bruto:
-            return safe_send_message(message.chat.id, "❌ Usuário não encontrado.")
-
-        user = obter_usuario(alvo_id)
-        vip = is_vip_user(user)
-
-        pedidos_usuario = list(
-            pedidos_col.find(
-                {"user_id": str(alvo_id)},
-                {
-                    "_id": 0,
-                    "order_nsu": 1,
-                    "plano_nome": 1,
-                    "valor_centavos": 1,
-                    "status": 1,
-                    "created_at": 1,
-                    "vip_liberado_ate": 1,
-                }
-            ).sort("created_at", -1).limit(5)
-        )
-
-        if pedidos_usuario:
-            linhas_pedidos = []
-            for pedido in pedidos_usuario:
-                linhas_pedidos.append(
-                    "• "
-                    f"`{_admin_code(pedido.get('order_nsu') or '-', 18)}` | "
-                    f"*{_escape_md(formatar_status_pedido(pedido.get('status')))}* | "
-                    f"{_escape_md(pedido.get('plano_nome') or '-')} | "
-                    f"{_escape_md(formatar_valor_centavos(pedido.get('valor_centavos')))} | "
-                    f"`{_admin_code(formatar_data_admin(pedido.get('created_at')), 16)}`"
-                )
-            resumo_pedidos = "\n".join(linhas_pedidos)
-        else:
-            resumo_pedidos = "Nenhum pedido encontrado."
-
-        texto = (
-            "👤 *Consulta de usuário*\n\n"
-            f"🆔 ID: `{_admin_code(alvo_id, 24)}`\n"
-            f"💎 VIP ativo: *{'sim' if vip else 'não'}*\n"
-            f"📅 VIP até: `{_admin_code(user.get('vip_ate') or '-', 24)}`\n"
-            f"📥 Downloads hoje: `{int(user.get('downloads_hoje', 0) or 0)}`\n"
-            f"🗓 Última data: `{_admin_code(user.get('ultima_data') or '-', 16)}`\n\n"
-            "🧾 *Últimos pedidos*\n"
-            f"{resumo_pedidos}"
-        )
-
-        safe_send_message(message.chat.id, texto, parse_mode="Markdown")
-    except Exception as e:
-        logger.error(f"[ADMIN_USER] erro={e}")
-        safe_send_message(message.chat.id, "❌ Erro ao consultar usuário.")
 
 
 # =========================================
@@ -2492,8 +1574,6 @@ def suporte(message):
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("pay_"))
 def checkout_automatico(call):
-    order_nsu = None
-
     try:
         valor = call.data.split("_", 1)[1]
         plano = obter_plano_por_callback(valor)
@@ -2510,12 +1590,11 @@ def checkout_automatico(call):
             "plano_key": valor,
             "plano_nome": plano["nome"],
             "valor_centavos": int(plano["preco_centavos"]),
-            "status": "creating",
+            "status": "pending",
             "created_at": agora_tz(),
             "checkout_url": None,
             "transaction_nsu": None,
-            "receipt_url": None,
-            "checkout_error": None
+            "receipt_url": None
         }
 
         pedidos_col.insert_one(pedido)
@@ -2524,14 +1603,7 @@ def checkout_automatico(call):
 
         pedidos_col.update_one(
             {"order_nsu": order_nsu},
-            {
-                "$set": {
-                    "status": "pending",
-                    "checkout_url": checkout_url,
-                    "checkout_created_at": agora_tz(),
-                    "checkout_error": None
-                }
-            }
+            {"$set": {"checkout_url": checkout_url}}
         )
 
         markup = types.InlineKeyboardMarkup()
@@ -2553,22 +1625,6 @@ def checkout_automatico(call):
 
     except Exception as e:
         logger.error(f"[CHECKOUT_CALLBACK] erro={e}")
-
-        if order_nsu:
-            try:
-                pedidos_col.update_one(
-                    {"order_nsu": order_nsu},
-                    {
-                        "$set": {
-                            "status": "checkout_error",
-                            "checkout_error": str(e)[:500],
-                            "checkout_error_at": agora_tz()
-                        }
-                    }
-                )
-            except Exception as e2:
-                logger.error(f"[CHECKOUT_CALLBACK_UPDATE_ERROR] order_nsu={order_nsu} erro={e2}")
-
         safe_send_message(
             call.message.chat.id,
             "❌ Não consegui gerar seu link de pagamento agora.\n"
@@ -2593,7 +1649,10 @@ def formatos_capados_gerais():
 def formatos_por_plataforma(is_tiktok=False, is_instagram=False, is_pinterest=False, is_rednote=False):
     if is_instagram:
         return [
+            "bestvideo[ext=mp4][width<=720][height<=1280][fps<=30]+bestaudio[ext=m4a]/best[ext=mp4][width<=720][height<=1280][fps<=30]",
             "bestvideo[ext=mp4][width<=720][height<=1280]+bestaudio[ext=m4a]/best[ext=mp4][width<=720][height<=1280]",
+            "best[ext=mp4][width<=720][height<=1280][fps<=30]",
+            "best[ext=mp4][width<=720][height<=1280]",
             "best[ext=mp4]/best"
         ]
 
@@ -2620,7 +1679,6 @@ def handle_download(message):
     user = obter_usuario(message.from_user.id)
     vip_status = is_vip_user(user)
     prefix = None
-    controle_download_ativo = False
 
     if not vip_status and user.get("downloads_hoje", 0) >= FREE_DAILY_LIMIT:
         safe_reply_to(
@@ -2634,32 +1692,6 @@ def handle_download(message):
     url = extrair_primeira_url(message.text)
     if not url:
         return safe_reply_to(message, "❌ Não encontrei um link válido na sua mensagem.")
-
-    url_normalizada = normalizar_url_para_duplicado(url)
-    if url_normalizada and url_normalizada != url.rstrip("/"):
-        logger.info(f"[URL_NORMALIZED] original={url} normalized={url_normalizada}")
-
-    if bloquear_link_duplicado_recente(message.from_user.id, url):
-        return safe_reply_to(
-            message,
-            "🔁 Esse mesmo link já foi processado há instantes. Aguarde um pouco antes de enviar novamente."
-        )
-
-    controle_info = iniciar_controle_download_usuario(message.from_user.id, getattr(message, "date", None))
-    controle_status = (controle_info or {}).get("status")
-    if controle_status == "global_limit":
-        return safe_reply_to(
-            message,
-            montar_mensagem_lotacao_global((controle_info or {}).get("active_total", 0))
-        )
-
-    if controle_status != "started":
-        return safe_reply_to(
-            message,
-            "⏳ Já estou processando seu link anterior. Aguarde concluir para enviar outro."
-        )
-
-    controle_download_ativo = True
 
     status_msg = safe_reply_to(
         message,
@@ -2686,7 +1718,8 @@ def handle_download(message):
             url_resolvida = resolver_link_pinterest(url)
 
             try:
-                info = obter_metadados_link_com_cache(url_resolvida, is_pinterest=True)
+                with yt_dlp.YoutubeDL(montar_info_opts(is_pinterest=True)) as ydl:
+                    info = ydl.extract_info(url_resolvida, download=False)
 
                 duracao = info.get("duration")
                 logger.info(f"[META] plataforma=Pinterest user_id={message.from_user.id} duration={duracao}")
@@ -2712,8 +1745,6 @@ def handle_download(message):
                 if not vip_status:
                     incrementar_download_gratis(user, message.chat.id, message.from_user.id)
 
-                registrar_link_processado(message.from_user.id, url)
-
                 if status_msg:
                     safe_delete_message(message.chat.id, status_msg.message_id)
 
@@ -2734,7 +1765,8 @@ def handle_download(message):
 
         prefix = os.path.join(DOWNLOAD_DIR, f"v_{message.from_user.id}_{uuid.uuid4().hex}")
 
-        info = obter_metadados_link_com_cache(url, is_instagram=is_instagram)
+        with yt_dlp.YoutubeDL(montar_info_opts(is_instagram=is_instagram)) as ydl:
+            info = ydl.extract_info(url, download=False)
 
         duracao = info.get("duration")
         logger.info(f"[META] plataforma={plataforma} user_id={message.from_user.id} duration={duracao}")
@@ -2769,9 +1801,6 @@ def handle_download(message):
 
                 arquivo_baixado = encontrar_arquivo_baixado(prefix)
                 if arquivo_baixado and os.path.exists(arquivo_baixado):
-                    logger.info(
-                        f"[DOWNLOAD_OK] plataforma={plataforma} formato={fmt} arquivo={arquivo_baixado}"
-                    )
                     baixou = True
                     break
 
@@ -2786,8 +1815,6 @@ def handle_download(message):
         if not arquivo_final or not os.path.exists(arquivo_final):
             raise Exception("Arquivo final não encontrado após o download")
 
-        if not ffmpeg_disponivel():
-            raise Exception("ffmpeg não está instalado no servidor.")
 
         arquivo_envio = preparar_arquivo_para_envio(arquivo_final, plataforma=plataforma)
 
@@ -2797,8 +1824,6 @@ def handle_download(message):
 
         if not vip_status:
             incrementar_download_gratis(user, message.chat.id, message.from_user.id)
-
-        registrar_link_processado(message.from_user.id, url)
 
         if status_msg:
             safe_delete_message(message.chat.id, status_msg.message_id)
@@ -2815,8 +1840,6 @@ def handle_download(message):
     finally:
         if prefix:
             cleanup_prefix(prefix)
-        if controle_download_ativo:
-            finalizar_controle_download_usuario(message.from_user.id)
 
 
 # =========================================
@@ -3025,47 +2048,6 @@ def webhook_infinitepay():
 
 
 
-
-
-def obter_metricas_health():
-    metricas = {
-        "ffmpeg_available": ffmpeg_disponivel(),
-        "ffprobe_available": ffprobe_disponivel(),
-        "mongo_status": "unknown",
-        "users_total": None,
-        "active_vips": None,
-        "pending_orders": None,
-        "expired_orders": None,
-        "paid_orders": None,
-        "downloads_in_progress": contar_downloads_em_andamento(),
-        "download_state_entries": contar_estados_download_memoria(),
-        "duplicate_link_entries": contar_links_duplicados_memoria(),
-        "metadata_cache_entries": contar_metadados_em_cache(),
-        "global_download_limit": GLOBAL_DOWNLOAD_CONCURRENCY_LIMIT,
-    }
-
-    try:
-        client.admin.command("ping")
-        metricas["mongo_status"] = "ok"
-
-        hoje = hoje_str()
-        metricas["users_total"] = usuarios_col.count_documents({})
-        metricas["active_vips"] = usuarios_col.count_documents({
-            "$or": [
-                {"vip_ate": "Vitalício"},
-                {"vip_ate": {"$gte": hoje}}
-            ]
-        })
-        metricas["pending_orders"] = pedidos_col.count_documents({"status": "pending"})
-        metricas["expired_orders"] = pedidos_col.count_documents({"status": "expired"})
-        metricas["paid_orders"] = pedidos_col.count_documents({"status": "paid"})
-    except Exception as e:
-        metricas["mongo_status"] = f"error: {str(e)[:150]}"
-        logger.warning(f"[HEALTH_METRICS] erro={e}")
-
-    return metricas
-
-
 # =========================================
 # HEALTHCHECK
 # =========================================
@@ -3075,8 +2057,6 @@ def root_status():
 
 @app.route("/health")
 def health():
-    metricas = obter_metricas_health()
-
     return jsonify({
         "status": "ok",
         "service": SERVICE_NAME,
@@ -3085,25 +2065,7 @@ def health():
         "environment": ENVIRONMENT_NAME,
         "started_at": APP_STARTED_AT,
         "bot": "running",
-        "flask": "running",
-        "ffmpeg_available": metricas["ffmpeg_available"],
-        "ffprobe_available": metricas["ffprobe_available"],
-        "mongo_status": metricas["mongo_status"],
-        "users_total": metricas["users_total"],
-        "active_vips": metricas["active_vips"],
-        "pending_orders": metricas["pending_orders"],
-        "expired_orders": metricas["expired_orders"],
-        "paid_orders": metricas["paid_orders"],
-        "downloads_in_progress": metricas["downloads_in_progress"],
-        "metadata_cache_entries": metricas["metadata_cache_entries"],
-        "metadata_cache_ttl_seconds": LINK_METADATA_CACHE_SECONDS,
-        "download_state_entries": metricas["download_state_entries"],
-        "duplicate_link_entries": metricas["duplicate_link_entries"],
-        "temp_memory_cleanup_interval_seconds": TEMP_MEMORY_CLEANUP_INTERVAL_SECONDS,
-        "download_active_stale_seconds": DOWNLOAD_ACTIVE_STALE_SECONDS,
-        "download_state_retention_seconds": DOWNLOAD_STATE_RETENTION_SECONDS,
-        "duplicate_link_state_retention_seconds": DUPLICATE_LINK_STATE_RETENTION_SECONDS,
-        "global_download_limit": metricas["global_download_limit"]
+        "flask": "running"
     }), 200
 
 
@@ -3112,18 +2074,10 @@ def health():
 # =========================================
 if __name__ == "__main__":
     cleanup_download_dir_old_files(max_age_hours=6)
-    limpar_memorias_temporarias(force=True, reason="startup")
-    expirar_pedidos_antigos(expiration_hours=PENDING_ORDER_EXPIRATION_HOURS)
 
     Thread(
         target=cleanup_download_dir_periodicamente,
         kwargs={"interval_minutes": 60, "max_age_hours": 6},
-        daemon=True
-    ).start()
-
-    Thread(
-        target=loop_expirar_pedidos_antigos,
-        kwargs={"interval_minutes": 60, "expiration_hours": PENDING_ORDER_EXPIRATION_HOURS},
         daemon=True
     ).start()
 
