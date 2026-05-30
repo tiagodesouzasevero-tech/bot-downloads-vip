@@ -13,8 +13,6 @@ import telebot
 import yt_dlp
 import subprocess
 import json
-import html
-from urllib.parse import unquote
 
 from flask import Flask, request, jsonify
 from telebot import types
@@ -76,9 +74,6 @@ FREE_DAILY_LIMIT = 3
 MAX_DURATION_SECONDS = 90
 
 INSTAGRAM_COOKIES_TEXT = os.environ.get("INSTAGRAM_COOKIES_TEXT", "").strip()
-# Opcional: cole aqui na Railway cookies da Shopee se quiser que o bot tente acessar
-# versões que só aparecem para sessão logada. Não é obrigatório para o bot subir.
-SHOPEE_COOKIES_TEXT = os.environ.get("SHOPEE_COOKIES_TEXT", "").strip()
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
@@ -136,18 +131,6 @@ INSTAGRAM_HEADERS = {
     "Sec-Fetch-Dest": "empty",
     "Sec-Fetch-Mode": "cors",
     "Sec-Fetch-Site": "same-origin"
-}
-
-SHOPEE_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/134.0.0.0 Safari/537.36"
-    ),
-    "Referer": "https://shopee.com.br/",
-    "Origin": "https://shopee.com.br",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8"
 }
 
 PLANOS = {
@@ -319,15 +302,6 @@ def obter_info_midia(arquivo_entrada):
         fps = parse_fps(video_stream.get("avg_frame_rate")) or parse_fps(video_stream.get("r_frame_rate"))
 
     format_name = (dados.get("format", {}) or {}).get("format_name", "")
-
-    duracao = None
-    try:
-        duracao_raw = (dados.get("format", {}) or {}).get("duration")
-        if duracao_raw:
-            duracao = float(duracao_raw)
-    except Exception:
-        duracao = None
-
     tamanho = None
     try:
         tamanho = os.path.getsize(arquivo_entrada)
@@ -341,7 +315,6 @@ def obter_info_midia(arquivo_entrada):
         "vcodec": (video_stream or {}).get("codec_name"),
         "acodec": (audio_stream or {}).get("codec_name") if audio_stream else None,
         "format_name": format_name,
-        "duration": duracao,
         "size_bytes": tamanho,
     }
 
@@ -642,11 +615,10 @@ def detectar_plataforma(url_lower):
     is_tiktok = ("tiktok.com" in url_lower) or ("vm.tiktok.com" in url_lower) or ("vt.tiktok.com" in url_lower)
     is_instagram = ("instagram.com" in url_lower) or ("instagr.am" in url_lower)
     is_rednote = ("xiaohongshu.com" in url_lower) or ("xhslink.com" in url_lower) or ("rednote" in url_lower)
-    is_shopee = ("shopee.com" in url_lower) or ("shp.ee" in url_lower) or ("sv.shopee" in url_lower)
-    return is_pinterest, is_tiktok, is_instagram, is_rednote, is_shopee
+    return is_pinterest, is_tiktok, is_instagram, is_rednote
 
 
-def nome_plataforma(is_pinterest, is_tiktok, is_instagram, is_rednote, is_shopee=False):
+def nome_plataforma(is_pinterest, is_tiktok, is_instagram, is_rednote):
     if is_pinterest:
         return "Pinterest"
     if is_tiktok:
@@ -655,8 +627,6 @@ def nome_plataforma(is_pinterest, is_tiktok, is_instagram, is_rednote, is_shopee
         return "Instagram"
     if is_rednote:
         return "RedNote"
-    if is_shopee:
-        return "Shopee"
     return "Desconhecida"
 
 
@@ -669,31 +639,7 @@ def get_instagram_cookiefile():
     return None
 
 
-def get_shopee_cookiefile():
-    """
-    Opcional: aceita SHOPEE_COOKIES_TEXT em formato Netscape/cookies.txt.
-    Isso pode ajudar quando a Shopee só mostra a URL original para sessão logada.
-    """
-    if SHOPEE_COOKIES_TEXT and "\t" in SHOPEE_COOKIES_TEXT:
-        cookie_path = os.path.join(DOWNLOAD_DIR, "shopee_cookies.txt")
-        with open(cookie_path, "w", encoding="utf-8", newline="\n") as f:
-            f.write(SHOPEE_COOKIES_TEXT)
-        return cookie_path
-    return None
-
-
-def get_shopee_headers():
-    headers = SHOPEE_HEADERS.copy()
-
-    # Se o usuário colocar cookies no formato de cabeçalho HTTP, o bot usa nas requisições diretas.
-    # Exemplo: SPC_EC=...; SPC_ST=...; csrftoken=...
-    if SHOPEE_COOKIES_TEXT and "=" in SHOPEE_COOKIES_TEXT and "\t" not in SHOPEE_COOKIES_TEXT:
-        headers["Cookie"] = SHOPEE_COOKIES_TEXT.replace("\n", "; ").strip("; ")
-
-    return headers
-
-
-def montar_info_opts(is_instagram=False, is_pinterest=False, is_shopee=False):
+def montar_info_opts(is_instagram=False, is_pinterest=False):
     opts = {
         "quiet": True,
         "nocheckcertificate": True,
@@ -709,16 +655,11 @@ def montar_info_opts(is_instagram=False, is_pinterest=False, is_shopee=False):
             opts["cookiefile"] = cookiefile
     elif is_pinterest:
         opts["http_headers"] = PINTEREST_HEADERS
-    elif is_shopee:
-        opts["http_headers"] = get_shopee_headers()
-        cookiefile = get_shopee_cookiefile()
-        if cookiefile:
-            opts["cookiefile"] = cookiefile
 
     return opts
 
 
-def montar_download_opts(prefix, is_instagram=False, is_pinterest=False, is_shopee=False):
+def montar_download_opts(prefix, is_instagram=False, is_pinterest=False):
     opts = {
         "outtmpl": f"{prefix}.%(ext)s",
         "nocheckcertificate": True,
@@ -738,11 +679,6 @@ def montar_download_opts(prefix, is_instagram=False, is_pinterest=False, is_shop
             opts["cookiefile"] = cookiefile
     elif is_pinterest:
         opts["http_headers"] = PINTEREST_HEADERS
-    elif is_shopee:
-        opts["http_headers"] = get_shopee_headers()
-        cookiefile = get_shopee_cookiefile()
-        if cookiefile:
-            opts["cookiefile"] = cookiefile
 
     return opts
 
@@ -772,20 +708,6 @@ def mapear_erro_download(err_text, plataforma="geral"):
         if "timed out" in err:
             return "❌ O Instagram demorou para responder. Tente novamente."
         return "❌ Não consegui baixar esse link do Instagram agora."
-
-    if plataforma == "shopee":
-        if "sem marca" in err or "no-watermark" in err or "original/sem marca" in err:
-            return (
-                "❌ A Shopee não liberou uma versão sem marca d'água/original nesse link.\n"
-                "Envie outro link de Shopee Vídeo ou teste com cookies da Shopee na variável SHOPEE_COOKIES_TEXT."
-            )
-        if "nenhuma url direta" in err or "não encontrei o vídeo" in err:
-            return "❌ Não encontrei o vídeo nesse link da Shopee. Envie o link direto do Shopee Vídeo."
-        if "403" in err or "forbidden" in err:
-            return "❌ A Shopee bloqueou esse link no momento. Tente novamente ou envie outro link do vídeo."
-        if "timed out" in err or "timeout" in err:
-            return "❌ A Shopee demorou para responder. Tente novamente."
-        return "❌ Não consegui baixar esse Shopee Vídeo agora."
 
     texto_erro = "❌ Erro no link ou formato."
     if "unsupported url" in err:
@@ -1103,506 +1025,6 @@ def baixar_pinterest_capado(url, prefix):
 
 
 # =========================================
-# SHOPEE VÍDEOS
-# =========================================
-def resolver_link_shopee(url):
-    try:
-        url = url.strip()
-
-        r = requests.get(
-            url,
-            allow_redirects=True,
-            timeout=(5, 15),
-            headers=get_shopee_headers()
-        )
-
-        if r.url:
-            logger.info(f"[SHOPEE_REDIRECT] {url} -> {r.url}")
-            return r.url, r.text
-
-    except Timeout as e:
-        logger.warning(f"[SHOPEE_TIMEOUT] url={url} erro={e}")
-    except RequestException as e:
-        logger.warning(f"[SHOPEE_REQUEST_ERROR] url={url} erro={e}")
-    except Exception as e:
-        logger.warning(f"[SHOPEE_UNKNOWN_ERROR] url={url} erro={e}")
-
-    return url, None
-
-
-def normalizar_url_midia_shopee(raw_url):
-    if not raw_url:
-        return None
-
-    url = str(raw_url).strip().strip("\"' ")
-    url = html.unescape(url)
-
-    # A Shopee costuma entregar URLs em vários formatos:
-    # normal, com barras escapadas, unicode escaped e/ou percent-encoded.
-    for _ in range(3):
-        antes = url
-        try:
-            url = json.loads(f'"{url}"')
-        except Exception:
-            pass
-
-        url = (
-            url
-            .replace("\\/", "/")
-            .replace("\\u002F", "/")
-            .replace("\\u002f", "/")
-            .replace("&amp;", "&")
-        )
-
-        try:
-            url = unquote(url)
-        except Exception:
-            pass
-
-        if url == antes:
-            break
-
-    if url.startswith("//"):
-        url = "https:" + url
-
-    # Corrige URLs que ficaram com barras ainda escapadas depois do decode.
-    url = url.replace("\\/", "/")
-
-    return url
-
-
-def url_parece_video_shopee(url):
-    if not url:
-        return False
-
-    u = url.lower()
-    if any(x in u for x in ("thumbnail", "thumb", "cover", "avatar", "image", ".jpg", ".jpeg", ".png", ".webp", ".gif")):
-        return False
-
-    return (
-        ".mp4" in u
-        or ".m3u8" in u
-        or "vod.susercontent.com" in u
-        or "down-" in u and "susercontent.com" in u
-    )
-
-
-def shopee_texto_candidato(candidato=None, url="", contexto="", origem=""):
-    candidato = candidato or {}
-    return f"{url} {contexto} {origem} {candidato.get('url', '')} {candidato.get('contexto', '')} {candidato.get('origem', '')}".lower()
-
-
-def shopee_indica_sem_marca_ou_original(candidato=None, url="", contexto="", origem=""):
-    texto = shopee_texto_candidato(candidato, url, contexto, origem)
-
-    termos_sem_marca = [
-        "no_watermark", "no-watermark", "nowatermark", "without_watermark",
-        "without-watermark", "watermarkless", "sem_marca", "sem-marca",
-        "remove_watermark", "unwatermarked"
-    ]
-    termos_original = [
-        "origin_video", "original_video", "originvideo", "originalvideo",
-        "originurl", "originalurl", "origin_url", "original_url",
-        "source_url", "sourceurl", "raw_url", "rawurl",
-        "video_original", "video_origin", "download_url", "downloadurl",
-        "main_url", "mainurl", "default_url", "defaulturl"
-    ]
-
-    if any(t in texto for t in termos_sem_marca):
-        return True
-
-    # Alguns HTMLs usam "origin"/"source" sem falar explicitamente "no_watermark".
-    if any(t in texto for t in termos_original) and "watermark" not in texto:
-        return True
-
-    return False
-
-
-def shopee_indica_com_marca(candidato=None, url="", contexto="", origem=""):
-    texto = shopee_texto_candidato(candidato, url, contexto, origem)
-
-    if shopee_indica_sem_marca_ou_original(candidato, url, contexto, origem):
-        return False
-
-    termos_com_marca = [
-        "watermark", "water_mark", "water-mark", "wm_url", "wmurl",
-        "with_watermark", "with-watermark", "marked_url", "markedurl"
-    ]
-    if any(t in texto for t in termos_com_marca):
-        return True
-
-    if re.search(r"(^|[^a-z])wm([^a-z]|$)", texto):
-        return True
-
-    return False
-
-
-def pontuar_contexto_shopee(url, contexto="", origem=""):
-    texto = shopee_texto_candidato(None, url, contexto, origem)
-    score = 0
-
-    # Prioridade real: somente versão original/sem marca d'água.
-    if shopee_indica_sem_marca_ou_original(None, url, contexto, origem):
-        score += 2500
-
-    if shopee_indica_com_marca(None, url, contexto, origem):
-        score -= 2500
-
-    if "video_url" in texto or "videourl" in texto or "play_url" in texto or "playurl" in texto:
-        score += 80
-
-    if any(t in texto for t in ("preview", "cover", "thumbnail", "thumb", "compressed", "low_quality", "lowquality")):
-        score -= 500
-
-    # Preferência de qualidade sem upscale: 720 primeiro, depois inferior se original só existir inferior.
-    if "720" in texto or "1280" in texto:
-        score += 180
-    if "540" in texto or "960" in texto:
-        score += 90
-    if "480" in texto or "854" in texto:
-        score += 40
-    if "360" in texto or "640" in texto:
-        score += 10
-
-    if ".m3u8" in texto:
-        score += 45
-    if ".mp4" in texto:
-        score += 25
-
-    return score
-
-
-def _adicionar_candidato_shopee(candidatos, vistos, raw_url, origem="", contexto=""):
-    url = normalizar_url_midia_shopee(raw_url)
-    if not url or not url_parece_video_shopee(url):
-        return
-
-    chave = url.split("#", 1)[0]
-    if chave in vistos:
-        return
-
-    sem_marca_ou_original = shopee_indica_sem_marca_ou_original(None, url, contexto, origem)
-    com_marca = shopee_indica_com_marca(None, url, contexto, origem)
-
-    vistos.add(chave)
-    candidatos.append({
-        "url": url,
-        "origem": origem,
-        "contexto": contexto or "",
-        "score_contexto": pontuar_contexto_shopee(url, contexto, origem),
-        "sem_marca_ou_original": sem_marca_ou_original,
-        "com_marca": com_marca,
-    })
-
-
-def extrair_candidatos_video_shopee_html(html_text):
-    if not html_text:
-        return []
-
-    candidatos = []
-    vistos = set()
-
-    # URLs normais, escapadas e percent-encoded.
-    padroes = [
-        r'https?:\\?/\\?/[^"\'<>\s]+?(?:\.mp4|\.m3u8)(?:\?[^"\'<>\s]*)?',
-        r'//[^"\'<>\s]+?(?:\.mp4|\.m3u8)(?:\?[^"\'<>\s]*)?',
-        r'https?:\\?/\\?/[^"\'<>\s]*vod\.susercontent\.com[^"\'<>\s]*',
-        r'//[^"\'<>\s]*vod\.susercontent\.com[^"\'<>\s]*',
-        r'https%3A%2F%2F[^"\'<>\s]+?(?:\.mp4|\.m3u8|%2Emp4|%2Em3u8)(?:[^"\'<>\s]*)?',
-        r'https%3A%2F%2F[^"\'<>\s]*vod\.susercontent\.com[^"\'<>\s]*',
-    ]
-
-    for padrao in padroes:
-        for match in re.finditer(padrao, html_text, flags=re.IGNORECASE):
-            ini = max(0, match.start() - 180)
-            fim = min(len(html_text), match.end() + 180)
-            contexto = html_text[ini:fim]
-            _adicionar_candidato_shopee(
-                candidatos,
-                vistos,
-                match.group(0),
-                origem="regex_url",
-                contexto=contexto
-            )
-
-    # Campos JSON/JS que podem indicar versão original ou sem marca d'água.
-    chaves_video = [
-        "no_watermark_url", "noWatermarkUrl", "nowatermark_url", "noWatermarkURL",
-        "without_watermark_url", "withoutWatermarkUrl", "withoutWatermarkURL",
-        "origin_video_url", "original_video_url", "originVideoUrl", "originalVideoUrl",
-        "originVideoURL", "originalVideoURL", "origin_url", "original_url",
-        "source_video_url", "sourceVideoUrl", "source_url", "sourceUrl",
-        "raw_video_url", "rawVideoUrl", "raw_url", "rawUrl",
-        "download_url", "downloadUrl", "main_url", "mainUrl",
-        "video_url", "videoUrl", "play_url", "playUrl", "playAddr", "play_addr",
-        "watermark_url", "watermarkUrl", "wm_url", "wmUrl",
-        "url", "src"
-    ]
-
-    for chave in chaves_video:
-        padrao_chave = rf'["\']{re.escape(chave)}["\']\s*:\s*["\']([^"\']+)["\']'
-        for match in re.finditer(padrao_chave, html_text, flags=re.IGNORECASE):
-            ini = max(0, match.start() - 180)
-            fim = min(len(html_text), match.end() + 180)
-            contexto = html_text[ini:fim]
-            _adicionar_candidato_shopee(
-                candidatos,
-                vistos,
-                match.group(1),
-                origem=f"json_key:{chave}",
-                contexto=contexto
-            )
-
-    # Tenta ler JSONs embutidos, como __NEXT_DATA__/application-json, para achar campos
-    # que o regex simples não capturou.
-    def _walk_json_shopee(obj, caminho="json"):
-        if isinstance(obj, dict):
-            for k, v in obj.items():
-                chave = str(k)
-                novo_caminho = f"{caminho}.{chave}"
-                if isinstance(v, str):
-                    contexto = f"{novo_caminho} {chave}"
-                    _adicionar_candidato_shopee(
-                        candidatos,
-                        vistos,
-                        v,
-                        origem=f"json_walk:{chave}",
-                        contexto=contexto
-                    )
-                else:
-                    _walk_json_shopee(v, novo_caminho)
-        elif isinstance(obj, list):
-            for idx, item in enumerate(obj):
-                _walk_json_shopee(item, f"{caminho}[{idx}]")
-
-    scripts_json = []
-    for match in re.finditer(r'<script[^>]*(?:application/json|__NEXT_DATA__)[^>]*>(.*?)</script>', html_text, flags=re.IGNORECASE | re.DOTALL):
-        scripts_json.append(html.unescape(match.group(1).strip()))
-
-    # Alguns dados aparecem com caracteres &quot; em atributos ou blocos de script.
-    for raw_json in scripts_json[:8]:
-        try:
-            dados = json.loads(raw_json)
-            _walk_json_shopee(dados, "embedded_json")
-        except Exception:
-            pass
-
-    # Remove duplicados e coloca em primeiro as URLs com maior chance de serem HD/sem marca.
-    candidatos.sort(
-        key=lambda c: (
-            c.get("score_contexto", 0),
-            1 if ".m3u8" in c.get("url", "").lower() else 0,
-            len(c.get("url", ""))
-        ),
-        reverse=True
-    )
-
-    return candidatos
-
-
-def extrair_urls_video_shopee_html(html_text):
-    # Mantida por compatibilidade com versões anteriores do código.
-    return [c["url"] for c in extrair_candidatos_video_shopee_html(html_text)]
-
-
-def baixar_url_direta_shopee(video_url, prefix):
-    video_url = normalizar_url_midia_shopee(video_url)
-
-    if not video_url:
-        raise Exception("URL direta da Shopee inválida")
-
-    if ".m3u8" in video_url.lower():
-        opts = montar_download_opts(prefix, is_shopee=True)
-        opts["format"] = "best[width<=720][height<=1280][fps<=30]/best[width<=720][height<=1280]/best"
-
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            ydl.download([video_url])
-
-        arquivo = encontrar_arquivo_baixado(prefix)
-        if arquivo and os.path.exists(arquivo):
-            return arquivo
-
-        raise Exception("Arquivo Shopee m3u8 não foi gerado")
-
-    arquivo_saida = f"{prefix}.mp4"
-
-    with requests.get(
-        video_url,
-        stream=True,
-        timeout=(8, 90),
-        headers=get_shopee_headers()
-    ) as r:
-        if not r.ok:
-            raise Exception(f"Falha ao baixar vídeo da Shopee. status={r.status_code}")
-
-        with open(arquivo_saida, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1024 * 512):
-                if chunk:
-                    f.write(chunk)
-
-    if not os.path.exists(arquivo_saida) or os.path.getsize(arquivo_saida) < 10_000:
-        raise Exception("Arquivo da Shopee não foi gerado corretamente")
-
-    return arquivo_saida
-
-
-def pontuar_arquivo_shopee(arquivo, candidato):
-    info = obter_info_midia(arquivo) or {}
-    width = int(info.get("width") or 0)
-    height = int(info.get("height") or 0)
-    fps = float(info.get("fps") or 0)
-    pixels = width * height
-    score_contexto = int(candidato.get("score_contexto") or 0)
-
-    cabe_no_limite = (
-        width > 0
-        and height > 0
-        and width <= 720
-        and height <= 1280
-        and (fps == 0 or fps <= 30.5)
-    )
-
-    # Mantém o mesmo comportamento dos outros apps: pega a melhor qualidade disponível
-    # dentro do limite. Não faz upscale de 480 para 720.
-    score = score_contexto
-    score += 100000 if cabe_no_limite else 0
-    score += min(pixels, 720 * 1280) // 10
-
-    # Preferência leve por vídeos verticais de feed/reels.
-    if height >= width:
-        score += 120
-
-    # Penaliza candidatos acima do limite quando houver outro dentro do limite.
-    if width > 720 or height > 1280 or fps > 30.5:
-        score -= 30000
-
-    return score, info
-
-
-def baixar_melhor_candidato_shopee(candidatos, prefix, url_resolvida):
-    if not candidatos:
-        raise Exception("Não encontrei o vídeo no link da Shopee")
-
-    total = len(candidatos)
-    candidatos_sem_marca = [
-        c for c in candidatos
-        if c.get("sem_marca_ou_original") and not c.get("com_marca")
-    ]
-
-    logger.info(
-        f"[SHOPEE_CANDIDATOS] total={total} sem_marca_ou_original={len(candidatos_sem_marca)} "
-        f"url={url_resolvida}"
-    )
-
-    # Regra solicitada: não enviar vídeo da Shopee com marca d'água.
-    # Se a Shopee não expuser uma URL original/sem marca, o bot avisa em vez de mandar arquivo marcado.
-    if not candidatos_sem_marca:
-        for idx, c in enumerate(candidatos[:8]):
-            logger.info(
-                f"[SHOPEE_DESCARTADO_COM_MARCA] idx={idx} origem={c.get('origem')} "
-                f"sem_marca_ou_original={c.get('sem_marca_ou_original')} com_marca={c.get('com_marca')} "
-                f"score_contexto={c.get('score_contexto')} url={str(c.get('url', ''))[:160]}"
-            )
-        raise Exception("Shopee não liberou versão original/sem marca d'água para este link")
-
-    melhores = []
-    ultimo_erro = None
-    limite_tentativas = min(len(candidatos_sem_marca), 16)
-
-    for idx, candidato in enumerate(candidatos_sem_marca[:limite_tentativas]):
-        video_url = candidato.get("url")
-        prefix_candidato = f"{prefix}_shopee_original_{idx}"
-
-        try:
-            cleanup_prefix(prefix_candidato)
-            arquivo = baixar_url_direta_shopee(video_url, prefix_candidato)
-
-            if not arquivo or not os.path.exists(arquivo):
-                continue
-
-            score, info = pontuar_arquivo_shopee(arquivo, candidato)
-            width = int((info or {}).get("width") or 0)
-            height = int((info or {}).get("height") or 0)
-            fps = float((info or {}).get("fps") or 0)
-
-            # Não envia arquivo fora do limite do bot. Se vier 1080/60fps, o preparo posterior
-            # ainda reduz para 720/30fps como os outros apps, mas aqui a pontuação favorece
-            # o maior original dentro do limite.
-            if width <= 0 or height <= 0:
-                score -= 50000
-            if fps and fps > 30.5:
-                score -= 20000
-
-            logger.info(
-                f"[SHOPEE_CANDIDATO_ORIGINAL] idx={idx} score={score} score_contexto={candidato.get('score_contexto')} "
-                f"width={info.get('width')} height={info.get('height')} fps={info.get('fps')} "
-                f"origem={candidato.get('origem')} url={video_url[:160]}"
-            )
-
-            melhores.append({
-                "arquivo": arquivo,
-                "score": score,
-                "info": info,
-                "candidato": candidato,
-            })
-
-        except Exception as e:
-            ultimo_erro = str(e)
-            logger.warning(f"[SHOPEE_TENTATIVA_ORIGINAL] idx={idx} url={url_resolvida} erro={e}")
-            cleanup_prefix(prefix_candidato)
-
-    if not melhores:
-        raise Exception(ultimo_erro or "Falha ao baixar Shopee Vídeo sem marca d'água")
-
-    melhores.sort(key=lambda item: item["score"], reverse=True)
-    escolhido = melhores[0]
-
-    arquivo_escolhido = escolhido["arquivo"]
-    for item in melhores[1:]:
-        try:
-            if item["arquivo"] != arquivo_escolhido and os.path.exists(item["arquivo"]):
-                os.remove(item["arquivo"])
-        except Exception:
-            pass
-
-    info = escolhido.get("info") or {}
-    candidato = escolhido.get("candidato") or {}
-    logger.info(
-        f"[SHOPEE_OK_SEM_MARCA] url={url_resolvida} escolhido={arquivo_escolhido} "
-        f"width={info.get('width')} height={info.get('height')} fps={info.get('fps')} "
-        f"origem={candidato.get('origem')} score_contexto={candidato.get('score_contexto')} "
-        f"video_url={str(candidato.get('url', ''))[:160]}"
-    )
-
-    return arquivo_escolhido
-
-
-def baixar_shopee_video(url, prefix):
-    url_resolvida, html_text = resolver_link_shopee(url)
-
-    candidatos = extrair_candidatos_video_shopee_html(html_text)
-
-    # Fallback: se o HTML inicial não trouxe o vídeo, tenta buscar a URL final de novo.
-    if not candidatos:
-        try:
-            resp = requests.get(
-                url_resolvida,
-                timeout=(5, 20),
-                headers=get_shopee_headers()
-            )
-            candidatos = extrair_candidatos_video_shopee_html(resp.text)
-        except Exception as e:
-            logger.warning(f"[SHOPEE_HTML_FALLBACK] url={url_resolvida} erro={e}")
-
-    if candidatos:
-        return baixar_melhor_candidato_shopee(candidatos, prefix, url_resolvida)
-
-    # Sem candidato direto, não usamos fallback genérico porque ele pode entregar vídeo marcado.
-    # A regra da Shopee agora é estrita: só enviar se encontrar URL original/sem marca d'água.
-    raise Exception("Não encontrei versão original/sem marca d'água no link da Shopee")
-
-
-# =========================================
 # MENU / UI
 # =========================================
 def enviar_menu_principal(is_admin=False):
@@ -1629,7 +1051,7 @@ def mostrar_planos_chat(chat_id, user_id):
         "Escolha o plano ideal para ativar seus downloads ilimitados.\n\n"
         "✅ Sem limite diário\n"
         "✅ Prioridade no processamento\n"
-        "✅ Uso liberado para TikTok, Pinterest, Instagram, RedNote e Shopee Vídeos\n"
+        "✅ Uso liberado para TikTok, Pinterest, Instagram e RedNote\n"
         "✅ Liberação automática após o pagamento\n\n"
         f"Sua ID: `{user_id}`"
     )
@@ -2076,7 +1498,7 @@ def start(message):
 
     texto = (
         "🚀 *Afiliado Tools*\n\n"
-        "Baixe vídeos em HD do TikTok, Pinterest, Instagram, RedNote e Shopee Vídeos.\n\n"
+        "Baixe vídeos em HD do TikTok, Pinterest, Instagram e RedNote.\n\n"
         f"• Duração máx: {MAX_DURATION_SECONDS}s\n"
         f"• Sua ID: `{message.from_user.id}`\n\n"
         f"{status}"
@@ -2108,8 +1530,7 @@ def como_funciona(message):
         "• TikTok\n"
         "• Pinterest\n"
         "• Instagram\n"
-        "• RedNote\n"
-        "• Shopee Vídeos\n\n"
+        "• RedNote\n\n"
         "O bot faz o download automaticamente.\n\n"
         "✅ Sem marca d'água\n"
         "✅ Qualidade em HD\n"
@@ -2225,7 +1646,7 @@ def formatos_capados_gerais():
     ]
 
 
-def formatos_por_plataforma(is_tiktok=False, is_instagram=False, is_pinterest=False, is_rednote=False, is_shopee=False):
+def formatos_por_plataforma(is_tiktok=False, is_instagram=False, is_pinterest=False, is_rednote=False):
     if is_instagram:
         return [
             "bestvideo[ext=mp4][width<=720][height<=1280][fps<=30]+bestaudio[ext=m4a]/best[ext=mp4][width<=720][height<=1280][fps<=30]",
@@ -2245,7 +1666,7 @@ def formatos_por_plataforma(is_tiktok=False, is_instagram=False, is_pinterest=Fa
             "best[width<=720][height<=1280]"
         ]
 
-    if is_tiktok or is_rednote or is_shopee:
+    if is_tiktok or is_rednote:
         return formatos_capados_gerais() + [
             "best[ext=mp4]/best"
         ]
@@ -2279,63 +1700,18 @@ def handle_download(message):
 
     try:
         url_lower = url.lower()
-        is_pinterest, is_tiktok, is_instagram, is_rednote, is_shopee = detectar_plataforma(url_lower)
-        plataforma = nome_plataforma(is_pinterest, is_tiktok, is_instagram, is_rednote, is_shopee)
+        is_pinterest, is_tiktok, is_instagram, is_rednote = detectar_plataforma(url_lower)
+        plataforma = nome_plataforma(is_pinterest, is_tiktok, is_instagram, is_rednote)
 
         logger.info(f"[DOWNLOAD_INICIO] user_id={message.from_user.id} plataforma={plataforma} url={url}")
 
-        if not (is_pinterest or is_tiktok or is_instagram or is_rednote or is_shopee):
-            texto_nao_reconhecido = "❌ Link não reconhecido. Envie um link do TikTok, Pinterest, Instagram, RedNote ou Shopee Vídeos."
+        if not (is_pinterest or is_tiktok or is_instagram or is_rednote):
+            texto_nao_reconhecido = "❌ Link não reconhecido. Envie um link do TikTok, Pinterest, Instagram ou RedNote."
             if status_msg:
                 safe_edit_message(message.chat.id, status_msg.message_id, texto_nao_reconhecido)
             else:
                 safe_send_message(message.chat.id, texto_nao_reconhecido)
             return
-
-        if is_shopee:
-            prefix = os.path.join(DOWNLOAD_DIR, f"v_{message.from_user.id}_{uuid.uuid4().hex}")
-
-            try:
-                arquivo_final = baixar_shopee_video(url, prefix)
-
-                info_midia = obter_info_midia(arquivo_final) or {}
-                duracao = info_midia.get("duration")
-                logger.info(f"[META] plataforma=Shopee user_id={message.from_user.id} duration={duracao}")
-
-                if duracao and duracao > MAX_DURATION_SECONDS:
-                    texto = f"⚠️ Vídeo muito longo. O limite é de {MAX_DURATION_SECONDS} segundos."
-                    if status_msg:
-                        safe_edit_message(message.chat.id, status_msg.message_id, texto)
-                    else:
-                        safe_send_message(message.chat.id, texto)
-                    return
-
-                arquivo_envio = preparar_arquivo_para_envio(arquivo_final, plataforma=plataforma)
-
-                enviado = enviar_arquivo_com_fallback(message.chat.id, arquivo_envio)
-                if not enviado:
-                    raise Exception("Falha ao enviar arquivo ao Telegram")
-
-                if not vip_status:
-                    incrementar_download_gratis(user, message.chat.id, message.from_user.id)
-
-                if status_msg:
-                    safe_delete_message(message.chat.id, status_msg.message_id)
-
-                return
-
-            except Exception as e:
-                logger.error(f"[ERRO_SHOPEE] user_id={message.from_user.id} url={url} erro={e}")
-                texto_erro = mapear_erro_download(str(e), plataforma="shopee")
-
-                if status_msg:
-                    safe_edit_message(message.chat.id, status_msg.message_id, texto_erro)
-                else:
-                    safe_send_message(message.chat.id, texto_erro)
-
-                if prefix:
-                    cleanup_prefix(prefix)
-                return
 
         if is_pinterest:
             prefix = os.path.join(DOWNLOAD_DIR, f"v_{message.from_user.id}_{uuid.uuid4().hex}")
@@ -2389,7 +1765,7 @@ def handle_download(message):
 
         prefix = os.path.join(DOWNLOAD_DIR, f"v_{message.from_user.id}_{uuid.uuid4().hex}")
 
-        with yt_dlp.YoutubeDL(montar_info_opts(is_instagram=is_instagram, is_shopee=is_shopee)) as ydl:
+        with yt_dlp.YoutubeDL(montar_info_opts(is_instagram=is_instagram)) as ydl:
             info = ydl.extract_info(url, download=False)
 
         duracao = info.get("duration")
@@ -2403,13 +1779,12 @@ def handle_download(message):
                 safe_send_message(message.chat.id, texto)
             return
 
-        common_opts = montar_download_opts(prefix, is_instagram=is_instagram, is_shopee=is_shopee)
+        common_opts = montar_download_opts(prefix, is_instagram=is_instagram)
         formatos = formatos_por_plataforma(
             is_tiktok=is_tiktok,
             is_instagram=is_instagram,
             is_pinterest=is_pinterest,
             is_rednote=is_rednote,
-            is_shopee=is_shopee,
         )
         baixou = False
         ultimo_erro = None
@@ -2455,12 +1830,7 @@ def handle_download(message):
 
     except Exception as e:
         logger.error(f"[ERRO_DOWNLOAD] user_id={message.from_user.id} url={url} erro={e}")
-        plataforma_erro = (
-            "instagram" if ("instagram.com" in url.lower() or "instagr.am" in url.lower())
-            else "shopee" if ("shopee." in url.lower() or "shp.ee" in url.lower())
-            else "geral"
-        )
-        texto_erro = mapear_erro_download(str(e), plataforma=plataforma_erro)
+        texto_erro = mapear_erro_download(str(e), plataforma=("instagram" if "instagram.com" in url.lower() else "geral"))
 
         if status_msg:
             safe_edit_message(message.chat.id, status_msg.message_id, texto_erro)
