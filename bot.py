@@ -14,6 +14,7 @@ import yt_dlp
 import subprocess
 import json
 import html
+from urllib.parse import unquote
 
 from flask import Flask, request, jsonify
 from telebot import types
@@ -1098,65 +1099,190 @@ def normalizar_url_midia_shopee(raw_url):
     url = str(raw_url).strip().strip("\"' ")
     url = html.unescape(url)
 
-    for _ in range(2):
+    # A Shopee costuma entregar URLs em vários formatos:
+    # normal, com barras escapadas, unicode escaped e/ou percent-encoded.
+    for _ in range(3):
+        antes = url
         try:
             url = json.loads(f'"{url}"')
         except Exception:
-            break
+            pass
 
-    url = (
-        url
-        .replace("\\/", "/")
-        .replace("\u002F", "/")
-        .replace("\u002f", "/")
-        .replace("&amp;", "&")
-    )
+        url = (
+            url
+            .replace("\\/", "/")
+            .replace("\\u002F", "/")
+            .replace("\\u002f", "/")
+            .replace("&amp;", "&")
+        )
+
+        try:
+            url = unquote(url)
+        except Exception:
+            pass
+
+        if url == antes:
+            break
 
     if url.startswith("//"):
         url = "https:" + url
 
+    # Corrige URLs que ficaram com barras ainda escapadas depois do decode.
+    url = url.replace("\\/", "/")
+
     return url
 
 
-def extrair_urls_video_shopee_html(html_text):
+def url_parece_video_shopee(url):
+    if not url:
+        return False
+
+    u = url.lower()
+    if any(x in u for x in ("thumbnail", "thumb", "cover", "avatar", "image", ".jpg", ".jpeg", ".png", ".webp", ".gif")):
+        return False
+
+    return (
+        ".mp4" in u
+        or ".m3u8" in u
+        or "vod.susercontent.com" in u
+        or "down-" in u and "susercontent.com" in u
+    )
+
+
+def pontuar_contexto_shopee(url, contexto="", origem=""):
+    texto = f"{url} {contexto} {origem}".lower()
+    score = 0
+
+    # Prioridade máxima: versões originais/sem marca d'água quando a página expõe esse campo.
+    termos_sem_marca = [
+        "no_watermark", "no-watermark", "nowatermark", "without_watermark",
+        "without-watermark", "watermarkless", "sem_marca", "sem-marca"
+    ]
+    if any(t in texto for t in termos_sem_marca):
+        score += 500
+
+    termos_original = [
+        "origin_video", "original_video", "originurl", "originalurl", "origin_url",
+        "original_url", "source_url", "raw_url", "rawurl", "video_original", "video_origin"
+    ]
+    if any(t in texto for t in termos_original):
+        score += 260
+
+    if "video_url" in texto or "videourl" in texto or "play_url" in texto or "playurl" in texto:
+        score += 80
+
+    # Evita candidatos declaradamente com marca d'água ou prévias/miniaturas.
+    if "watermark" in texto and not any(t in texto for t in termos_sem_marca):
+        score -= 350
+    if re.search(r"(^|[^a-z])wm([^a-z]|$)", texto) and not any(t in texto for t in termos_sem_marca):
+        score -= 120
+    if any(t in texto for t in ("preview", "cover", "thumbnail", "thumb", "compressed", "low_quality", "lowquality")):
+        score -= 220
+
+    # Preferências de qualidade, sem forçar upscale.
+    if "720" in texto or "1280" in texto:
+        score += 90
+    if "540" in texto or "960" in texto:
+        score += 45
+    if "480" in texto or "854" in texto:
+        score += 20
+    if "360" in texto or "640" in texto:
+        score += 5
+
+    if ".m3u8" in texto:
+        score += 35
+    if ".mp4" in texto:
+        score += 25
+
+    return score
+
+
+def _adicionar_candidato_shopee(candidatos, vistos, raw_url, origem="", contexto=""):
+    url = normalizar_url_midia_shopee(raw_url)
+    if not url or not url_parece_video_shopee(url):
+        return
+
+    chave = url.split("#", 1)[0]
+    if chave in vistos:
+        return
+
+    vistos.add(chave)
+    candidatos.append({
+        "url": url,
+        "origem": origem,
+        "contexto": contexto or "",
+        "score_contexto": pontuar_contexto_shopee(url, contexto, origem),
+    })
+
+
+def extrair_candidatos_video_shopee_html(html_text):
     if not html_text:
         return []
 
-    encontrados = []
+    candidatos = []
+    vistos = set()
 
+    # URLs normais, escapadas e percent-encoded.
     padroes = [
         r'https?:\\?/\\?/[^"\'<>\s]+?(?:\.mp4|\.m3u8)(?:\?[^"\'<>\s]*)?',
         r'//[^"\'<>\s]+?(?:\.mp4|\.m3u8)(?:\?[^"\'<>\s]*)?',
         r'https?:\\?/\\?/[^"\'<>\s]*vod\.susercontent\.com[^"\'<>\s]*',
         r'//[^"\'<>\s]*vod\.susercontent\.com[^"\'<>\s]*',
+        r'https%3A%2F%2F[^"\'<>\s]+?(?:\.mp4|\.m3u8|%2Emp4|%2Em3u8)(?:[^"\'<>\s]*)?',
+        r'https%3A%2F%2F[^"\'<>\s]*vod\.susercontent\.com[^"\'<>\s]*',
     ]
 
     for padrao in padroes:
-        for match in re.findall(padrao, html_text, flags=re.IGNORECASE):
-            url = normalizar_url_midia_shopee(match)
-            if not url:
-                continue
+        for match in re.finditer(padrao, html_text, flags=re.IGNORECASE):
+            ini = max(0, match.start() - 180)
+            fim = min(len(html_text), match.end() + 180)
+            contexto = html_text[ini:fim]
+            _adicionar_candidato_shopee(
+                candidatos,
+                vistos,
+                match.group(0),
+                origem="regex_url",
+                contexto=contexto
+            )
 
-            url_lower = url.lower()
-            if (
-                ("vod.susercontent.com" in url_lower)
-                or (".mp4" in url_lower)
-                or (".m3u8" in url_lower)
-            ):
-                encontrados.append(url)
+    # Campos JSON/JS que podem indicar versão original ou sem marca d'água.
+    chaves_video = [
+        "no_watermark_url", "noWatermarkUrl", "nowatermark_url", "without_watermark_url",
+        "origin_video_url", "original_video_url", "originVideoUrl", "originalVideoUrl",
+        "source_video_url", "raw_video_url", "video_url", "videoUrl", "play_url", "playUrl",
+        "url", "src"
+    ]
 
-    # Remove duplicados mantendo a ordem e prioriza MP4.
-    vistos = set()
-    unicos = []
-    for url in encontrados:
-        chave = url.split("#", 1)[0]
-        if chave in vistos:
-            continue
-        vistos.add(chave)
-        unicos.append(url)
+    for chave in chaves_video:
+        padrao_chave = rf'["\']{re.escape(chave)}["\']\s*:\s*["\']([^"\']+)["\']'
+        for match in re.finditer(padrao_chave, html_text, flags=re.IGNORECASE):
+            ini = max(0, match.start() - 180)
+            fim = min(len(html_text), match.end() + 180)
+            contexto = html_text[ini:fim]
+            _adicionar_candidato_shopee(
+                candidatos,
+                vistos,
+                match.group(1),
+                origem=f"json_key:{chave}",
+                contexto=contexto
+            )
 
-    unicos.sort(key=lambda u: (".mp4" not in u.lower(), len(u)))
-    return unicos
+    # Remove duplicados e coloca em primeiro as URLs com maior chance de serem HD/sem marca.
+    candidatos.sort(
+        key=lambda c: (
+            c.get("score_contexto", 0),
+            1 if ".m3u8" in c.get("url", "").lower() else 0,
+            len(c.get("url", ""))
+        ),
+        reverse=True
+    )
+
+    return candidatos
+
+
+def extrair_urls_video_shopee_html(html_text):
+    # Mantida por compatibilidade com versões anteriores do código.
+    return [c["url"] for c in extrair_candidatos_video_shopee_html(html_text)]
 
 
 def baixar_url_direta_shopee(video_url, prefix):
@@ -1167,7 +1293,7 @@ def baixar_url_direta_shopee(video_url, prefix):
 
     if ".m3u8" in video_url.lower():
         opts = montar_download_opts(prefix, is_shopee=True)
-        opts["format"] = "best"
+        opts["format"] = "best[width<=720][height<=1280][fps<=30]/best[width<=720][height<=1280]/best"
 
         with yt_dlp.YoutubeDL(opts) as ydl:
             ydl.download([video_url])
@@ -1200,10 +1326,110 @@ def baixar_url_direta_shopee(video_url, prefix):
     return arquivo_saida
 
 
+def pontuar_arquivo_shopee(arquivo, candidato):
+    info = obter_info_midia(arquivo) or {}
+    width = int(info.get("width") or 0)
+    height = int(info.get("height") or 0)
+    fps = float(info.get("fps") or 0)
+    pixels = width * height
+    score_contexto = int(candidato.get("score_contexto") or 0)
+
+    cabe_no_limite = (
+        width > 0
+        and height > 0
+        and width <= 720
+        and height <= 1280
+        and (fps == 0 or fps <= 30.5)
+    )
+
+    # Mantém o mesmo comportamento dos outros apps: pega a melhor qualidade disponível
+    # dentro do limite. Não faz upscale de 480 para 720.
+    score = score_contexto
+    score += 100000 if cabe_no_limite else 0
+    score += min(pixels, 720 * 1280) // 10
+
+    # Preferência leve por vídeos verticais de feed/reels.
+    if height >= width:
+        score += 120
+
+    # Penaliza candidatos acima do limite quando houver outro dentro do limite.
+    if width > 720 or height > 1280 or fps > 30.5:
+        score -= 30000
+
+    return score, info
+
+
+def baixar_melhor_candidato_shopee(candidatos, prefix, url_resolvida):
+    if not candidatos:
+        raise Exception("Não encontrei o vídeo no link da Shopee")
+
+    # Testa vários candidatos, porque a Shopee pode expor 480p, 720p,
+    # versão com marca e versão original na mesma página.
+    melhores = []
+    ultimo_erro = None
+    limite_tentativas = min(len(candidatos), 14)
+
+    for idx, candidato in enumerate(candidatos[:limite_tentativas]):
+        video_url = candidato.get("url")
+        prefix_candidato = f"{prefix}_shopee_{idx}"
+
+        try:
+            cleanup_prefix(prefix_candidato)
+            arquivo = baixar_url_direta_shopee(video_url, prefix_candidato)
+
+            if not arquivo or not os.path.exists(arquivo):
+                continue
+
+            score, info = pontuar_arquivo_shopee(arquivo, candidato)
+            logger.info(
+                f"[SHOPEE_CANDIDATO] idx={idx} score={score} score_contexto={candidato.get('score_contexto')} "
+                f"width={info.get('width')} height={info.get('height')} fps={info.get('fps')} "
+                f"origem={candidato.get('origem')} url={video_url[:140]}"
+            )
+
+            melhores.append({
+                "arquivo": arquivo,
+                "score": score,
+                "info": info,
+                "candidato": candidato,
+            })
+
+        except Exception as e:
+            ultimo_erro = str(e)
+            logger.warning(f"[SHOPEE_TENTATIVA] idx={idx} url={url_resolvida} erro={e}")
+            cleanup_prefix(prefix_candidato)
+
+    if not melhores:
+        raise Exception(ultimo_erro or "Falha ao baixar Shopee Vídeo")
+
+    melhores.sort(key=lambda item: item["score"], reverse=True)
+    escolhido = melhores[0]
+
+    # Remove arquivos dos candidatos que não foram escolhidos.
+    arquivo_escolhido = escolhido["arquivo"]
+    for item in melhores[1:]:
+        try:
+            if item["arquivo"] != arquivo_escolhido and os.path.exists(item["arquivo"]):
+                os.remove(item["arquivo"])
+        except Exception:
+            pass
+
+    info = escolhido.get("info") or {}
+    candidato = escolhido.get("candidato") or {}
+    logger.info(
+        f"[SHOPEE_OK] url={url_resolvida} escolhido={arquivo_escolhido} "
+        f"width={info.get('width')} height={info.get('height')} fps={info.get('fps')} "
+        f"origem={candidato.get('origem')} score_contexto={candidato.get('score_contexto')} "
+        f"video_url={str(candidato.get('url', ''))[:140]}"
+    )
+
+    return arquivo_escolhido
+
+
 def baixar_shopee_video(url, prefix):
     url_resolvida, html_text = resolver_link_shopee(url)
 
-    candidatos = extrair_urls_video_shopee_html(html_text)
+    candidatos = extrair_candidatos_video_shopee_html(html_text)
 
     # Fallback: se o HTML inicial não trouxe o vídeo, tenta buscar a URL final de novo.
     if not candidatos:
@@ -1213,43 +1439,34 @@ def baixar_shopee_video(url, prefix):
                 timeout=(5, 20),
                 headers=SHOPEE_HEADERS
             )
-            candidatos = extrair_urls_video_shopee_html(resp.text)
+            candidatos = extrair_candidatos_video_shopee_html(resp.text)
         except Exception as e:
             logger.warning(f"[SHOPEE_HTML_FALLBACK] url={url_resolvida} erro={e}")
 
-    # Último fallback: tenta pelo extrator genérico do yt-dlp.
-    if not candidatos:
-        try:
-            opts = montar_download_opts(prefix, is_shopee=True)
-            opts["format"] = "best[ext=mp4]/best"
+    if candidatos:
+        return baixar_melhor_candidato_shopee(candidatos, prefix, url_resolvida)
 
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                ydl.download([url_resolvida])
+    # Último fallback: tenta pelo extrator genérico do yt-dlp, mantendo o limite do bot.
+    try:
+        opts = montar_download_opts(prefix, is_shopee=True)
+        opts["format"] = (
+            "bestvideo[ext=mp4][width<=720][height<=1280][fps<=30]+bestaudio[ext=m4a]/"
+            "best[ext=mp4][width<=720][height<=1280][fps<=30]/"
+            "best[width<=720][height<=1280][fps<=30]/"
+            "best[ext=mp4]/best"
+        )
 
-            arquivo = encontrar_arquivo_baixado(prefix)
-            if arquivo and os.path.exists(arquivo):
-                logger.info(f"[SHOPEE_OK_YTDLP] url={url_resolvida}")
-                return arquivo
-        except Exception as e:
-            logger.warning(f"[SHOPEE_YTDLP_FALLBACK] url={url_resolvida} erro={e}")
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.download([url_resolvida])
 
-    if not candidatos:
-        raise Exception("Não encontrei o vídeo no link da Shopee")
+        arquivo = encontrar_arquivo_baixado(prefix)
+        if arquivo and os.path.exists(arquivo):
+            logger.info(f"[SHOPEE_OK_YTDLP] url={url_resolvida}")
+            return arquivo
+    except Exception as e:
+        logger.warning(f"[SHOPEE_YTDLP_FALLBACK] url={url_resolvida} erro={e}")
 
-    ultimo_erro = None
-
-    for video_url in candidatos:
-        try:
-            cleanup_prefix(prefix)
-            arquivo = baixar_url_direta_shopee(video_url, prefix)
-            if arquivo and os.path.exists(arquivo):
-                logger.info(f"[SHOPEE_OK] url={url_resolvida} video_url={video_url[:120]}")
-                return arquivo
-        except Exception as e:
-            ultimo_erro = str(e)
-            logger.warning(f"[SHOPEE_TENTATIVA] url={url_resolvida} erro={e}")
-
-    raise Exception(ultimo_erro or "Falha ao baixar Shopee Vídeo")
+    raise Exception("Não encontrei o vídeo no link da Shopee")
 
 
 # =========================================
