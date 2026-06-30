@@ -47,7 +47,7 @@ ADMIN_ID = int(get_env_required("ADMIN_ID"))
 INFINITEPAY_HANDLE = get_env_required("INFINITEPAY_HANDLE")
 INFINITEPAY_WEBHOOK_SECRET = get_env_required("INFINITEPAY_WEBHOOK_SECRET")
 APP_BASE_URL = get_env_required("APP_BASE_URL").rstrip("/")
-INFINITEPAY_CHECKOUT_URL = "https://api.infinitepay.io/invoices/public/checkout/links"
+INFINITEPAY_CHECKOUT_URL = "https://api.checkout.infinitepay.io/links"
 
 DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", "downloads_temp")
 TZ = ZoneInfo("America/Sao_Paulo")
