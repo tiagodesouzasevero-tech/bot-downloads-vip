@@ -13,6 +13,8 @@ import telebot
 import yt_dlp
 import subprocess
 import json
+import html as html_lib
+from urllib.parse import urlparse, parse_qs, unquote, urljoin
 
 from flask import Flask, request, jsonify
 from telebot import types
@@ -991,35 +993,150 @@ def is_vip(user_id):
 # =========================================
 # SHOPEE VÍDEOS
 # =========================================
+def decodificar_url_shopee(valor, max_iteracoes=4):
+    if valor is None:
+        return ""
+
+    atual = html_lib.unescape(str(valor)).strip().strip('"\'')
+    atual = (
+        atual
+        .replace("\\u002F", "/")
+        .replace("\\u002f", "/")
+        .replace("\\u003A", ":")
+        .replace("\\u003a", ":")
+        .replace("\\u0026", "&")
+        .replace("\\/", "/")
+    )
+
+    for _ in range(max_iteracoes):
+        novo = unquote(atual)
+        if novo == atual:
+            break
+        atual = novo
+
+    return html_lib.unescape(atual).strip().strip('"\'')
+
+
+def extrair_destino_universal_shopee(url):
+    """
+    Extrai o destino real de links como:
+    shopee.com.br/universal-link?...&redir=https%3A%2F%2Fsv.shopee...
+
+    A função é isolada e não altera o tratamento das demais plataformas.
+    """
+    # Não decodifica a URL externa inteira antes do parse, pois isso transformaria
+    # os & codificados do parâmetro redir em parâmetros do wrapper e cortaria o destino.
+    atual = html_lib.unescape(str(url or "")).strip().strip('"\'')
+
+    for _ in range(5):
+        if not atual.startswith(("http://", "https://")):
+            return atual
+
+        parsed = urlparse(atual)
+        host_atual = (parsed.netloc or "").lower()
+        path_atual = (parsed.path or "").lower()
+        if host_atual == "sv.shopee.com.br" and (
+            path_atual.startswith("/share-video/") or path_atual.startswith("/web/")
+        ):
+            return atual
+
+        query = parse_qs(parsed.query, keep_blank_values=True)
+        proximo = None
+
+        for chave in (
+            "redir", "redirect", "redirect_url", "redirectUrl",
+            "target", "target_url", "url", "deep_link", "deeplink"
+        ):
+            for valor in query.get(chave, []):
+                candidato = decodificar_url_shopee(valor)
+                if candidato.startswith(("http://", "https://")) and candidato != atual:
+                    host = (urlparse(candidato).netloc or "").lower()
+                    if "shopee" in host or host.endswith("shp.ee"):
+                        proximo = candidato
+                        break
+            if proximo:
+                break
+
+        if not proximo and (
+            "universal-link" in path_atual or "%3a%2f%2f" in atual.lower()
+        ):
+            # Fallback para wrappers que trazem o redirecionamento codificado fora
+            # do parse normal da query.
+            match = re.search(
+                r"(?i)(https?(?:%3A|:)(?:%2F|/){2}(?:sv\.)?shopee[^&\s]+)",
+                atual,
+            )
+            if match:
+                candidato = decodificar_url_shopee(match.group(1))
+                if candidato.startswith(("http://", "https://")) and candidato != atual:
+                    proximo = candidato
+
+        if not proximo:
+            return atual
+
+        atual = proximo
+
+    return atual
+
+
+def url_shopee_video_publica(url):
+    try:
+        parsed = urlparse(url)
+        host = (parsed.netloc or "").lower()
+        path = (parsed.path or "").lower()
+        return host == "sv.shopee.com.br" and (
+            path.startswith("/share-video/") or path.startswith("/web/")
+        )
+    except Exception:
+        return False
+
+
 def resolver_link_shopee(url):
-    """Resolve links curtos/universais da Shopee sem interferir em outras plataformas."""
+    """Resolve links curtos e o wrapper universal-link da Shopee."""
+    original = url.strip()
+    url_atual = extrair_destino_universal_shopee(original)
+
+    if url_shopee_video_publica(url_atual):
+        logger.info(f"[SHOPEE_REDIRECT] {original} -> {url_atual}")
+        return url_atual
+
     try:
         resp = requests.get(
-            url.strip(),
+            url_atual,
             allow_redirects=True,
-            timeout=(5, 15),
+            timeout=(5, 18),
             headers=SHOPEE_HEADERS
         )
-        if resp.url:
-            logger.info(f"[SHOPEE_REDIRECT] {url} -> {resp.url}")
-            return resp.url
+
+        candidatos = []
+        for historico in resp.history:
+            location = historico.headers.get("Location")
+            if location:
+                candidatos.append(urljoin(historico.url, location))
+        candidatos.append(resp.url)
+
+        # Analisa do último redirecionamento para o primeiro.
+        for candidato in reversed(candidatos):
+            destino = extrair_destino_universal_shopee(candidato)
+            if url_shopee_video_publica(destino):
+                logger.info(f"[SHOPEE_REDIRECT] {original} -> {destino}")
+                return destino
+
+        destino_final = extrair_destino_universal_shopee(resp.url or url_atual)
+        logger.info(f"[SHOPEE_REDIRECT] {original} -> {destino_final}")
+        return destino_final
+
     except Exception as e:
-        logger.warning(f"[SHOPEE_REDIRECT] url={url} erro={e}")
-    return url.strip()
+        logger.warning(f"[SHOPEE_REDIRECT] url={original} erro={e}")
+        return url_atual
 
 
 def normalizar_url_midia_shopee(valor):
     if not valor:
         return None
 
-    valor = str(valor).strip().strip('"\'')
-    valor = valor.replace("\\u002F", "/").replace("\\/", "/")
-    valor = valor.replace("&amp;", "&")
-
-    try:
-        valor = bytes(valor, "utf-8").decode("unicode_escape")
-    except Exception:
-        pass
+    valor = decodificar_url_shopee(valor)
+    valor = valor.strip().strip('"\' ,;')
 
     if valor.startswith("//"):
         valor = "https:" + valor
@@ -1027,49 +1144,146 @@ def normalizar_url_midia_shopee(valor):
     if not valor.startswith(("http://", "https://")):
         return None
 
+    # Remove caracteres que às vezes ficam anexados ao fim da URL em JSON/HTML.
+    valor = re.sub(r"[\\\"']+$", "", valor)
     return valor
 
 
-def extrair_urls_video_shopee(html):
-    """Extrai candidatos MP4/HLS presentes no HTML/JSON público da página compartilhada."""
-    candidatos = []
+def extrair_urls_paginas_shopee(conteudo, base_url):
+    """Encontra canonical/og:url e rotas web alternativas do mesmo vídeo."""
+    encontrados = []
+    texto = html_lib.unescape(conteudo or "")
+
     padroes = [
-        r'(?i)(?:video_url|videoUrl|playback_url|playbackUrl|origin_video_url|original_video_url|url)\\?["\']?\s*[:=]\s*\\?["\']([^"\']+)',
-        r'(?i)(https?:\\?/\\?/[^"\'\s<>]+?\\?\.(?:mp4|m3u8)(?:\\?[^"\'\s<>]*)?)',
+        r'(?is)<link[^>]+rel=["\'][^"\']*canonical[^"\']*["\'][^>]+href=["\']([^"\']+)',
+        r'(?is)<link[^>]+href=["\']([^"\']+)["\'][^>]+rel=["\'][^"\']*canonical',
+        r'(?is)<meta[^>]+(?:property|name)=["\'](?:og:url|twitter:url)["\'][^>]+content=["\']([^"\']+)',
+        r'(?is)<meta[^>]+content=["\']([^"\']+)["\'][^>]+(?:property|name)=["\'](?:og:url|twitter:url)["\']',
+        r'(?i)(https?:\\?/\\?/sv\.shopee\.com\.br/(?:share-video|web)/[^"\'\s<>]+)',
     ]
 
     for padrao in padroes:
-        for encontrado in re.findall(padrao, html or ""):
-            url_midia = normalizar_url_midia_shopee(encontrado)
-            if not url_midia:
-                continue
-            url_lower = url_midia.lower()
-            if ".mp4" not in url_lower and ".m3u8" not in url_lower:
-                continue
-            if url_midia not in candidatos:
-                candidatos.append(url_midia)
+        for valor in re.findall(padrao, texto):
+            candidato = normalizar_url_midia_shopee(valor)
+            if not candidato:
+                candidato = urljoin(base_url, decodificar_url_shopee(valor))
+            candidato = extrair_destino_universal_shopee(candidato)
+            if url_shopee_video_publica(candidato) and candidato not in encontrados:
+                encontrados.append(candidato)
 
-    def prioridade(url_midia):
+    return encontrados
+
+
+def extrair_urls_video_shopee(conteudo):
+    """Extrai MP4/HLS de metatags, JSON, scripts e HTML da página pública."""
+    candidatos = []
+    texto_original = conteudo or ""
+    textos = [texto_original, html_lib.unescape(texto_original)]
+
+    # Algumas páginas guardam blocos inteiros com URL encoding.
+    if "%3A%2F%2F" in texto_original.lower():
+        textos.append(decodificar_url_shopee(texto_original, max_iteracoes=2))
+
+    def adicionar(valor, prioridade=50):
+        url_midia = normalizar_url_midia_shopee(valor)
+        if not url_midia:
+            return
+
         u = url_midia.lower()
-        penalidade = 0
-        if "watermark" in u or "wm=" in u or "_wm" in u:
-            penalidade += 100
+        parece_midia = (
+            ".mp4" in u
+            or ".m3u8" in u
+            or "video" in (urlparse(url_midia).netloc or "").lower()
+            or "/video/" in (urlparse(url_midia).path or "").lower()
+        )
+        if not parece_midia:
+            return
+
+        if "watermark" in u or "_wm" in u or "wm=" in u:
+            prioridade += 100
         if ".m3u8" in u:
-            penalidade += 10
-        if "original" in u or "origin" in u:
-            penalidade -= 5
-        return penalidade
+            prioridade += 10
+        if "original" in u or "origin" in u or "source" in u:
+            prioridade -= 10
 
-    candidatos.sort(key=prioridade)
-    return candidatos
+        for existente, _ in candidatos:
+            if existente == url_midia:
+                return
+        candidatos.append((url_midia, prioridade))
+
+    for texto in textos:
+        # Metatags normalmente usadas por WhatsApp/Facebook/Twitter.
+        meta_padroes = [
+            r'(?is)<meta[^>]+(?:property|name)=["\'](?:og:video(?::url|:secure_url)?|twitter:player:stream)["\'][^>]+content=["\']([^"\']+)',
+            r'(?is)<meta[^>]+content=["\']([^"\']+)["\'][^>]+(?:property|name)=["\'](?:og:video(?::url|:secure_url)?|twitter:player:stream)["\']',
+            r'(?is)<video[^>]+src=["\']([^"\']+)',
+            r'(?is)<source[^>]+src=["\']([^"\']+)',
+        ]
+        for padrao in meta_padroes:
+            for encontrado in re.findall(padrao, texto):
+                adicionar(encontrado, prioridade=0)
+
+        # Campos comuns em JSON e dados estruturados.
+        chave_padrao = (
+            r'(?i)(?:video_url|videoUrl|playback_url|playbackUrl|play_url|playUrl|'
+            r'origin_video_url|original_video_url|source_url|sourceUrl|contentUrl|content_url|'
+            r'download_url|downloadUrl|stream_url|streamUrl|file_url|fileUrl)'
+            r'\\?["\']?\s*[:=]\s*\\?["\']([^"\']+)'
+        )
+        for encontrado in re.findall(chave_padrao, texto):
+            adicionar(encontrado, prioridade=5)
+
+        # URLs diretas normais ou escapadas.
+        for encontrado in re.findall(
+            r'(?i)(https?:\\?/\\?/[^"\'\s<>]+?(?:\.mp4|\.m3u8)(?:\?[^"\'\s<>]*)?)',
+            texto,
+        ):
+            adicionar(encontrado, prioridade=20)
+
+        # URLs percent-encoded.
+        for encontrado in re.findall(
+            r'(?i)(https?%3A%2F%2F[^"\'\s<>]+?(?:%2Emp4|%2Em3u8|\.mp4|\.m3u8)[^"\'\s<>]*)',
+            texto,
+        ):
+            adicionar(encontrado, prioridade=20)
+
+    candidatos.sort(key=lambda item: item[1])
+    return [url for url, _ in candidatos]
 
 
-def baixar_url_midia_direta(url_midia, prefix):
-    extensao = ".m3u8" if ".m3u8" in url_midia.lower() else ".mp4"
+def headers_shopee_para_paginas():
+    """Perfis de navegador e de preview social, sem cookies ou nova variável."""
+    return [
+        SHOPEE_HEADERS,
+        {
+            **SHOPEE_HEADERS,
+            "User-Agent": "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
+            "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+        },
+        {
+            **SHOPEE_HEADERS,
+            "User-Agent": "Twitterbot/1.0",
+            "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+        },
+        {
+            **SHOPEE_HEADERS,
+            "User-Agent": (
+                "Mozilla/5.0 (Linux; Android 6.0.1; Nexus 5X Build/MMB29P) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 "
+                "Mobile Safari/537.36 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"
+            ),
+        },
+    ]
 
-    if extensao == ".m3u8":
+
+def baixar_url_midia_direta(url_midia, prefix, referer=None):
+    headers = dict(SHOPEE_HEADERS)
+    if referer:
+        headers["Referer"] = referer
+
+    if ".m3u8" in url_midia.lower():
         opts = montar_download_opts(prefix)
-        opts["http_headers"] = SHOPEE_HEADERS
+        opts["http_headers"] = headers
         opts["format"] = "best"
         with yt_dlp.YoutubeDL(opts) as ydl:
             ydl.download([url_midia])
@@ -1082,13 +1296,18 @@ def baixar_url_midia_direta(url_midia, prefix):
     with requests.get(
         url_midia,
         stream=True,
-        timeout=(5, 45),
-        headers=SHOPEE_HEADERS
+        timeout=(5, 60),
+        headers=headers,
+        allow_redirects=True,
     ) as resp:
         resp.raise_for_status()
         content_type = (resp.headers.get("Content-Type") or "").lower()
-        if "text/html" in content_type or "application/json" in content_type:
-            raise Exception("A URL encontrada não retornou um arquivo de vídeo.")
+        if (
+            "text/html" in content_type
+            or "application/json" in content_type
+            or "text/plain" in content_type
+        ):
+            raise Exception(f"A URL encontrada não retornou vídeo. Content-Type={content_type}")
 
         with open(arquivo_saida, "wb") as f:
             for chunk in resp.iter_content(chunk_size=1024 * 256):
@@ -1104,47 +1323,89 @@ def baixar_url_midia_direta(url_midia, prefix):
 def baixar_shopee_video(url, prefix):
     """
     Extrator isolado para Shopee Vídeos.
-    Tenta primeiro o HTML/JSON público e, por último, o extrator genérico do yt-dlp.
+    Resolve o universal-link, consulta a página pública com perfis diferentes
+    e só depois usa o yt-dlp genérico como último fallback.
     """
     url_resolvida = resolver_link_shopee(url)
     ultimo_erro = None
+    paginas = [url_resolvida]
+    paginas_processadas = set()
+    encontrou_candidato_midia = False
 
-    try:
-        resp = requests.get(
-            url_resolvida,
-            timeout=(5, 20),
-            headers=SHOPEE_HEADERS,
-            allow_redirects=True
-        )
-        resp.raise_for_status()
+    indice = 0
+    while indice < len(paginas) and indice < 6:
+        pagina = paginas[indice]
+        indice += 1
 
-        for url_midia in extrair_urls_video_shopee(resp.text):
+        if pagina in paginas_processadas:
+            continue
+        paginas_processadas.add(pagina)
+
+        for headers in headers_shopee_para_paginas():
             try:
-                cleanup_prefix(prefix)
-                arquivo = baixar_url_midia_direta(url_midia, prefix)
-                logger.info(f"[SHOPEE_OK] origem=html url={url_resolvida} midia={url_midia[:180]}")
-                return arquivo
+                resp = requests.get(
+                    pagina,
+                    timeout=(5, 25),
+                    headers=headers,
+                    allow_redirects=True
+                )
+                resp.raise_for_status()
+
+                pagina_final = extrair_destino_universal_shopee(resp.url or pagina)
+                logger.info(
+                    f"[SHOPEE_HTML] status={resp.status_code} bytes={len(resp.content)} "
+                    f"pagina={pagina} final={pagina_final} ua={headers.get('User-Agent', '')[:35]}"
+                )
+
+                for pagina_extra in extrair_urls_paginas_shopee(resp.text, pagina_final):
+                    if pagina_extra not in paginas and pagina_extra not in paginas_processadas:
+                        paginas.append(pagina_extra)
+
+                urls_midia = extrair_urls_video_shopee(resp.text)
+                if urls_midia:
+                    encontrou_candidato_midia = True
+                    logger.info(
+                        f"[SHOPEE_CANDIDATOS] pagina={pagina_final} quantidade={len(urls_midia)}"
+                    )
+
+                for url_midia in urls_midia:
+                    try:
+                        cleanup_prefix(prefix)
+                        arquivo = baixar_url_midia_direta(url_midia, prefix, referer=pagina_final)
+                        logger.info(
+                            f"[SHOPEE_OK] origem=html pagina={pagina_final} midia={url_midia[:180]}"
+                        )
+                        return arquivo
+                    except Exception as e:
+                        ultimo_erro = str(e)
+                        logger.warning(f"[SHOPEE_CANDIDATO] midia={url_midia[:180]} erro={e}")
+
             except Exception as e:
                 ultimo_erro = str(e)
-                logger.warning(f"[SHOPEE_CANDIDATO] midia={url_midia[:180]} erro={e}")
-    except Exception as e:
-        ultimo_erro = str(e)
-        logger.warning(f"[SHOPEE_HTML] url={url_resolvida} erro={e}")
+                logger.warning(f"[SHOPEE_HTML_ERRO] pagina={pagina} erro={e}")
 
-    try:
-        cleanup_prefix(prefix)
-        opts = montar_download_opts(prefix)
-        opts["http_headers"] = SHOPEE_HEADERS
-        opts["format"] = "best[ext=mp4]/best"
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            ydl.download([url_resolvida])
-        arquivo = encontrar_arquivo_baixado(prefix)
-        if arquivo:
-            logger.info(f"[SHOPEE_OK] origem=yt_dlp_generico url={url_resolvida}")
-            return arquivo
-    except Exception as e:
-        ultimo_erro = str(e)
-        logger.warning(f"[SHOPEE_YTDLP] url={url_resolvida} erro={e}")
+    # Último fallback. O yt-dlp não possui extrator específico para Shopee,
+    # mas pode funcionar quando a página expõe mídia genérica.
+    for pagina in paginas:
+        try:
+            cleanup_prefix(prefix)
+            opts = montar_download_opts(prefix)
+            opts["http_headers"] = SHOPEE_HEADERS
+            opts["format"] = "best[ext=mp4]/best"
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.download([pagina])
+            arquivo = encontrar_arquivo_baixado(prefix)
+            if arquivo:
+                logger.info(f"[SHOPEE_OK] origem=yt_dlp_generico url={pagina}")
+                return arquivo
+        except Exception as e:
+            ultimo_erro = str(e)
+            logger.warning(f"[SHOPEE_YTDLP] url={pagina} erro={e}")
+
+    if not encontrou_candidato_midia:
+        raise Exception(
+            "Não encontrei URL de mídia no HTML público da Shopee após resolver o universal-link."
+        )
 
     raise Exception(ultimo_erro or "Não encontrei o vídeo público nesse link da Shopee.")
 
