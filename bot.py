@@ -73,7 +73,7 @@ APP_STARTED_AT = datetime.now(TZ).isoformat()
 FREE_DAILY_LIMIT = 3
 MAX_DURATION_SECONDS = 90
 
-INSTAGRAM_COOKIES_TEXT = os.environ.get("INSTAGRAM_COOKIES_TEXT", "").strip()
+INSTAGRAM_COOKIES_TEXT = os.environ.get("INSTAGRAM_COOKIES_TEXT", "")
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
@@ -116,21 +116,6 @@ PINTEREST_HEADERS = {
     "Referer": "https://www.pinterest.com/",
     "Origin": "https://www.pinterest.com",
     "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8"
-}
-
-INSTAGRAM_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/134.0.0.0 Safari/537.36"
-    ),
-    "Referer": "https://www.instagram.com/",
-    "Origin": "https://www.instagram.com",
-    "Accept": "*/*",
-    "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
-    "Sec-Fetch-Dest": "empty",
-    "Sec-Fetch-Mode": "cors",
-    "Sec-Fetch-Site": "same-origin"
 }
 
 PLANOS = {
@@ -181,6 +166,22 @@ def extrair_primeira_url(texto):
     if not match:
         return None
     return match.group(1).strip().rstrip(".,);]}>\"'")
+
+
+def normalizar_url_instagram(url):
+    """Remove parâmetros de rastreamento e padroniza links de post/Reel."""
+    match = re.search(
+        r"https?://(?:www\.)?instagram\.com/(?:[^/?#]+/)?(p|reels?|tv)/([^/?#&]+)",
+        url,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return url
+
+    tipo = match.group(1).lower()
+    if tipo in ("reel", "reels"):
+        tipo = "reel"
+    return f"https://www.instagram.com/{tipo}/{match.group(2)}/"
 
 
 def cleanup_prefix(prefix):
@@ -631,15 +632,37 @@ def nome_plataforma(is_pinterest, is_tiktok, is_instagram, is_rednote):
 
 
 def get_instagram_cookiefile():
-    if INSTAGRAM_COOKIES_TEXT:
-        cookie_path = os.path.join(DOWNLOAD_DIR, "instagram_cookies.txt")
-        with open(cookie_path, "w", encoding="utf-8", newline="\n") as f:
-            f.write(INSTAGRAM_COOKIES_TEXT)
-        return cookie_path
-    return None
+    texto = (INSTAGRAM_COOKIES_TEXT or "").strip()
+    if not texto:
+        return None
+
+    # Algumas plataformas salvam quebras de linha como os caracteres \n.
+    if "\n" not in texto and "\\n" in texto:
+        texto = texto.replace("\\r\\n", "\n").replace("\\n", "\n")
+
+    texto = texto.replace("\r\n", "\n").replace("\r", "\n").strip()
+
+    # O yt-dlp espera o formato Netscape/Mozilla.
+    if not texto.startswith("# Netscape HTTP Cookie File") and not texto.startswith("# HTTP Cookie File"):
+        texto = "# Netscape HTTP Cookie File\n" + texto
+
+    cookie_path = os.path.join(DOWNLOAD_DIR, "instagram_cookies.txt")
+    with open(cookie_path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(texto + "\n")
+
+    linhas = [linha for linha in texto.splitlines() if linha and not linha.startswith("#")]
+    tem_sessionid = any(
+        len(partes := linha.split("\t")) >= 7 and partes[5] == "sessionid"
+        for linha in linhas
+    )
+    logger.info(
+        f"[INSTAGRAM_COOKIES] arquivo_criado=True linhas={len(linhas)} "
+        f"tem_sessionid={tem_sessionid}"
+    )
+    return cookie_path
 
 
-def montar_info_opts(is_instagram=False, is_pinterest=False):
+def montar_info_opts(is_instagram=False, is_pinterest=False, usar_cookies=True):
     opts = {
         "quiet": True,
         "nocheckcertificate": True,
@@ -649,17 +672,19 @@ def montar_info_opts(is_instagram=False, is_pinterest=False):
     }
 
     if is_instagram:
-        opts["http_headers"] = INSTAGRAM_HEADERS
-        cookiefile = get_instagram_cookiefile()
-        if cookiefile:
-            opts["cookiefile"] = cookiefile
+        # O extrator do yt-dlp configura os cabeçalhos e a impersonação.
+        # Cabeçalhos manuais podem ficar incompatíveis quando o Instagram muda.
+        if usar_cookies:
+            cookiefile = get_instagram_cookiefile()
+            if cookiefile:
+                opts["cookiefile"] = cookiefile
     elif is_pinterest:
         opts["http_headers"] = PINTEREST_HEADERS
 
     return opts
 
 
-def montar_download_opts(prefix, is_instagram=False, is_pinterest=False):
+def montar_download_opts(prefix, is_instagram=False, is_pinterest=False, usar_cookies=True):
     opts = {
         "outtmpl": f"{prefix}.%(ext)s",
         "nocheckcertificate": True,
@@ -673,14 +698,53 @@ def montar_download_opts(prefix, is_instagram=False, is_pinterest=False):
     }
 
     if is_instagram:
-        opts["http_headers"] = INSTAGRAM_HEADERS
-        cookiefile = get_instagram_cookiefile()
-        if cookiefile:
-            opts["cookiefile"] = cookiefile
+        opts.pop("http_headers", None)
+        if usar_cookies:
+            cookiefile = get_instagram_cookiefile()
+            if cookiefile:
+                opts["cookiefile"] = cookiefile
     elif is_pinterest:
         opts["http_headers"] = PINTEREST_HEADERS
 
     return opts
+
+
+def erro_instagram_permite_fallback(erro):
+    texto = str(erro or "").lower()
+    sinais = (
+        "http error 400",
+        "bad request",
+        "instagram api is not granting access",
+        "video info extraction failed",
+        "rate-limit reached",
+        "requested content is not available",
+    )
+    return any(sinal in texto for sinal in sinais)
+
+
+def extrair_info_instagram_com_fallback(url):
+    """Tenta com cookies e repete anonimamente para Reels públicos."""
+    tentativas = [True]
+    if INSTAGRAM_COOKIES_TEXT.strip():
+        tentativas.append(False)
+
+    ultimo_erro = None
+    for usar_cookies in tentativas:
+        try:
+            logger.info(f"[INSTAGRAM_INFO] usar_cookies={usar_cookies} url={url}")
+            opts = montar_info_opts(is_instagram=True, usar_cookies=usar_cookies)
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+            return info, usar_cookies
+        except Exception as e:
+            ultimo_erro = e
+            logger.warning(
+                f"[INSTAGRAM_INFO_FALHA] usar_cookies={usar_cookies} url={url} erro={e}"
+            )
+            if not usar_cookies or not erro_instagram_permite_fallback(e):
+                raise
+
+    raise ultimo_erro or Exception("Falha ao consultar o Instagram")
 
 
 def mapear_erro_download(err_text, plataforma="geral"):
@@ -1703,6 +1767,9 @@ def handle_download(message):
         is_pinterest, is_tiktok, is_instagram, is_rednote = detectar_plataforma(url_lower)
         plataforma = nome_plataforma(is_pinterest, is_tiktok, is_instagram, is_rednote)
 
+        if is_instagram:
+            url = normalizar_url_instagram(url)
+
         logger.info(f"[DOWNLOAD_INICIO] user_id={message.from_user.id} plataforma={plataforma} url={url}")
 
         if not (is_pinterest or is_tiktok or is_instagram or is_rednote):
@@ -1765,8 +1832,12 @@ def handle_download(message):
 
         prefix = os.path.join(DOWNLOAD_DIR, f"v_{message.from_user.id}_{uuid.uuid4().hex}")
 
-        with yt_dlp.YoutubeDL(montar_info_opts(is_instagram=is_instagram)) as ydl:
-            info = ydl.extract_info(url, download=False)
+        usar_cookies_instagram = True
+        if is_instagram:
+            info, usar_cookies_instagram = extrair_info_instagram_com_fallback(url)
+        else:
+            with yt_dlp.YoutubeDL(montar_info_opts()) as ydl:
+                info = ydl.extract_info(url, download=False)
 
         duracao = info.get("duration")
         logger.info(f"[META] plataforma={plataforma} user_id={message.from_user.id} duration={duracao}")
@@ -1779,7 +1850,6 @@ def handle_download(message):
                 safe_send_message(message.chat.id, texto)
             return
 
-        common_opts = montar_download_opts(prefix, is_instagram=is_instagram)
         formatos = formatos_por_plataforma(
             is_tiktok=is_tiktok,
             is_instagram=is_instagram,
@@ -1789,24 +1859,41 @@ def handle_download(message):
         baixou = False
         ultimo_erro = None
 
-        for fmt in formatos:
-            try:
-                cleanup_prefix(prefix)
+        modos_cookie = [usar_cookies_instagram] if is_instagram else [False]
+        if is_instagram and usar_cookies_instagram and INSTAGRAM_COOKIES_TEXT.strip():
+            modos_cookie.append(False)
 
-                opts = common_opts.copy()
-                opts["format"] = fmt
+        for usar_cookies in modos_cookie:
+            common_opts = montar_download_opts(
+                prefix,
+                is_instagram=is_instagram,
+                usar_cookies=usar_cookies,
+            )
 
-                with yt_dlp.YoutubeDL(opts) as ydl:
-                    ydl.download([url])
+            for fmt in formatos:
+                try:
+                    cleanup_prefix(prefix)
 
-                arquivo_baixado = encontrar_arquivo_baixado(prefix)
-                if arquivo_baixado and os.path.exists(arquivo_baixado):
-                    baixou = True
-                    break
+                    opts = common_opts.copy()
+                    opts["format"] = fmt
 
-            except Exception as e:
-                ultimo_erro = str(e)
-                logger.warning(f"[DOWNLOAD_TENTATIVA] plataforma={plataforma} formato={fmt} url={url} erro={e}")
+                    with yt_dlp.YoutubeDL(opts) as ydl:
+                        ydl.download([url])
+
+                    arquivo_baixado = encontrar_arquivo_baixado(prefix)
+                    if arquivo_baixado and os.path.exists(arquivo_baixado):
+                        baixou = True
+                        break
+
+                except Exception as e:
+                    ultimo_erro = str(e)
+                    logger.warning(
+                        f"[DOWNLOAD_TENTATIVA] plataforma={plataforma} "
+                        f"usar_cookies={usar_cookies} formato={fmt} url={url} erro={e}"
+                    )
+
+            if baixou:
+                break
 
         if not baixou:
             raise Exception(ultimo_erro or "Falha ao baixar dentro do limite 720x1280 30fps")
