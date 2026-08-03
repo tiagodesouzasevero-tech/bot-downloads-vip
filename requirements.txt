@@ -1,5 +1,5 @@
 pyTelegramBotAPI
-yt-dlp[default,curl-cffi]==2026.7.4
+yt-dlp[default,curl-cffi]==2026.7.23.234303.dev0
 Flask
 pymongo[srv]
 requests
