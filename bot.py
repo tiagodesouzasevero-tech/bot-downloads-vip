@@ -4,12 +4,9 @@ import glob
 import uuid
 import time
 import logging
-import html
-import hmac
-from threading import Lock, Thread
+from threading import Thread
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from urllib.parse import urlparse
 
 import requests
 import telebot
@@ -51,7 +48,6 @@ INFINITEPAY_HANDLE = get_env_required("INFINITEPAY_HANDLE")
 INFINITEPAY_WEBHOOK_SECRET = get_env_required("INFINITEPAY_WEBHOOK_SECRET")
 APP_BASE_URL = get_env_required("APP_BASE_URL").rstrip("/")
 INFINITEPAY_CHECKOUT_URL = "https://api.checkout.infinitepay.io/links"
-INFINITEPAY_PAYMENT_CHECK_URL = "https://api.checkout.infinitepay.io/payment_check"
 
 DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", "downloads_temp")
 TZ = ZoneInfo("America/Sao_Paulo")
@@ -60,10 +56,19 @@ SERVICE_NAME = get_first_env(
     ["SERVICE_NAME", "RAILWAY_SERVICE_NAME"],
     default="bot-downloads-vip"
 )
+APP_VERSION = get_first_env(
+    ["APP_VERSION", "RAILWAY_GIT_COMMIT_SHA", "GIT_COMMIT", "COMMIT_SHA"],
+    default="unknown"
+)
+DEPLOYMENT_ID = get_first_env(
+    ["RAILWAY_DEPLOYMENT_ID", "DEPLOYMENT_ID", "RAILWAY_REPLICA_ID"],
+    default="unknown"
+)
 ENVIRONMENT_NAME = get_first_env(
     ["RAILWAY_ENVIRONMENT_NAME", "RAILWAY_ENVIRONMENT", "ENVIRONMENT"],
     default="production"
 )
+APP_STARTED_AT = datetime.now(TZ).isoformat()
 
 FREE_DAILY_LIMIT = 3
 MAX_DURATION_SECONDS = 90
@@ -95,17 +100,11 @@ try:
     pedidos_col.create_index("order_nsu", unique=True)
     pedidos_col.create_index("status")
     pedidos_col.create_index("user_id")
-    pedidos_col.create_index(
-        "transaction_nsu",
-        unique=True,
-        partialFilterExpression={"transaction_nsu": {"$type": "string"}}
-    )
 except Exception as e:
     logger.warning(f"[MONGO_INDEX] Não foi possível garantir índices agora: {e}")
 
 bot = telebot.TeleBot(TOKEN_TELEGRAM, threaded=False)
 app = Flask(__name__)
-webhook_lock = Lock()
 
 DEFAULT_HEADERS = {
     "User-Agent": "Mozilla/5.0",
@@ -146,12 +145,7 @@ PLANOS = {
         "preco_centavos": 7990,
         "dias": 365,
         "descricao": "VIP Anual 365 dias"
-    }
-}
-
-# Mantido apenas para honrar links vitalícios criados antes desta atualização.
-# O plano não aparece mais no menu e não gera novos checkouts.
-PLANOS_LEGADOS = {
+    },
     "297.00": {
         "nome": "VIP Vitalício",
         "preco_centavos": 29700,
@@ -616,28 +610,11 @@ def enviar_arquivo_com_fallback(chat_id, arquivo):
         return False
 
 
-def dominio_corresponde(hostname, dominios):
-    return any(
-        hostname == dominio or hostname.endswith(f".{dominio}")
-        for dominio in dominios
-    )
-
-
-def detectar_plataforma(url):
-    """Valida o domínio real antes de entregar a URL ao yt-dlp."""
-    try:
-        parsed = urlparse(url.strip())
-        if parsed.scheme not in ("http", "https") or not parsed.hostname:
-            return False, False, False, False
-
-        hostname = parsed.hostname.lower().rstrip(".")
-    except Exception:
-        return False, False, False, False
-
-    is_pinterest = dominio_corresponde(hostname, ("pin.it", "pinterest.com"))
-    is_tiktok = dominio_corresponde(hostname, ("tiktok.com",))
-    is_instagram = dominio_corresponde(hostname, ("instagram.com", "instagr.am"))
-    is_rednote = dominio_corresponde(hostname, ("xiaohongshu.com", "xhslink.com"))
+def detectar_plataforma(url_lower):
+    is_pinterest = ("pin.it" in url_lower) or ("pinterest" in url_lower)
+    is_tiktok = ("tiktok.com" in url_lower) or ("vm.tiktok.com" in url_lower) or ("vt.tiktok.com" in url_lower)
+    is_instagram = ("instagram.com" in url_lower) or ("instagr.am" in url_lower)
+    is_rednote = ("xiaohongshu.com" in url_lower) or ("xhslink.com" in url_lower) or ("rednote" in url_lower)
     return is_pinterest, is_tiktok, is_instagram, is_rednote
 
 
@@ -665,6 +642,7 @@ def get_instagram_cookiefile():
 def montar_info_opts(is_instagram=False, is_pinterest=False):
     opts = {
         "quiet": True,
+        "nocheckcertificate": True,
         "noplaylist": True,
         "socket_timeout": 20,
         "retries": 2
@@ -684,6 +662,7 @@ def montar_info_opts(is_instagram=False, is_pinterest=False):
 def montar_download_opts(prefix, is_instagram=False, is_pinterest=False):
     opts = {
         "outtmpl": f"{prefix}.%(ext)s",
+        "nocheckcertificate": True,
         "quiet": True,
         "noplaylist": True,
         "merge_output_format": "mp4",
@@ -759,7 +738,7 @@ def incrementar_download_gratis(user, chat_id, from_user_id):
         safe_send_message(
             chat_id,
             f"⚠️ *Você atingiu seu limite diário ({FREE_DAILY_LIMIT}/{FREE_DAILY_LIMIT})!*\n"
-            "Para continuar baixando sem limite diário, libere um plano VIP: 👇",
+            "Para continuar baixando de forma ilimitada agora mesmo, libere um plano VIP: 👇",
             parse_mode="Markdown"
         )
         mostrar_planos_chat(chat_id, from_user_id)
@@ -811,39 +790,6 @@ def criar_checkout_infinitepay(order_nsu, plano):
     return checkout_url
 
 
-def confirmar_pagamento_infinitepay(order_nsu, transaction_nsu, invoice_slug):
-    """Confirma o pagamento diretamente na InfinitePay antes de liberar o VIP."""
-    if not order_nsu or not transaction_nsu or not invoice_slug:
-        raise ValueError("Dados insuficientes para confirmar o pagamento.")
-
-    payload = {
-        "handle": INFINITEPAY_HANDLE,
-        "order_nsu": order_nsu,
-        "transaction_nsu": transaction_nsu,
-        "slug": invoice_slug,
-    }
-
-    resp = requests.post(
-        INFINITEPAY_PAYMENT_CHECK_URL,
-        json=payload,
-        timeout=(5, 20),
-        headers={"Content-Type": "application/json"}
-    )
-
-    if not resp.ok:
-        logger.error(
-            f"[PAYMENT_CHECK_ERROR] order_nsu={order_nsu} "
-            f"status={resp.status_code} body={resp.text[:500]}"
-        )
-        resp.raise_for_status()
-
-    data = resp.json()
-    if not data.get("success") or not data.get("paid"):
-        raise ValueError("Pagamento ainda não aparece como aprovado na InfinitePay.")
-
-    return data
-
-
 def calcular_nova_data_vip(user, dias):
     if dias is None:
         return "Vitalício"
@@ -868,7 +814,7 @@ def calcular_nova_data_vip(user, dias):
     return nova_data.strftime("%Y-%m-%d")
 
 
-def liberar_vip_por_plano(user_id, plano, order_nsu=None):
+def liberar_vip_por_plano(user_id, plano):
     user = obter_usuario(user_id)
 
     if plano.get("vitalicio"):
@@ -876,28 +822,21 @@ def liberar_vip_por_plano(user_id, plano, order_nsu=None):
     else:
         novo_vip_ate = calcular_nova_data_vip(user, plano["dias"])
 
-    filtro = {"_id": str(user_id)}
-    atualizacao = {
-        "$set": {
-            "vip_ate": novo_vip_ate,
-            "ultima_data": hoje_str()
+    usuarios_col.update_one(
+        {"_id": str(user_id)},
+        {
+            "$set": {
+                "vip_ate": novo_vip_ate,
+                "ultima_data": hoje_str()
+            },
+            "$setOnInsert": {
+                "downloads_hoje": 0
+            }
         },
-        "$setOnInsert": {
-            "downloads_hoje": 0
-        }
-    }
+        upsert=True
+    )
 
-    if order_nsu:
-        filtro["vip_order_nsus"] = {"$ne": order_nsu}
-        atualizacao["$addToSet"] = {"vip_order_nsus": order_nsu}
-
-    resultado = usuarios_col.update_one(filtro, atualizacao, upsert=not bool(order_nsu))
-
-    if order_nsu and resultado.matched_count == 0:
-        user_atual = usuarios_col.find_one({"_id": str(user_id)}) or {}
-        return user_atual.get("vip_ate") or novo_vip_ate, False
-
-    return novo_vip_ate, True
+    return novo_vip_ate
 
 
 def notificar_pagamento_confirmado(user_id, plano_nome, vip_ate, receipt_url=None):
@@ -1042,15 +981,15 @@ def resolver_link_pinterest(url):
                 }
             )
             if r.url:
-                logger.info("[PINTEREST_REDIRECT] Link curto resolvido com sucesso")
+                logger.info(f"[PINTEREST_REDIRECT] {url} -> {r.url}")
                 return r.url
 
     except Timeout as e:
-        logger.warning(f"[PINTEREST_TIMEOUT] erro={e}")
+        logger.warning(f"[PINTEREST_TIMEOUT] url={url} erro={e}")
     except RequestException as e:
-        logger.warning(f"[PINTEREST_REQUEST_ERROR] erro={e}")
+        logger.warning(f"[PINTEREST_REQUEST_ERROR] url={url} erro={e}")
     except Exception as e:
-        logger.warning(f"[PINTEREST_UNKNOWN_ERROR] erro={e}")
+        logger.warning(f"[PINTEREST_UNKNOWN_ERROR] url={url} erro={e}")
 
     return url
 
@@ -1075,12 +1014,12 @@ def baixar_pinterest_capado(url, prefix):
 
             arquivo = encontrar_arquivo_baixado(prefix)
             if arquivo and os.path.exists(arquivo):
-                logger.info(f"[PINTEREST_OK] formato={fmt}")
+                logger.info(f"[PINTEREST_OK] formato={fmt} url={url}")
                 return arquivo
 
         except Exception as e:
             ultimo_erro = str(e)
-            logger.warning(f"[PINTEREST_TENTATIVA] formato={fmt} erro={e}")
+            logger.warning(f"[PINTEREST_TENTATIVA] formato={fmt} url={url} erro={e}")
 
     raise Exception(ultimo_erro or "Falha ao baixar Pinterest")
 
@@ -1090,8 +1029,8 @@ def baixar_pinterest_capado(url, prefix):
 # =========================================
 def enviar_menu_principal(is_admin=False):
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    markup.row("💎 Planos VIP", "👤 Meu plano")
-    markup.row("📋 Como funciona", "📞 Suporte")
+    markup.row("🚀 Liberar VIP", "📋 Como funciona")
+    markup.row("📞 Suporte")
 
     if is_admin:
         markup.row("⚙️ Painel Admin")
@@ -1103,16 +1042,18 @@ def mostrar_planos_chat(chat_id, user_id):
     markup = types.InlineKeyboardMarkup(row_width=1)
     markup.add(
         types.InlineKeyboardButton("💳 VIP Mensal - R$ 10,00", callback_data="pay_10.00"),
-        types.InlineKeyboardButton("🏆 VIP Anual - R$ 79,90", callback_data="pay_79.90")
+        types.InlineKeyboardButton("💳 VIP Anual - R$ 79,90", callback_data="pay_79.90"),
+        types.InlineKeyboardButton("💎 VIP Vitalício - R$ 297,00", callback_data="pay_297.00")
     )
 
     texto = (
         "🚀 *LIBERAR ACESSO VIP*\n\n"
-        "Escolha o plano ideal para baixar sem limite diário.\n\n"
-        "✅ Um download por vez, sem limite diário\n"
+        "Escolha o plano ideal para ativar seus downloads ilimitados.\n\n"
+        "✅ Sem limite diário\n"
+        "✅ Prioridade no processamento\n"
         "✅ Uso liberado para TikTok, Pinterest, Instagram e RedNote\n"
         "✅ Liberação automática após o pagamento\n\n"
-        "🏆 *Plano anual:* equivale a R$ 6,66 por mês e economiza R$ 40,10."
+        f"Sua ID: `{user_id}`"
     )
 
     safe_send_message(chat_id, texto, parse_mode="Markdown", reply_markup=markup)
@@ -1206,10 +1147,8 @@ def consultar_docs_backup(tipo):
                     "created_at": 1,
                     "paid_at": 1,
                     "transaction_nsu": 1,
-                    "invoice_slug": 1,
                     "receipt_url": 1,
                     "capture_method": 1,
-                    "payment_verified_at": 1,
                     "vip_liberado_ate": 1,
                     "checkout_url": 1,
                 }
@@ -1249,10 +1188,8 @@ def consultar_docs_backup(tipo):
                     "created_at": 1,
                     "paid_at": 1,
                     "transaction_nsu": 1,
-                    "invoice_slug": 1,
                     "receipt_url": 1,
                     "capture_method": 1,
-                    "payment_verified_at": 1,
                     "vip_liberado_ate": 1,
                     "checkout_url": 1,
                 }
@@ -1549,43 +1486,7 @@ def painel_admin(message):
 # =========================================
 # START / PERFIL / PLANOS / SUPORTE
 # =========================================
-def formatar_data_br(data_iso):
-    try:
-        return datetime.strptime(data_iso, "%Y-%m-%d").strftime("%d/%m/%Y")
-    except Exception:
-        return str(data_iso)
-
-
-def mostrar_perfil_chat(chat_id, user_id):
-    user = obter_usuario(user_id)
-    vip = is_vip_user(user)
-
-    if vip:
-        vip_ate = user.get("vip_ate")
-        validade = "Vitalício" if vip_ate == "Vitalício" else formatar_data_br(vip_ate)
-        texto = (
-            "👤 *MEU PLANO*\n\n"
-            "💎 Status: *VIP ATIVO*\n"
-            f"📅 Válido até: *{validade}*\n"
-            "📥 Downloads: *sem limite diário, um por vez*\n\n"
-            f"🆔 Sua ID: `{user_id}`"
-        )
-    else:
-        usados = int(user.get("downloads_hoje", 0))
-        restantes = max(0, FREE_DAILY_LIMIT - usados)
-        texto = (
-            "👤 *MEU PLANO*\n\n"
-            "Status: *GRÁTIS*\n"
-            f"📊 Usados hoje: *{usados}/{FREE_DAILY_LIMIT}*\n"
-            f"🎁 Restantes hoje: *{restantes}*\n"
-            "🔄 O limite é renovado diariamente.\n\n"
-            f"🆔 Sua ID: `{user_id}`"
-        )
-
-    safe_send_message(chat_id, texto, parse_mode="Markdown")
-
-
-@bot.message_handler(commands=["start"])
+@bot.message_handler(commands=["start", "perfil"])
 def start(message):
     user = obter_usuario(message.from_user.id)
     vip = is_vip_user(user)
@@ -1597,10 +1498,10 @@ def start(message):
 
     texto = (
         "🚀 *Afiliado Tools*\n\n"
-        "Baixe vídeos do TikTok, Pinterest, Instagram e RedNote "
-        "em até 720 HD e sem marca d'água.\n\n"
-        f"{status}\n\n"
-        "📥 *Cole o link do vídeo aqui para começar.*"
+        "Baixe vídeos em HD do TikTok, Pinterest, Instagram e RedNote.\n\n"
+        f"• Duração máx: {MAX_DURATION_SECONDS}s\n"
+        f"• Sua ID: `{message.from_user.id}`\n\n"
+        f"{status}"
     )
 
     safe_send_message(
@@ -1611,22 +1512,12 @@ def start(message):
     )
 
 
-@bot.message_handler(commands=["perfil"])
-def cmd_perfil(message):
-    mostrar_perfil_chat(message.chat.id, message.from_user.id)
-
-
-@bot.message_handler(func=lambda m: m.text == "👤 Meu plano")
-def meu_plano(message):
-    mostrar_perfil_chat(message.chat.id, message.from_user.id)
-
-
 @bot.message_handler(commands=["planos"])
 def cmd_planos(message):
     mostrar_planos_chat(message.chat.id, message.from_user.id)
 
 
-@bot.message_handler(func=lambda m: m.text in ["💎 Planos VIP", "🚀 Liberar VIP", "💎 VIP"])
+@bot.message_handler(func=lambda m: m.text in ["🚀 Liberar VIP", "💎 VIP"])
 def mostrar_planos(message):
     mostrar_planos_chat(message.chat.id, message.from_user.id)
 
@@ -1635,15 +1526,31 @@ def mostrar_planos(message):
 def como_funciona(message):
     texto = (
         "📋 *COMO FUNCIONA*\n\n"
-        "1. Copie o link de um vídeo do TikTok, Pinterest, Instagram ou RedNote.\n"
-        "2. Cole o link aqui no chat.\n"
-        "3. Aguarde o bot enviar o vídeo.\n\n"
+        "Envie o link de um vídeo do:\n"
+        "• TikTok\n"
+        "• Pinterest\n"
+        "• Instagram\n"
+        "• RedNote\n\n"
+        "O bot faz o download automaticamente.\n\n"
         "✅ Sem marca d'água\n"
-        "✅ Saída em até 720x1280 HD e 30 fps\n"
-        f"✅ Vídeos de até {MAX_DURATION_SECONDS} segundos\n\n"
-        f"🎁 Plano grátis: *{FREE_DAILY_LIMIT} downloads por dia*\n"
-        "💎 VIP: *sem limite diário, um download por vez*\n\n"
-        "Use apenas conteúdos públicos que você tenha autorização para baixar e reutilizar."
+        "✅ Qualidade em HD\n"
+        "✅ Rápido e prático\n\n"
+        "*Plano grátis:*\n"
+        f"• {FREE_DAILY_LIMIT} downloads por dia\n\n"
+        "*VIP libera:*\n"
+        "• Downloads ilimitados\n"
+        "• Prioridade no processamento\n"
+        "• Sem limite diário\n"
+        "• Liberação automática após o pagamento\n\n"
+        "*Regras:*\n"
+        f"• Vídeos de até {MAX_DURATION_SECONDS} segundos\n"
+        "• Máximo 720x1280 em até 30 fps\n"
+        "• Envie apenas o link do vídeo\n\n"
+        "*Como usar:*\n"
+        "1. Copie o link do vídeo\n"
+        "2. Envie aqui no chat\n"
+        "3. Aguarde o download\n\n"
+        "Use o botão *🚀 Liberar VIP* para ativar o acesso ilimitado."
     )
 
     safe_send_message(message.chat.id, texto, parse_mode="Markdown")
@@ -1657,9 +1564,7 @@ def suporte(message):
 
         safe_send_message(
             message.chat.id,
-            "👋 Precisa de ajuda? Clique abaixo para falar com o suporte.\n\n"
-            f"Sua ID: `{message.from_user.id}`",
-            parse_mode="Markdown",
+            "👋 Precisa de ajuda? Clique abaixo para falar com o suporte.",
             reply_markup=markup
         )
     except Exception as e:
@@ -1771,12 +1676,6 @@ def formatos_por_plataforma(is_tiktok=False, is_instagram=False, is_pinterest=Fa
 
 @bot.message_handler(func=lambda message: message.text and "http" in message.text.lower())
 def handle_download(message):
-    if message.chat.type != "private":
-        return safe_reply_to(
-            message,
-            "🔒 Para sua segurança, envie o link diretamente no privado do bot."
-        )
-
     user = obter_usuario(message.from_user.id)
     vip_status = is_vip_user(user)
     prefix = None
@@ -1785,7 +1684,7 @@ def handle_download(message):
         safe_reply_to(
             message,
             f"⚠️ *Limite diário atingido ({FREE_DAILY_LIMIT}/{FREE_DAILY_LIMIT})!*\n"
-            "Para continuar baixando sem limite diário, libere o VIP abaixo: 👇",
+            "Para continuar baixando sem limites, libere o VIP abaixo: 👇",
             parse_mode="Markdown"
         )
         return mostrar_planos_chat(message.chat.id, message.from_user.id)
@@ -1796,14 +1695,15 @@ def handle_download(message):
 
     status_msg = safe_reply_to(
         message,
-        "✅ Link recebido! Estou preparando seu vídeo. Aguarde alguns instantes 👊"
+        "✅ Seu link entrou na fila de download! Aguarde só alguns instantes 👊"
     )
 
     try:
-        is_pinterest, is_tiktok, is_instagram, is_rednote = detectar_plataforma(url)
+        url_lower = url.lower()
+        is_pinterest, is_tiktok, is_instagram, is_rednote = detectar_plataforma(url_lower)
         plataforma = nome_plataforma(is_pinterest, is_tiktok, is_instagram, is_rednote)
 
-        logger.info(f"[DOWNLOAD_INICIO] user_id={message.from_user.id} plataforma={plataforma}")
+        logger.info(f"[DOWNLOAD_INICIO] user_id={message.from_user.id} plataforma={plataforma} url={url}")
 
         if not (is_pinterest or is_tiktok or is_instagram or is_rednote):
             texto_nao_reconhecido = "❌ Link não reconhecido. Envie um link do TikTok, Pinterest, Instagram ou RedNote."
@@ -1851,7 +1751,7 @@ def handle_download(message):
                 return
 
             except Exception as e:
-                logger.error(f"[ERRO_PINTEREST] user_id={message.from_user.id} erro={e}")
+                logger.error(f"[ERRO_PINTEREST] user_id={message.from_user.id} url={url} erro={e}")
                 texto_erro = mapear_erro_download(str(e), plataforma="pinterest")
 
                 if status_msg:
@@ -1906,7 +1806,7 @@ def handle_download(message):
 
             except Exception as e:
                 ultimo_erro = str(e)
-                logger.warning(f"[DOWNLOAD_TENTATIVA] plataforma={plataforma} formato={fmt} erro={e}")
+                logger.warning(f"[DOWNLOAD_TENTATIVA] plataforma={plataforma} formato={fmt} url={url} erro={e}")
 
         if not baixou:
             raise Exception(ultimo_erro or "Falha ao baixar dentro do limite 720x1280 30fps")
@@ -1929,7 +1829,7 @@ def handle_download(message):
             safe_delete_message(message.chat.id, status_msg.message_id)
 
     except Exception as e:
-        logger.error(f"[ERRO_DOWNLOAD] user_id={message.from_user.id} erro={e}")
+        logger.error(f"[ERRO_DOWNLOAD] user_id={message.from_user.id} url={url} erro={e}")
         texto_erro = mapear_erro_download(str(e), plataforma=("instagram" if "instagram.com" in url.lower() else "geral"))
 
         if status_msg:
@@ -1942,26 +1842,13 @@ def handle_download(message):
             cleanup_prefix(prefix)
 
 
-@bot.message_handler(content_types=["text"])
-def orientar_texto_nao_reconhecido(message):
-    if message.chat.type != "private":
-        return
-
-    safe_reply_to(
-        message,
-        "📥 Envie um link do TikTok, Pinterest, Instagram ou RedNote.\n\n"
-        "Se precisar de ajuda, toque em *📋 Como funciona*.",
-        parse_mode="Markdown"
-    )
-
-
 # =========================================
 # ROTAS INFINITEPAY
 # =========================================
 @app.route("/pagamento/sucesso")
 def pagamento_sucesso():
-    order_nsu = html.escape(request.args.get("order_nsu", ""), quote=True)
-    capture_method = html.escape(request.args.get("capture_method", ""), quote=True)
+    order_nsu = request.args.get("order_nsu", "")
+    capture_method = request.args.get("capture_method", "")
     return f"""
     <html>
         <head><title>Pagamento recebido</title></head>
@@ -1978,10 +1865,9 @@ def pagamento_sucesso():
 
 @app.route("/webhook/infinitepay", methods=["POST"])
 def webhook_infinitepay():
-    webhook_lock.acquire()
     try:
         secret_recebido = (request.args.get("secret") or "").strip()
-        if not hmac.compare_digest(secret_recebido, INFINITEPAY_WEBHOOK_SECRET):
+        if secret_recebido != INFINITEPAY_WEBHOOK_SECRET:
             logger.warning("[WEBHOOK_INFINITEPAY] acesso negado: secret inválido")
             disparar_notificacao_admin(
                 montar_texto_admin_webhook(
@@ -1997,7 +1883,6 @@ def webhook_infinitepay():
         payload = request.get_json(silent=True) or {}
         order_nsu = payload.get("order_nsu")
         transaction_nsu = payload.get("transaction_nsu")
-        invoice_slug = payload.get("invoice_slug")
         amount = payload.get("amount")
         receipt_url = payload.get("receipt_url")
         capture_method = payload.get("capture_method")
@@ -2006,18 +1891,26 @@ def webhook_infinitepay():
             f"[WEBHOOK_INFINITEPAY] recebido order_nsu={order_nsu} transaction_nsu={transaction_nsu} "
             f"amount={amount} capture_method={capture_method}"
         )
-        if not order_nsu or not transaction_nsu or not invoice_slug:
-            logger.warning("[WEBHOOK_INFINITEPAY] identificadores obrigatórios ausentes")
+        disparar_notificacao_admin(
+            montar_texto_admin_webhook(
+                "📩 *Webhook InfinitePay recebido*",
+                order_nsu=order_nsu,
+                valor_centavos=amount,
+                detalhe=f"Forma: {capture_method or 'não informada'}"
+            )
+        )
+
+        if not order_nsu:
+            logger.warning("[WEBHOOK_INFINITEPAY] order_nsu ausente")
             disparar_notificacao_admin(
                 montar_texto_admin_webhook(
                     "⚠️ *Webhook com erro*",
-                    order_nsu=order_nsu,
-                    detalhe="order_nsu, transaction_nsu ou invoice_slug ausente"
+                    detalhe="order_nsu ausente"
                 )
             )
             return jsonify({
                 "success": False,
-                "message": "Identificadores obrigatórios ausentes"
+                "message": "order_nsu ausente"
             }), 400
 
         pedido = pedidos_col.find_one({"order_nsu": order_nsu})
@@ -2035,11 +1928,7 @@ def webhook_infinitepay():
                 "message": "Pedido não encontrado"
             }), 400
 
-        plano = (
-            PLANOS.get(pedido.get("plano_key"))
-            or PLANOS_LEGADOS.get(pedido.get("plano_key"))
-            or {}
-        )
+        plano = PLANOS.get(pedido.get("plano_key")) or {}
         plano_nome = plano.get("nome")
 
         if pedido.get("status") == "paid":
@@ -2097,59 +1986,12 @@ def webhook_infinitepay():
                 "message": "Plano inválido"
             }), 400
 
-        transacao_em_outro_pedido = pedidos_col.find_one({
-            "transaction_nsu": transaction_nsu,
-            "order_nsu": {"$ne": order_nsu}
-        })
-        if transacao_em_outro_pedido:
-            logger.warning(
-                f"[WEBHOOK_TRANSACAO_REUTILIZADA] transaction_nsu={transaction_nsu} "
-                f"order_nsu={order_nsu}"
-            )
-            return jsonify({
-                "success": False,
-                "message": "Transação já vinculada a outro pedido"
-            }), 400
-
-        confirmacao = confirmar_pagamento_infinitepay(
-            order_nsu=order_nsu,
-            transaction_nsu=transaction_nsu,
-            invoice_slug=invoice_slug
-        )
-
-        try:
-            valor_confirmado = int(confirmacao.get("amount") or 0)
-        except Exception:
-            valor_confirmado = 0
-
-        if valor_confirmado != valor_esperado:
-            detalhe = f"Esperado {valor_esperado} | Confirmado {valor_confirmado}"
-            logger.warning(f"[PAYMENT_CHECK_VALOR_DIVERGENTE] order_nsu={order_nsu} {detalhe}")
-            disparar_notificacao_admin(
-                montar_texto_admin_webhook(
-                    "❌ *Valor divergente na confirmação do pagamento*",
-                    order_nsu=order_nsu,
-                    user_id=pedido.get("user_id"),
-                    plano_nome=plano_nome,
-                    valor_centavos=valor_confirmado,
-                    detalhe=detalhe
-                )
-            )
-            return jsonify({
-                "success": False,
-                "message": "Valor confirmado divergente"
-            }), 400
-
         logger.info(
             f"[WEBHOOK_PROCESSANDO] order_nsu={order_nsu} user_id={pedido['user_id']} "
             f"plano={plano['nome']} valor={valor_recebido}"
         )
 
-        vip_ate, vip_liberado_agora = liberar_vip_por_plano(
-            pedido["user_id"],
-            plano,
-            order_nsu=order_nsu
-        )
+        vip_ate = liberar_vip_por_plano(pedido["user_id"], plano)
 
         pedidos_col.update_one(
             {"order_nsu": order_nsu},
@@ -2158,11 +2000,9 @@ def webhook_infinitepay():
                     "status": "paid",
                     "paid_at": agora_tz(),
                     "transaction_nsu": transaction_nsu,
-                    "invoice_slug": invoice_slug,
                     "receipt_url": receipt_url,
                     "capture_method": capture_method,
-                    "vip_liberado_ate": vip_ate,
-                    "payment_verified_at": agora_tz()
+                    "vip_liberado_ate": vip_ate
                 }
             }
         )
@@ -2182,12 +2022,11 @@ def webhook_infinitepay():
             )
         )
 
-        if vip_liberado_agora:
-            Thread(
-                target=notificar_pagamento_confirmado,
-                args=(pedido["user_id"], plano["nome"], vip_ate, receipt_url),
-                daemon=True
-            ).start()
+        Thread(
+            target=notificar_pagamento_confirmado,
+            args=(pedido["user_id"], plano["nome"], vip_ate, receipt_url),
+            daemon=True
+        ).start()
 
         return jsonify({
             "success": True,
@@ -2206,8 +2045,6 @@ def webhook_infinitepay():
             "success": False,
             "message": "Erro interno no webhook"
         }), 400
-    finally:
-        webhook_lock.release()
 
 
 
@@ -2220,7 +2057,16 @@ def root_status():
 
 @app.route("/health")
 def health():
-    return jsonify({"status": "ok"}), 200
+    return jsonify({
+        "status": "ok",
+        "service": SERVICE_NAME,
+        "version": APP_VERSION,
+        "deployment_id": DEPLOYMENT_ID,
+        "environment": ENVIRONMENT_NAME,
+        "started_at": APP_STARTED_AT,
+        "bot": "running",
+        "flask": "running"
+    }), 200
 
 
 # =========================================
