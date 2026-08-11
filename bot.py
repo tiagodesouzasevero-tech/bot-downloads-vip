@@ -4,7 +4,7 @@ import glob
 import uuid
 import time
 import logging
-from threading import Thread
+from threading import Lock, Thread
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -76,6 +76,9 @@ MAX_DURATION_SECONDS = 90
 
 INSTAGRAM_COOKIES_TEXT = os.environ.get("INSTAGRAM_COOKIES_TEXT", "")
 TIKTOK_COOKIES_TEXT = os.environ.get("TIKTOK_COOKIES_TEXT", "")
+
+TIKTOK_COOKIE_LOCK = Lock()
+TIKTOK_COOKIES_ENV_APLICADOS = False
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
@@ -658,33 +661,121 @@ def get_instagram_cookiefile():
     return cookie_path
 
 
-def get_tiktok_cookiefile():
-    """Mantém uma sessão do TikTok entre tentativas e aceita cookies opcionais."""
-    cookie_path = os.path.join(DOWNLOAD_DIR, "tiktok_cookies.txt")
-
-    # Não sobrescreve o arquivo existente: o yt-dlp pode ter atualizado a sessão.
-    if os.path.exists(cookie_path) and os.path.getsize(cookie_path) > 0:
-        return cookie_path
-
-    texto = (TIKTOK_COOKIES_TEXT or "").strip()
-    if texto:
-        if "\n" not in texto and "\\n" in texto:
-            texto = texto.replace("\\r\\n", "\n").replace("\\n", "\n")
-        texto = texto.replace("\r\n", "\n").replace("\r", "\n").strip()
-
+def normalizar_tiktok_cookies_text(texto):
+    texto = (texto or "").strip().lstrip("\ufeff")
     if not texto:
-        texto = "# Netscape HTTP Cookie File"
-    elif not texto.startswith("# Netscape HTTP Cookie File") and not texto.startswith("# HTTP Cookie File"):
-        texto = "# Netscape HTTP Cookie File\n" + texto
+        return ""
 
-    with open(cookie_path, "w", encoding="utf-8", newline="\n") as f:
-        f.write(texto + "\n")
+    # A Railway pode preservar as quebras/tabs ou recebê-las escapadas.
+    if "\n" not in texto and "\\n" in texto:
+        texto = texto.replace("\\r\\n", "\n").replace("\\n", "\n")
+    if "\t" not in texto and "\\t" in texto:
+        texto = texto.replace("\\t", "\t")
 
-    linhas = [linha for linha in texto.splitlines() if linha and not linha.startswith("#")]
-    logger.info(
-        f"[TIKTOK_COOKIES] arquivo_criado=True cookies_fornecidos={bool(linhas)}"
-    )
-    return cookie_path
+    return texto.replace("\r\n", "\n").replace("\r", "\n").strip()
+
+
+def linhas_validas_tiktok_cookies(texto):
+    """Retorna somente registros compatíveis com o formato Netscape."""
+    linhas_validas = []
+    for linha_original in (texto or "").splitlines():
+        linha = linha_original.strip("\r\n")
+        linha_sem_espacos = linha.strip()
+        if not linha_sem_espacos:
+            continue
+        if linha_sem_espacos.startswith("#") and not linha_sem_espacos.startswith("#HttpOnly_"):
+            continue
+        if len(linha.split("\t")) >= 7:
+            linhas_validas.append(linha)
+    return linhas_validas
+
+
+def get_tiktok_cookiefile():
+    """Aplica cookies da Railway e preserva a sessão atualizada pelo yt-dlp."""
+    global TIKTOK_COOKIES_ENV_APLICADOS
+
+    cookie_path = os.path.join(DOWNLOAD_DIR, "tiktok_cookies.txt")
+    texto_env = normalizar_tiktok_cookies_text(TIKTOK_COOKIES_TEXT)
+    linhas_env = linhas_validas_tiktok_cookies(texto_env)
+
+    if texto_env and not linhas_env:
+        logger.error(
+            "[TIKTOK_COOKIES_INVALIDOS] A variável TIKTOK_COOKIES_TEXT não "
+            "contém registros no formato Netscape."
+        )
+        raise RuntimeError(
+            "TIKTOK_COOKIES_TEXT_INVALIDO: use um arquivo de cookies no formato Netscape"
+        )
+
+    with TIKTOK_COOKIE_LOCK:
+        texto_arquivo = ""
+        if os.path.exists(cookie_path):
+            try:
+                with open(cookie_path, "r", encoding="utf-8") as f:
+                    texto_arquivo = f.read()
+            except OSError as e:
+                logger.warning(f"[TIKTOK_COOKIES_LEITURA_FALHA] erro={e}")
+
+        linhas_arquivo = linhas_validas_tiktok_cookies(texto_arquivo)
+
+        # Na primeira chamada de cada implantação, a variável da Railway é a
+        # fonte principal. Isso substitui inclusive o antigo arquivo que tinha
+        # apenas o cabeçalho e fazia os cookies reais serem ignorados.
+        if linhas_env and not TIKTOK_COOKIES_ENV_APLICADOS:
+            texto_gravar = texto_env
+            if not (
+                texto_gravar.startswith("# Netscape HTTP Cookie File")
+                or texto_gravar.startswith("# HTTP Cookie File")
+            ):
+                texto_gravar = "# Netscape HTTP Cookie File\n" + texto_gravar
+
+            with open(cookie_path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(texto_gravar.rstrip("\n") + "\n")
+
+            TIKTOK_COOKIES_ENV_APLICADOS = True
+            logger.info(
+                f"[TIKTOK_COOKIES] origem=variavel_railway "
+                f"cookies_fornecidos=True linhas={len(linhas_env)}"
+            )
+            return cookie_path
+
+        # Depois da primeira aplicação, mantém eventuais cookies de desafio
+        # que o próprio yt-dlp tenha atualizado durante a sessão.
+        if linhas_arquivo:
+            logger.info(
+                f"[TIKTOK_COOKIES] origem=arquivo_persistente "
+                f"cookies_fornecidos=True linhas={len(linhas_arquivo)}"
+            )
+            return cookie_path
+
+        # Se o arquivo sumir durante a execução, recria os cookies fornecidos.
+        if linhas_env:
+            texto_gravar = texto_env
+            if not (
+                texto_gravar.startswith("# Netscape HTTP Cookie File")
+                or texto_gravar.startswith("# HTTP Cookie File")
+            ):
+                texto_gravar = "# Netscape HTTP Cookie File\n" + texto_gravar
+
+            with open(cookie_path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(texto_gravar.rstrip("\n") + "\n")
+
+            TIKTOK_COOKIES_ENV_APLICADOS = True
+            logger.info(
+                f"[TIKTOK_COOKIES] origem=variavel_railway_recriada "
+                f"cookies_fornecidos=True linhas={len(linhas_env)}"
+            )
+            return cookie_path
+
+        # Sem configuração, mantém um cookiefile válido e vazio para o yt-dlp
+        # poder salvar uma sessão caso o desafio do TikTok permita.
+        with open(cookie_path, "w", encoding="utf-8", newline="\n") as f:
+            f.write("# Netscape HTTP Cookie File\n")
+
+        logger.info(
+            "[TIKTOK_COOKIES] origem=nenhuma cookies_fornecidos=False linhas=0"
+        )
+        return cookie_path
 
 
 def montar_info_opts(
@@ -879,6 +970,8 @@ def mapear_erro_download(err_text, plataforma="geral"):
         return "❌ Não consegui baixar esse link do Instagram agora."
 
     if plataforma == "tiktok":
+        if "tiktok_cookies_text_invalido" in err:
+            return "❌ Os cookies do TikTok estão em formato inválido. Use o formato Netscape e tente novamente."
         if (
             "unexpected response from webpage request" in err
             or "unable to extract challenge data" in err
