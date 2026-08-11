@@ -76,9 +76,11 @@ MAX_DURATION_SECONDS = 90
 
 INSTAGRAM_COOKIES_TEXT = os.environ.get("INSTAGRAM_COOKIES_TEXT", "")
 TIKTOK_COOKIES_TEXT = os.environ.get("TIKTOK_COOKIES_TEXT", "")
+TIKTOK_DEVICE_ID_TEXT = os.environ.get("TIKTOK_DEVICE_ID", "")
 
 TIKTOK_COOKIE_LOCK = Lock()
 TIKTOK_COOKIES_ENV_APLICADOS = False
+TIKTOK_DEVICE_LOCK = Lock()
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
@@ -778,11 +780,77 @@ def get_tiktok_cookiefile():
         return cookie_path
 
 
+def validar_tiktok_device_id(valor):
+    """Aceita apenas o identificador numérico de 19 dígitos usado pelo app."""
+    valor = str(valor or "").strip()
+    return valor if re.fullmatch(r"\d{19}", valor) else None
+
+
+def get_tiktok_device_id():
+    """Mantém um device_id estável entre reinícios usando o volume da Railway."""
+    device_path = os.path.join(DOWNLOAD_DIR, "tiktok_device_id.txt")
+
+    with TIKTOK_DEVICE_LOCK:
+        device_id_env = validar_tiktok_device_id(TIKTOK_DEVICE_ID_TEXT)
+        if TIKTOK_DEVICE_ID_TEXT.strip() and not device_id_env:
+            logger.warning(
+                "[TIKTOK_DEVICE_ID_INVALIDO] A variável TIKTOK_DEVICE_ID deve "
+                "conter exatamente 19 dígitos; será usado o identificador persistente."
+            )
+
+        if device_id_env:
+            try:
+                with open(device_path, "w", encoding="utf-8", newline="\n") as f:
+                    f.write(device_id_env + "\n")
+            except OSError as e:
+                logger.warning(f"[TIKTOK_DEVICE_ID_GRAVACAO_FALHA] origem=variavel erro={e}")
+            logger.info("[TIKTOK_DEVICE_ID] origem=variavel_railway valido=True")
+            return device_id_env
+
+        if os.path.exists(device_path):
+            try:
+                with open(device_path, "r", encoding="utf-8") as f:
+                    device_id_arquivo = validar_tiktok_device_id(f.read())
+                if device_id_arquivo:
+                    logger.info("[TIKTOK_DEVICE_ID] origem=arquivo_persistente valido=True")
+                    return device_id_arquivo
+            except OSError as e:
+                logger.warning(f"[TIKTOK_DEVICE_ID_LEITURA_FALHA] erro={e}")
+
+        # O intervalo é o mesmo usado pelo próprio extrator do yt-dlp. Gravar
+        # no volume evita apresentar um aparelho diferente a cada tentativa.
+        inicio = 7250000000000000000
+        fim = 7325099899999994577
+        device_id_novo = str(inicio + (uuid.uuid4().int % (fim - inicio + 1)))
+        try:
+            with open(device_path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(device_id_novo + "\n")
+            logger.info("[TIKTOK_DEVICE_ID] origem=gerado_persistente valido=True")
+        except OSError as e:
+            logger.warning(f"[TIKTOK_DEVICE_ID_GRAVACAO_FALHA] origem=gerado erro={e}")
+        return device_id_novo
+
+
+def montar_tiktok_extractor_args(api_hostname):
+    """Ativa o fallback pela API móvel nativa disponível no yt-dlp."""
+    return {
+        "tiktok": {
+            "device_id": [get_tiktok_device_id()],
+            "api_hostname": [api_hostname],
+            "app_name": ["musical_ly"],
+            "app_version": ["35.1.3"],
+            "manifest_app_version": ["2023501030"],
+            "aid": ["1233"],
+        }
+    }
+
+
 def montar_info_opts(
     is_instagram=False,
     is_pinterest=False,
     usar_cookies=True,
     is_tiktok=False,
+    tiktok_extractor_args=None,
 ):
     opts = {
         "quiet": True,
@@ -808,6 +876,8 @@ def montar_info_opts(
         opts["sleep_interval_requests"] = 1
         if usar_cookies:
             opts["cookiefile"] = get_tiktok_cookiefile()
+        if tiktok_extractor_args:
+            opts["extractor_args"] = tiktok_extractor_args
 
     return opts
 
@@ -818,6 +888,7 @@ def montar_download_opts(
     is_pinterest=False,
     usar_cookies=True,
     is_tiktok=False,
+    tiktok_extractor_args=None,
 ):
     opts = {
         "outtmpl": f"{prefix}.%(ext)s",
@@ -846,6 +917,8 @@ def montar_download_opts(
         opts["sleep_interval_requests"] = 1
         if usar_cookies:
             opts["cookiefile"] = get_tiktok_cookiefile()
+        if tiktok_extractor_args:
+            opts["extractor_args"] = tiktok_extractor_args
 
     return opts
 
@@ -906,14 +979,45 @@ def erro_tiktok_permite_nova_tentativa(erro):
 
 
 def extrair_info_tiktok_com_fallback(url):
-    """Tenta com sessão persistente e depois com uma sessão anônima limpa."""
+    """Tenta página web e, em último caso, a API móvel nativa do yt-dlp."""
     estrategias = [
-        (True, 2, "sessao"),
-        (False, 1, "anonima"),
+        {
+            "usar_cookies": True,
+            "total_tentativas": 2,
+            "nome": "sessao",
+            "extractor_args": None,
+        },
+        {
+            "usar_cookies": False,
+            "total_tentativas": 1,
+            "nome": "anonima",
+            "extractor_args": None,
+        },
+        {
+            "usar_cookies": True,
+            "total_tentativas": 1,
+            "nome": "mobile_api_padrao",
+            "extractor_args": montar_tiktok_extractor_args(
+                "api16-normal-c-useast1a.tiktokv.com"
+            ),
+        },
+        {
+            "usar_cookies": True,
+            "total_tentativas": 1,
+            "nome": "mobile_api_global",
+            "extractor_args": montar_tiktok_extractor_args(
+                "api22-normal-c-alisg.tiktokv.com"
+            ),
+        },
     ]
     ultimo_erro = None
 
-    for usar_cookies, total_tentativas, nome_estrategia in estrategias:
+    for estrategia in estrategias:
+        usar_cookies = estrategia["usar_cookies"]
+        total_tentativas = estrategia["total_tentativas"]
+        nome_estrategia = estrategia["nome"]
+        extractor_args = estrategia["extractor_args"]
+
         for tentativa in range(1, total_tentativas + 1):
             try:
                 logger.info(
@@ -923,10 +1027,11 @@ def extrair_info_tiktok_com_fallback(url):
                 opts = montar_info_opts(
                     is_tiktok=True,
                     usar_cookies=usar_cookies,
+                    tiktok_extractor_args=extractor_args,
                 )
                 with yt_dlp.YoutubeDL(opts) as ydl:
                     info = ydl.extract_info(url, download=False)
-                return info, usar_cookies
+                return info, usar_cookies, extractor_args
             except Exception as e:
                 ultimo_erro = e
                 logger.warning(
@@ -934,7 +1039,11 @@ def extrair_info_tiktok_com_fallback(url):
                     f"tentativa={tentativa}/{total_tentativas} url={url} erro={e}"
                 )
 
-                if not erro_tiktok_permite_nova_tentativa(e):
+                # Falhas da página que não indicam bloqueio devem parar cedo.
+                # Já no fallback móvel, uma API pode rejeitar a combinação
+                # enquanto a seguinte ainda funciona, então deixa o laço
+                # avançar para o próximo endpoint.
+                if extractor_args is None and not erro_tiktok_permite_nova_tentativa(e):
                     raise
 
                 if tentativa < total_tentativas:
@@ -2127,10 +2236,15 @@ def handle_download(message):
         prefix = os.path.join(DOWNLOAD_DIR, f"v_{message.from_user.id}_{uuid.uuid4().hex}")
 
         usar_cookies_plataforma = True
+        tiktok_extractor_args_usados = None
         if is_instagram:
             info, usar_cookies_plataforma = extrair_info_instagram_com_fallback(url)
         elif is_tiktok:
-            info, usar_cookies_plataforma = extrair_info_tiktok_com_fallback(url)
+            (
+                info,
+                usar_cookies_plataforma,
+                tiktok_extractor_args_usados,
+            ) = extrair_info_tiktok_com_fallback(url)
         else:
             with yt_dlp.YoutubeDL(montar_info_opts()) as ydl:
                 info = ydl.extract_info(url, download=False)
@@ -2172,6 +2286,7 @@ def handle_download(message):
                 is_instagram=is_instagram,
                 usar_cookies=usar_cookies,
                 is_tiktok=is_tiktok,
+                tiktok_extractor_args=tiktok_extractor_args_usados,
             )
 
             for fmt in formatos:
