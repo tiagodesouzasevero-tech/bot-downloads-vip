@@ -1504,7 +1504,10 @@ def painel_admin(message):
             ]
         })
 
-        pipeline = [{"$group": {"_id": None, "total": {"$sum": "$downloads_hoje"}}}]
+        pipeline = [
+            {"$match": {"ultima_data": hoje}},
+            {"$group": {"_id": None, "total": {"$sum": "$downloads_hoje"}}}
+        ]
         res_downloads = list(usuarios_col.aggregate(pipeline))
         downloads_totais_hoje = res_downloads[0]["total"] if res_downloads else 0
 
