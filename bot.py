@@ -1794,23 +1794,60 @@ def zerar_contador(message):
         safe_reply_to(message, "❌ Use: `/zerar ID`", parse_mode="Markdown")
 
 
+def enviar_aviso_geral_usuario(user_id, msg_texto):
+    """Envia um aviso e informa o resultado real da chamada ao Telegram."""
+    try:
+        chat_id = int(user_id)
+        bot.send_message(chat_id, msg_texto, parse_mode="Markdown")
+        return "enviado"
+    except Exception as e:
+        erro_texto = str(e)
+        erro_lower = erro_texto.lower()
+
+        if "error code: 403" in erro_lower and "bot was blocked by the user" in erro_lower:
+            logger.info(f"[AVISOGERAL_BLOQUEADO] chat_id={user_id}")
+            return "bloqueado"
+
+        logger.error(f"[AVISOGERAL_FALHA] chat_id={user_id} erro={e}")
+        return "falha"
+
+
 def processar_aviso_geral(admin_chat_id, msg_texto):
     try:
         usuarios = usuarios_col.find({}, {"_id": 1})
-        cont = 0
+        total_processados = 0
+        enviados = 0
+        bloqueados = 0
+        falhas = 0
 
         logger.info("[AVISOGERAL_LOOP] iniciado")
 
         for u in usuarios:
-            try:
-                safe_send_message(int(u["_id"]), msg_texto, parse_mode="Markdown")
-                cont += 1
-                time.sleep(0.05)
-            except Exception:
-                pass
+            total_processados += 1
+            resultado = enviar_aviso_geral_usuario(u.get("_id"), msg_texto)
 
-        safe_send_message(admin_chat_id, f"📢 Aviso enviado para {cont} usuários!")
-        logger.info(f"[AVISOGERAL_LOOP] finalizado enviados={cont}")
+            if resultado == "enviado":
+                enviados += 1
+            elif resultado == "bloqueado":
+                bloqueados += 1
+            else:
+                falhas += 1
+
+            # Mantém o envio abaixo do limite global usual do Telegram.
+            time.sleep(0.05)
+
+        relatorio = (
+            "📢 *Aviso geral concluído!*\n\n"
+            f"✅ Entregues: `{enviados}`\n"
+            f"🚫 Bloquearam o bot: `{bloqueados}`\n"
+            f"❌ Outras falhas: `{falhas}`\n"
+            f"👥 Total processado: `{total_processados}`"
+        )
+        safe_send_message(admin_chat_id, relatorio, parse_mode="Markdown")
+        logger.info(
+            f"[AVISOGERAL_LOOP] finalizado total={total_processados} "
+            f"enviados={enviados} bloqueados={bloqueados} falhas={falhas}"
+        )
     except Exception as e:
         logger.error(f"[AVISOGERAL_LOOP] erro={e}")
         safe_send_message(admin_chat_id, "❌ Erro ao enviar aviso geral.")
