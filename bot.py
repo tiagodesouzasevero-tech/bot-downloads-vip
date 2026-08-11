@@ -3019,7 +3019,9 @@ def painel_admin(message):
         downloads_gratuitos_hoje = int(metricas_hoje.get("downloads_gratuitos", 0) or 0)
         downloads_vips_hoje = int(metricas_hoje.get("downloads_vips", 0) or 0)
 
-        pedidos_pendentes = pedidos_col.count_documents({"status": "pending"})
+        comprovantes_em_analise = pedidos_col.count_documents({
+            "status": "receipt_submitted"
+        })
         pedidos_pagos = pedidos_col.count_documents({"status": "paid"})
 
         resumo_admin = (
@@ -3029,8 +3031,8 @@ def painel_admin(message):
             f"📥 Downloads hoje: `{downloads_totais_hoje}`\n"
             f"   ├ 👤 Gratuitos: `{downloads_gratuitos_hoje}`\n"
             f"   └ 💎 VIPs: `{downloads_vips_hoje}`\n"
-            f"🕒 Pendentes: `{pedidos_pendentes}`\n"
-            f"✅ Pagos: `{pedidos_pagos}`"
+            f"🧾 Comprovantes aguardando análise: `{comprovantes_em_analise}`\n"
+            f"✅ Pagamentos aprovados: `{pedidos_pagos}`"
         )
 
         comandos_admin = (
