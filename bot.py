@@ -179,7 +179,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
-logger = logging.getLogger("afiliadotools")
+logger = logging.getLogger("baixar_videos_hd")
 
 # =========================================
 # DB / BOT / APP
@@ -3060,17 +3060,36 @@ def start(message):
     user = obter_usuario(message.from_user.id)
     vip = is_vip_user(user)
 
-    status = (
-        "💎 *STATUS: VIP PRO*"
-        if vip else f"👤 *STATUS: GRÁTIS* ({user.get('downloads_hoje', 0)}/{FREE_DAILY_LIMIT})"
-    )
+    if vip:
+        vip_ate = user.get("vip_ate")
+        if vip_ate == "Vitalício":
+            validade = "Vitalício"
+        else:
+            try:
+                validade = datetime.strptime(vip_ate, "%Y-%m-%d").strftime("%d/%m/%Y")
+            except (TypeError, ValueError):
+                validade = str(vip_ate or "Ativo")
+
+        status = (
+            "💎 *Acesso VIP ativo*\n\n"
+            "• Downloads: ilimitados\n"
+            f"• Válido até: *{validade}*"
+        )
+    else:
+        status = (
+            "👤 *Plano gratuito*\n\n"
+            f"• Downloads utilizados hoje: "
+            f"{user.get('downloads_hoje', 0)} de {FREE_DAILY_LIMIT}"
+        )
 
     texto = (
-        "🚀 *Afiliado Tools*\n\n"
-        "Baixe vídeos em HD do TikTok, Pinterest, Instagram e RedNote.\n\n"
-        f"• Duração máx: {MAX_DURATION_SECONDS}s\n"
-        f"• Sua ID: `{message.from_user.id}`\n\n"
-        f"{status}"
+        "📥 *Baixar Vídeos HD*\n\n"
+        "Baixe vídeos do TikTok, Pinterest, Instagram e RedNote.\n\n"
+        "• Qualidade: até 720×1280\n"
+        f"• Duração máxima: {MAX_DURATION_SECONDS} segundos\n"
+        f"• ID de usuário: `{message.from_user.id}`\n\n"
+        f"{status}\n\n"
+        "Envie o link de um vídeo para começar."
     )
 
     safe_send_message(
