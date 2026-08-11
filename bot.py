@@ -6,13 +6,16 @@ import time
 import copy
 import html
 import hashlib
-import secrets
+import ipaddress
+import itertools
 import logging
+import socket
 from collections import defaultdict, deque
-from concurrent.futures import ThreadPoolExecutor
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from queue import Full, PriorityQueue
 from threading import Lock, Thread
 from datetime import datetime, timedelta, timezone
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlencode, urljoin, urlparse
 from zoneinfo import ZoneInfo
 
 import requests
@@ -32,7 +35,6 @@ except ImportError:
     CURL_CFFI_VERSION = None
     TIKTOK_IMPERSONATION_DISPONIVEL = False
 
-from flask import Flask, request, jsonify
 from telebot import types
 from pymongo import MongoClient
 from requests.exceptions import RequestException, Timeout
@@ -75,16 +77,11 @@ MONGO_DB_NAME = get_env_required("MONGO_DB_NAME")
 LINK_SUPORTE = get_env_required("LINK_SUPORTE")
 ADMIN_ID = int(get_env_required("ADMIN_ID"))
 
-# InfinitePay
-INFINITEPAY_HANDLE = get_env_required("INFINITEPAY_HANDLE")
-INFINITEPAY_WEBHOOK_SECRET = get_env_required("INFINITEPAY_WEBHOOK_SECRET")
-INFINITEPAY_PAYMENT_CHECK_URL = "https://api.checkout.infinitepay.io/payment_check"
-
-# Novas vendas são exclusivamente por Pix manual. A chave fica no Railway,
-# nunca gravada diretamente no código-fonte.
-PIX_KEY = os.environ.get("PIX_KEY", "").strip()
-PIX_RECEIVER_NAME = os.environ.get("PIX_RECEIVER_NAME", "").strip()
-PIX_RECEIVER_BANK = os.environ.get("PIX_RECEIVER_BANK", "InfinitePay").strip() or "InfinitePay"
+# Vendas exclusivamente por Pix manual. Nenhuma integração de checkout ou
+# cartão é carregada pelo bot. Os dados ficam somente nas variáveis do Railway.
+PIX_KEY = get_env_required("PIX_KEY")
+PIX_RECEIVER_NAME = get_env_required("PIX_RECEIVER_NAME")
+PIX_RECEIVER_BANK = get_env_required("PIX_RECEIVER_BANK")
 
 DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", "downloads_temp")
 TZ = ZoneInfo("America/Sao_Paulo")
@@ -92,14 +89,6 @@ TZ = ZoneInfo("America/Sao_Paulo")
 SERVICE_NAME = get_first_env(
     ["SERVICE_NAME", "RAILWAY_SERVICE_NAME"],
     default="bot-downloads-vip"
-)
-APP_VERSION = get_first_env(
-    ["APP_VERSION", "RAILWAY_GIT_COMMIT_SHA", "GIT_COMMIT", "COMMIT_SHA"],
-    default="unknown"
-)
-DEPLOYMENT_ID = get_first_env(
-    ["RAILWAY_DEPLOYMENT_ID", "DEPLOYMENT_ID", "RAILWAY_REPLICA_ID"],
-    default="unknown"
 )
 ENVIRONMENT_NAME = get_first_env(
     ["RAILWAY_ENVIRONMENT_NAME", "RAILWAY_ENVIRONMENT", "ENVIRONMENT"],
@@ -120,11 +109,7 @@ DOWNLOAD_TIMEOUT_SECONDS = get_env_int("DOWNLOAD_TIMEOUT_SECONDS", 240, 30, 1800
 FFMPEG_THREADS = get_env_int("FFMPEG_THREADS", 2, 1, 8)
 VIDEO_CRF = get_env_int("VIDEO_CRF", 27, 18, 35)
 AUDIO_BITRATE = os.environ.get("AUDIO_BITRATE", "80k").strip() or "80k"
-MEDIA_CACHE_DAYS = get_env_int("MEDIA_CACHE_DAYS", 30, 1, 365)
-WEBHOOK_MAX_BODY_KB = get_env_int("WEBHOOK_MAX_BODY_KB", 64, 8, 1024)
-WEBHOOK_RATE_LIMIT_PER_MINUTE = get_env_int(
-    "WEBHOOK_RATE_LIMIT_PER_MINUTE", 60, 5, 600
-)
+MEDIA_CACHE_DAYS = get_env_int("MEDIA_CACHE_DAYS", 180, 1, 365)
 DOWNLOAD_COOLDOWN_SECONDS = get_env_int(
     "DOWNLOAD_COOLDOWN_SECONDS", 5, 0, 60
 )
@@ -134,10 +119,20 @@ MAX_DOWNLOADS_PER_USER_HOUR = get_env_int(
 MAX_DOWNLOADS_GLOBAL_HOUR = get_env_int(
     "MAX_DOWNLOADS_GLOBAL_HOUR", 300, 20, 10000
 )
-PAYMENT_RETRY_SCAN_SECONDS = get_env_int(
-    "PAYMENT_RETRY_SCAN_SECONDS", 60, 30, 600
+DOWNLOAD_QUEUE_MAX = get_env_int("DOWNLOAD_QUEUE_MAX", 10, 1, 50)
+PIX_ORDER_EXPIRATION_HOURS = get_env_int(
+    "PIX_ORDER_EXPIRATION_HOURS", 24, 1, 168
 )
-PAYMENT_WORKERS = get_env_int("PAYMENT_WORKERS", 2, 1, 4)
+TIKWM_REQUEST_TIMEOUT_SECONDS = get_env_int(
+    "TIKWM_REQUEST_TIMEOUT_SECONDS", 12, 5, 30
+)
+TIKWM_TOTAL_TIMEOUT_SECONDS = get_env_int(
+    "TIKWM_TOTAL_TIMEOUT_SECONDS", 35, 10, 90
+)
+TIKWM_CIRCUIT_FAILURES = get_env_int("TIKWM_CIRCUIT_FAILURES", 3, 1, 10)
+TIKWM_CIRCUIT_COOLDOWN_SECONDS = get_env_int(
+    "TIKWM_CIRCUIT_COOLDOWN_SECONDS", 300, 30, 1800
+)
 MEDIA_PROFILE_VERSION = (
     f"720x1280_30fps_h264_crf{VIDEO_CRF}_audio{AUDIO_BITRATE}_sem_marca_v2"
 )
@@ -150,8 +145,6 @@ TIKWM_API_URL = os.environ.get("TIKWM_API_URL", "https://www.tikwm.com/api/").st
 TIKTOK_COOKIE_LOCK = Lock()
 TIKTOK_COOKIES_ENV_APLICADOS = False
 TIKTOK_DEVICE_LOCK = Lock()
-WEBHOOK_RATE_LOCK = Lock()
-WEBHOOK_RATE_EVENTS = defaultdict(deque)
 AVISO_GERAL_LOCK = Lock()
 BACKUP_ADMIN_LOCK = Lock()
 DOWNLOAD_RATE_LOCK = Lock()
@@ -159,10 +152,15 @@ DOWNLOAD_RATE_EVENTS = defaultdict(deque)
 DOWNLOAD_GLOBAL_EVENTS = deque()
 PAYMENT_USER_LOCKS = [Lock() for _ in range(64)]
 PAYMENT_ORDER_LOCKS = [Lock() for _ in range(64)]
-PAYMENT_EXECUTOR = ThreadPoolExecutor(
-    max_workers=PAYMENT_WORKERS,
-    thread_name_prefix="payment_verification",
-)
+DOWNLOAD_PENDING_LOCK = Lock()
+DOWNLOAD_PENDING_USERS = set()
+DOWNLOAD_QUEUE = PriorityQueue(maxsize=DOWNLOAD_QUEUE_MAX)
+DOWNLOAD_SEQUENCE = itertools.count()
+TIKWM_CIRCUIT_LOCK = Lock()
+TIKWM_CIRCUIT_STATE = {"failures": 0, "open_until": 0.0}
+BOT_STATE_LOCK = Lock()
+BOT_STATE = "starting"
+BOT_LAST_UPDATE_AT = None
 
 ARQUIVOS_PERSISTENTES_DOWNLOAD_DIR = {
     "instagram_cookies.txt",
@@ -204,20 +202,13 @@ try:
     pedidos_col.create_index("order_nsu", unique=True)
     pedidos_col.create_index("status")
     pedidos_col.create_index("user_id")
-    pedidos_col.create_index([
-        ("payment_verification_status", 1),
-        ("next_payment_retry_at", 1),
-    ])
+    pedidos_col.create_index([("user_id", 1), ("status", 1), ("created_at", -1)])
+    pedidos_col.create_index("expires_at", expireAfterSeconds=0)
     midia_cache_col.create_index("expires_at", expireAfterSeconds=0)
 except Exception as e:
     logger.warning(f"[MONGO_INDEX] Não foi possível garantir índices agora: {e}")
 
 bot = telebot.TeleBot(TOKEN_TELEGRAM, threaded=False)
-app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = WEBHOOK_MAX_BODY_KB * 1024
-
-# Evita registrar URLs completas do webhook, que contêm o segredo na query.
-logging.getLogger("werkzeug").setLevel(logging.WARNING)
 
 DEFAULT_HEADERS = {
     "User-Agent": "Mozilla/5.0",
@@ -257,6 +248,136 @@ def hoje_str():
     return agora_tz().strftime("%Y-%m-%d")
 
 
+def formatar_validade_vip(vip_ate):
+    if vip_ate == "Vitalício":
+        return "Vitalício"
+    try:
+        return datetime.strptime(str(vip_ate), "%Y-%m-%d").strftime("%d/%m/%Y")
+    except (TypeError, ValueError):
+        return str(vip_ate or "Ativo")
+
+
+def is_chat_privado(message):
+    return getattr(getattr(message, "chat", None), "type", None) == "private"
+
+
+def is_admin_privado(message):
+    return (
+        is_chat_privado(message)
+        and int(getattr(getattr(message, "from_user", None), "id", 0) or 0) == ADMIN_ID
+        and int(getattr(getattr(message, "chat", None), "id", 0) or 0) == ADMIN_ID
+    )
+
+
+def exigir_admin_privado(message):
+    if is_admin_privado(message):
+        return True
+    if int(getattr(getattr(message, "from_user", None), "id", 0) or 0) == ADMIN_ID:
+        orientar_uso_no_privado(message)
+    return False
+
+
+def orientar_uso_no_privado(message):
+    safe_reply_to(
+        message,
+        "🔒 Para proteger seus dados e seu pagamento, use este bot somente no "
+        "chat privado. Abra o perfil do bot e toque em *Iniciar*.",
+        parse_mode="Markdown",
+    )
+
+
+def referencia_url_log(url):
+    """Identifica uma URL nos logs sem gravar caminho, consulta ou tokens."""
+    texto = str(url or "").strip()
+    try:
+        host = (urlparse(texto).hostname or "desconhecido").lower()
+    except Exception:
+        host = "desconhecido"
+    digest = hashlib.sha256(texto.encode("utf-8", errors="ignore")).hexdigest()[:12]
+    return f"{host}#{digest}"
+
+
+def sanitizar_erro_log(erro, limite=1200):
+    texto = str(erro or "")
+    texto = re.sub(r"https?://[^\s]+", "[url]", texto, flags=re.IGNORECASE)
+    return texto[:limite]
+
+
+def validar_url_http_publica(url, resolver_dns=True):
+    """Rejeita credenciais, portas incomuns e destinos de rede privada."""
+    try:
+        parsed = urlparse(str(url or "").strip())
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            return False
+        if parsed.username or parsed.password:
+            return False
+        porta = parsed.port
+        if porta not in (None, 80, 443):
+            return False
+
+        if not resolver_dns:
+            return True
+
+        host = parsed.hostname.rstrip(".")
+        try:
+            ips = {ipaddress.ip_address(host)}
+        except ValueError:
+            infos = socket.getaddrinfo(
+                host,
+                porta or (443 if parsed.scheme == "https" else 80),
+                type=socket.SOCK_STREAM,
+            )
+            ips = {ipaddress.ip_address(info[4][0]) for info in infos}
+
+        return bool(ips) and all(ip.is_global for ip in ips)
+    except (OSError, ValueError):
+        return False
+
+
+def seguir_redirecionamentos_seguros(url, headers=None, max_redirects=5):
+    """Segue redirecionamentos somente depois de validar cada destino."""
+    atual = str(url or "").strip()
+    resposta = None
+
+    for _ in range(max_redirects + 1):
+        if not validar_url_http_publica(atual):
+            raise RuntimeError("URL_DESTINO_NAO_PUBLICO")
+
+        resposta = requests.get(
+            atual,
+            allow_redirects=False,
+            stream=True,
+            timeout=(5, 12),
+            headers=headers or DEFAULT_HEADERS,
+        )
+
+        if resposta.status_code not in (301, 302, 303, 307, 308):
+            resposta.raise_for_status()
+            return resposta, atual
+
+        destino = urljoin(atual, resposta.headers.get("Location") or "")
+        resposta.close()
+        if not destino or destino == atual:
+            raise RuntimeError("REDIRECIONAMENTO_INVALIDO")
+        atual = destino
+
+    if resposta is not None:
+        resposta.close()
+    raise RuntimeError("MUITOS_REDIRECIONAMENTOS")
+
+
+def atualizar_estado_bot(estado, registrar_atividade=False):
+    global BOT_STATE, BOT_LAST_UPDATE_AT
+    with BOT_STATE_LOCK:
+        BOT_STATE = str(estado)
+        if registrar_atividade:
+            BOT_LAST_UPDATE_AT = agora_tz().isoformat()
+
+
+def registrar_atividade_bot(_mensagens):
+    atualizar_estado_bot("polling", registrar_atividade=True)
+
+
 def extrair_primeira_url(texto):
     if not texto:
         return None
@@ -282,21 +403,77 @@ def detectar_plataforma_url(url):
     except Exception:
         return False, False, False, False
 
-    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+    if (
+        parsed.scheme not in ("http", "https")
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+    ):
+        return False, False, False, False
+
+    try:
+        if parsed.port not in (None, 80, 443):
+            return False, False, False, False
+    except ValueError:
         return False, False, False, False
 
     host = parsed.hostname.lower().rstrip(".")
     is_pinterest = hostname_permitido(host, "pinterest.com") or host == "pin.it"
-    is_tiktok = hostname_permitido(host, "tiktok.com")
-    is_instagram = hostname_permitido(host, "instagram.com") or hostname_permitido(
-        host, "instagr.am"
-    )
-    is_rednote = (
-        hostname_permitido(host, "xiaohongshu.com")
-        or hostname_permitido(host, "xhslink.com")
-        or hostname_permitido(host, "rednote.com")
-    )
+    is_tiktok = host in {
+        "tiktok.com",
+        "www.tiktok.com",
+        "m.tiktok.com",
+        "vm.tiktok.com",
+        "vt.tiktok.com",
+    }
+    is_instagram = host in {
+        "instagram.com",
+        "www.instagram.com",
+        "m.instagram.com",
+        "instagr.am",
+        "www.instagr.am",
+    }
+    is_rednote = host in {
+        "xiaohongshu.com",
+        "www.xiaohongshu.com",
+        "xhslink.com",
+        "www.xhslink.com",
+        "rednote.com",
+        "www.rednote.com",
+    }
     return is_pinterest, is_tiktok, is_instagram, is_rednote
+
+
+def resolver_url_compartilhada(url):
+    """Resolve links curtos sem permitir que escapem da plataforma original."""
+    flags_originais = detectar_plataforma_url(url)
+    if not any(flags_originais):
+        raise RuntimeError("URL_PLATAFORMA_NAO_PERMITIDA")
+
+    host = (urlparse(url).hostname or "").lower().rstrip(".")
+    hosts_curtos = {
+        "pin.it",
+        "vm.tiktok.com",
+        "vt.tiktok.com",
+        "instagr.am",
+        "www.instagr.am",
+        "xhslink.com",
+        "www.xhslink.com",
+    }
+    if host not in hosts_curtos:
+        if not validar_url_http_publica(url):
+            raise RuntimeError("URL_DESTINO_NAO_PUBLICO")
+        return url
+
+    resposta, url_final = seguir_redirecionamentos_seguros(url)
+    resposta.close()
+    flags_finais = detectar_plataforma_url(url_final)
+    if not any(flags_finais) or not any(
+        original and final
+        for original, final in zip(flags_originais, flags_finais)
+    ):
+        raise RuntimeError("REDIRECIONAMENTO_FORA_DA_PLATAFORMA")
+    return url_final
 
 
 def normalizar_url_instagram(url):
@@ -868,10 +1045,30 @@ def normalizar_url_cache(url):
         path = parsed.path or "/"
         if path != "/":
             path = path.rstrip("/")
+        parametros_rastreamento = {
+            "igsh",
+            "share_app_id",
+            "share_iid",
+            "share_link_id",
+            "share_id",
+            "sender_device",
+            "sender_web_id",
+            "is_from_webapp",
+            "tt_from",
+            "timestamp",
+            "_r",
+        }
+        query_limpa = [
+            (chave, valor)
+            for chave, valor in parse_qsl(parsed.query, keep_blank_values=True)
+            if chave.lower() not in parametros_rastreamento
+            and not chave.lower().startswith("utm_")
+        ]
         return parsed._replace(
             scheme=scheme,
             netloc=netloc,
             path=path,
+            query=urlencode(query_limpa, doseq=True),
             fragment="",
         ).geturl()
     except Exception:
@@ -919,18 +1116,27 @@ def salvar_file_id_cache(
             documentos.append((url_cache_key, "url", url_normalizada or source_id))
 
         for chave, tipo_cache, identificador in documentos:
+            identificador_hash = hashlib.sha256(
+                str(identificador or "").encode("utf-8", errors="ignore")
+            ).hexdigest()
             midia_cache_col.update_one(
                 {"_id": chave},
                 {
                     "$set": {
-                        "source_id": source_id,
+                        "source_hash": hashlib.sha256(
+                            str(source_id or "").encode("utf-8", errors="ignore")
+                        ).hexdigest(),
                         "cache_kind": tipo_cache,
-                        "cache_identifier": identificador,
+                        "cache_identifier_hash": identificador_hash,
                         "plataforma": plataforma,
                         "telegram_file_id": telegram_file_id,
                         "media_profile": MEDIA_PROFILE_VERSION,
                         "updated_at": agora,
                         "expires_at": agora + timedelta(days=MEDIA_CACHE_DAYS),
+                    },
+                    "$unset": {
+                        "source_id": "",
+                        "cache_identifier": "",
                     },
                     "$setOnInsert": {"created_at": agora},
                 },
@@ -1274,81 +1480,22 @@ def extrair_tiktok_video_id(url):
     if match:
         return match.group(1)
 
-    resposta = fazer_requisicao_tiktok(url, allow_redirects=True)
-    resposta.raise_for_status()
+    resposta, url_final = seguir_redirecionamentos_seguros(
+        url,
+        headers={"Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8"},
+    )
+    if not detectar_plataforma_url(url_final)[1]:
+        resposta.close()
+        raise RuntimeError("TIKTOK_REDIRECIONAMENTO_FORA_DA_PLATAFORMA")
 
-    for candidato in (str(resposta.url), resposta.text):
+    for candidato in (url_final, resposta.text):
         match = re.search(padrao, candidato or "", flags=re.IGNORECASE)
         if match:
+            resposta.close()
             return match.group(1)
 
+    resposta.close()
     raise RuntimeError("TIKTOK_EMBED_ID_NAO_ENCONTRADO")
-
-
-def extrair_info_tiktok_embed(url):
-    """Extrai o MP4 pelo endpoint público de incorporação do TikTok.
-
-    Este caminho é independente do JSON da página principal que, em mudanças
-    recentes do TikTok, pode não ser reconhecido pelo extrator do yt-dlp.
-    """
-    video_id = extrair_tiktok_video_id(url)
-    embed_url = f"https://www.tiktok.com/embed/v2/{video_id}"
-    resposta = fazer_requisicao_tiktok(embed_url)
-    resposta.raise_for_status()
-
-    match = re.search(
-        r'<script[^>]+id=["\']__FRONTITY_CONNECT_STATE__["\'][^>]*>(.*?)</script>',
-        resposta.text,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-    if not match:
-        raise RuntimeError("TIKTOK_EMBED_DADOS_NAO_ENCONTRADOS")
-
-    estado = json.loads(html.unescape(match.group(1)))
-    dados_source = estado.get("source", {}).get("data", {})
-    bloco = dados_source.get(f"/embed/v2/{video_id}", {})
-    video_data = bloco.get("videoData", {})
-
-    # Protege contra pequenas mudanças no nome da chave da rota.
-    if not video_data:
-        for valor in dados_source.values():
-            if isinstance(valor, dict) and isinstance(valor.get("videoData"), dict):
-                video_data = valor["videoData"]
-                break
-
-    item = video_data.get("itemInfos", {})
-    video = item.get("video", {})
-    video_meta = video.get("videoMeta", {})
-    urls = [u for u in video.get("urls", []) if isinstance(u, str) and u.startswith("http")]
-    if not urls:
-        raise RuntimeError("TIKTOK_EMBED_URL_MP4_NAO_ENCONTRADA")
-
-    logger.info(
-        f"[TIKTOK_EMBED_OK] video_id={video_id} "
-        f"duration={video_meta.get('duration')} "
-        f"resolucao={video_meta.get('width')}x{video_meta.get('height')}"
-    )
-    return {
-        "id": video_id,
-        "title": item.get("text") or f"TikTok {video_id}",
-        "duration": video_meta.get("duration"),
-        "webpage_url": url,
-        "extractor": "TikTokEmbedFallback",
-        "extractor_key": "TikTokEmbedFallback",
-        "formats": [
-            {
-                "format_id": "tiktok_embed_mp4",
-                "url": urls[0],
-                "ext": "mp4",
-                "width": video_meta.get("width"),
-                "height": video_meta.get("height"),
-                "http_headers": {
-                    "Referer": embed_url,
-                    "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
-                },
-            }
-        ],
-    }
 
 
 def normalizar_url_midia_tikwm(url):
@@ -1360,6 +1507,32 @@ def normalizar_url_midia_tikwm(url):
     return url
 
 
+def tikwm_circuito_disponivel():
+    agora = time.monotonic()
+    with TIKWM_CIRCUIT_LOCK:
+        return agora >= float(TIKWM_CIRCUIT_STATE.get("open_until", 0.0) or 0.0)
+
+
+def registrar_resultado_tikwm(sucesso):
+    agora = time.monotonic()
+    with TIKWM_CIRCUIT_LOCK:
+        if sucesso:
+            TIKWM_CIRCUIT_STATE["failures"] = 0
+            TIKWM_CIRCUIT_STATE["open_until"] = 0.0
+            return
+
+        falhas = int(TIKWM_CIRCUIT_STATE.get("failures", 0) or 0) + 1
+        TIKWM_CIRCUIT_STATE["failures"] = falhas
+        if falhas >= TIKWM_CIRCUIT_FAILURES:
+            TIKWM_CIRCUIT_STATE["open_until"] = (
+                agora + TIKWM_CIRCUIT_COOLDOWN_SECONDS
+            )
+            logger.warning(
+                f"[TIKWM_CIRCUIT] pausado_por={TIKWM_CIRCUIT_COOLDOWN_SECONDS}s "
+                f"falhas={falhas}"
+            )
+
+
 def extrair_info_tiktok_hd_sem_marca(url):
     """Obtém a variante HD sem marca e evita deliberadamente o campo wmplay.
 
@@ -1369,6 +1542,8 @@ def extrair_info_tiktok_hd_sem_marca(url):
     """
     if not TIKWM_API_URL:
         raise RuntimeError("TIKWM_API_DESATIVADA")
+    if not tikwm_circuito_disponivel():
+        raise RuntimeError("TIKWM_API_PAUSA_TEMPORARIA")
 
     payload = {"url": url, "hd": "1"}
     headers = {
@@ -1383,32 +1558,50 @@ def extrair_info_tiktok_hd_sem_marca(url):
     api_urls = []
     for api_url in (TIKWM_API_URL, "https://www.tikwm.com/api/"):
         api_url = str(api_url or "").strip()
-        if api_url and api_url not in api_urls:
+        if (
+            api_url
+            and api_url not in api_urls
+            and validar_url_http_publica(api_url)
+        ):
             api_urls.append(api_url)
+
+    if not api_urls:
+        registrar_resultado_tikwm(False)
+        raise RuntimeError("TIKWM_API_URL_NAO_PUBLICA")
 
     metodos = ["requests_post", "requests_get"]
     if curl_requests is not None:
         metodos.append("curl_cffi_post")
 
     ultimo_erro = None
+    inicio = time.monotonic()
+    prazo = inicio + TIKWM_TOTAL_TIMEOUT_SECONDS
     for api_url in api_urls:
         for metodo in metodos:
             try:
+                restante = prazo - time.monotonic()
+                if restante <= 0:
+                    raise RuntimeError("TIKWM_TEMPO_TOTAL_EXCEDIDO")
+                timeout_tentativa = max(
+                    3.0,
+                    min(float(TIKWM_REQUEST_TIMEOUT_SECONDS), restante),
+                )
                 logger.info(
-                    f"[TIKTOK_SEM_MARCA_TENTATIVA] metodo={metodo} api={api_url}"
+                    f"[TIKTOK_SEM_MARCA_TENTATIVA] metodo={metodo} "
+                    f"api_ref={referencia_url_log(api_url)}"
                 )
                 if metodo == "requests_post":
                     resposta = requests.post(
                         api_url,
                         data=payload,
-                        timeout=30,
+                        timeout=timeout_tentativa,
                         headers=headers,
                     )
                 elif metodo == "requests_get":
                     resposta = requests.get(
                         api_url,
                         params=payload,
-                        timeout=30,
+                        timeout=timeout_tentativa,
                         headers=headers,
                     )
                 else:
@@ -1416,7 +1609,7 @@ def extrair_info_tiktok_hd_sem_marca(url):
                         api_url,
                         data=payload,
                         impersonate="chrome",
-                        timeout=30,
+                        timeout=timeout_tentativa,
                         headers=headers,
                     )
 
@@ -1435,6 +1628,8 @@ def extrair_info_tiktok_hd_sem_marca(url):
                 video_url = url_hd or url_sem_marca
                 if not video_url.startswith("http"):
                     raise RuntimeError("TIKWM_URL_SEM_MARCA_NAO_ENCONTRADA")
+                if not validar_url_http_publica(video_url):
+                    raise RuntimeError("TIKWM_URL_MIDIA_NAO_PUBLICA")
 
                 usou_hd = bool(url_hd)
                 video_id = str(dados.get("id") or extrair_tiktok_video_id(url))
@@ -1444,6 +1639,7 @@ def extrair_info_tiktok_hd_sem_marca(url):
                     f"hd={usou_hd} metodo={metodo} duration={dados.get('duration')} "
                     f"tamanho={tamanho}"
                 )
+                registrar_resultado_tikwm(True)
                 return {
                     "id": video_id,
                     "title": dados.get("title") or f"TikTok {video_id}",
@@ -1471,11 +1667,19 @@ def extrair_info_tiktok_hd_sem_marca(url):
                 ultimo_erro = e
                 status = getattr(getattr(e, "response", None), "status_code", None)
                 logger.warning(
-                    f"[TIKTOK_SEM_MARCA_FALHA] metodo={metodo} api={api_url} "
-                    f"status={status} erro={e}"
+                    f"[TIKTOK_SEM_MARCA_FALHA] metodo={metodo} "
+                    f"api_ref={referencia_url_log(api_url)} status={status} "
+                    f"erro={sanitizar_erro_log(e)}"
                 )
+                if time.monotonic() >= prazo:
+                    break
+        if time.monotonic() >= prazo:
+            break
 
-    raise RuntimeError(f"TIKWM_SEM_MARCA_FALHOU: {ultimo_erro}")
+    registrar_resultado_tikwm(False)
+    raise RuntimeError(
+        f"TIKWM_SEM_MARCA_FALHOU: {sanitizar_erro_log(ultimo_erro)}"
+    )
 
 
 def montar_info_opts(
@@ -1596,7 +1800,10 @@ def extrair_info_instagram_com_fallback(url):
     ultimo_erro = None
     for usar_cookies in tentativas:
         try:
-            logger.info(f"[INSTAGRAM_INFO] usar_cookies={usar_cookies} url={url}")
+            logger.info(
+                f"[INSTAGRAM_INFO] usar_cookies={usar_cookies} "
+                f"url_ref={referencia_url_log(url)}"
+            )
             opts = montar_info_opts(is_instagram=True, usar_cookies=usar_cookies)
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=False)
@@ -1604,7 +1811,8 @@ def extrair_info_instagram_com_fallback(url):
         except Exception as e:
             ultimo_erro = e
             logger.warning(
-                f"[INSTAGRAM_INFO_FALHA] usar_cookies={usar_cookies} url={url} erro={e}"
+                f"[INSTAGRAM_INFO_FALHA] usar_cookies={usar_cookies} "
+                f"url_ref={referencia_url_log(url)} erro={sanitizar_erro_log(e)}"
             )
             if not usar_cookies or not erro_instagram_permite_fallback(e):
                 raise
@@ -1638,10 +1846,16 @@ def erro_tiktok_permite_nova_tentativa(erro):
 def extrair_info_tiktok_com_fallback(url):
     """Prioriza HD sem marca e nunca aceita o embed público com marca."""
     try:
-        logger.info(f"[TIKTOK_INFO] estrategia=hd_sem_marca url={url}")
+        logger.info(
+            f"[TIKTOK_INFO] estrategia=hd_sem_marca "
+            f"url_ref={referencia_url_log(url)}"
+        )
         return extrair_info_tiktok_hd_sem_marca(url), False, None
     except Exception as e:
-        logger.warning(f"[TIKTOK_HD_FALHA] url={url} erro={e}")
+        logger.warning(
+            f"[TIKTOK_HD_FALHA] url_ref={referencia_url_log(url)} "
+            f"erro={sanitizar_erro_log(e)}"
+        )
 
     estrategias = []
 
@@ -1692,7 +1906,8 @@ def extrair_info_tiktok_com_fallback(url):
             try:
                 logger.info(
                     f"[TIKTOK_INFO] estrategia={nome_estrategia} "
-                    f"tentativa={tentativa}/{total_tentativas} url={url}"
+                    f"tentativa={tentativa}/{total_tentativas} "
+                    f"url_ref={referencia_url_log(url)}"
                 )
                 opts = montar_info_opts(
                     is_tiktok=True,
@@ -1706,7 +1921,8 @@ def extrair_info_tiktok_com_fallback(url):
                 ultimo_erro = e
                 logger.warning(
                     f"[TIKTOK_INFO_FALHA] estrategia={nome_estrategia} "
-                    f"tentativa={tentativa}/{total_tentativas} url={url} erro={e}"
+                    f"tentativa={tentativa}/{total_tentativas} "
+                    f"url_ref={referencia_url_log(url)} erro={sanitizar_erro_log(e)}"
                 )
 
                 if tentativa < total_tentativas:
@@ -1720,7 +1936,8 @@ def extrair_info_tiktok_com_fallback(url):
     # a cópia 576x1024 com a marca do TikTok. É melhor informar indisponibilidade
     # do que entregar ao usuário um arquivo diferente do prometido.
     logger.error(
-        f"[TIKTOK_SEM_MARCA_INDISPONIVEL] url={url} ultimo_erro={ultimo_erro}"
+        f"[TIKTOK_SEM_MARCA_INDISPONIVEL] url_ref={referencia_url_log(url)} "
+        f"ultimo_erro={sanitizar_erro_log(ultimo_erro)}"
     )
     raise RuntimeError(
         f"TIKTOK_SEM_MARCA_INDISPONIVEL: {ultimo_erro or 'fontes sem marca falharam'}"
@@ -1833,7 +2050,7 @@ def incrementar_download_gratis(user, chat_id, from_user_id):
         safe_send_message(
             chat_id,
             f"⚠️ *Você atingiu seu limite diário ({FREE_DAILY_LIMIT}/{FREE_DAILY_LIMIT})!*\n"
-            "Para continuar baixando de forma ilimitada agora mesmo, libere um plano VIP: 👇",
+            "Para continuar baixando sem limite diário, libere um plano VIP: 👇",
             parse_mode="Markdown"
         )
         mostrar_planos_chat(chat_id, from_user_id)
@@ -1917,81 +2134,6 @@ def obter_plano_por_callback(valor_str):
     return PLANOS.get(valor_str)
 
 
-def webhook_dentro_do_limite(ip):
-    """Limite simples por processo para reduzir abuso do endpoint público."""
-    agora = time.time()
-    janela_inicio = agora - 60
-    chave = str(ip or "desconhecido")[:128]
-
-    with WEBHOOK_RATE_LOCK:
-        eventos = WEBHOOK_RATE_EVENTS[chave]
-        while eventos and eventos[0] < janela_inicio:
-            eventos.popleft()
-        if len(eventos) >= WEBHOOK_RATE_LIMIT_PER_MINUTE:
-            return False
-        eventos.append(agora)
-
-        # Evita crescimento permanente do dicionário em caso de muitos IPs.
-        if len(WEBHOOK_RATE_EVENTS) > 2000:
-            for ip_antigo in list(WEBHOOK_RATE_EVENTS.keys())[:500]:
-                fila = WEBHOOK_RATE_EVENTS[ip_antigo]
-                while fila and fila[0] < janela_inicio:
-                    fila.popleft()
-                if not fila:
-                    WEBHOOK_RATE_EVENTS.pop(ip_antigo, None)
-        return True
-
-
-def confirmar_pagamento_infinitepay(payload, pedido):
-    """Confirma o pagamento diretamente na InfinitePay antes de liberar VIP."""
-    order_nsu = str(payload.get("order_nsu") or "").strip()
-    transaction_nsu = str(payload.get("transaction_nsu") or "").strip()
-    invoice_slug = str(
-        payload.get("invoice_slug") or payload.get("slug") or ""
-    ).strip()
-
-    if not transaction_nsu or not invoice_slug:
-        raise RuntimeError("PAGAMENTO_SEM_TRANSACTION_OU_SLUG")
-
-    resp = requests.post(
-        INFINITEPAY_PAYMENT_CHECK_URL,
-        json={
-            "handle": INFINITEPAY_HANDLE,
-            "order_nsu": order_nsu,
-            "transaction_nsu": transaction_nsu,
-            "slug": invoice_slug,
-        },
-        timeout=(5, 15),
-        headers={"Content-Type": "application/json"},
-    )
-    resp.raise_for_status()
-    dados = resp.json()
-
-    if not dados.get("success") or not dados.get("paid"):
-        raise RuntimeError("PAGAMENTO_NAO_CONFIRMADO_NA_INFINITEPAY")
-
-    try:
-        valor_confirmado = int(dados.get("amount") or 0)
-        valor_esperado = int(pedido.get("valor_centavos") or 0)
-    except (TypeError, ValueError) as e:
-        raise RuntimeError("PAGAMENTO_VALOR_INVALIDO") from e
-
-    if valor_confirmado != valor_esperado:
-        raise RuntimeError(
-            f"PAGAMENTO_VALOR_DIVERGENTE esperado={valor_esperado} "
-            f"confirmado={valor_confirmado}"
-        )
-
-    return {
-        "transaction_nsu": transaction_nsu,
-        "invoice_slug": invoice_slug,
-        "amount": valor_confirmado,
-        "paid_amount": dados.get("paid_amount"),
-        "capture_method": dados.get("capture_method") or payload.get("capture_method"),
-        "receipt_url": payload.get("receipt_url"),
-    }
-
-
 def calcular_nova_data_vip(user, dias):
     if dias is None:
         return "Vitalício"
@@ -2064,268 +2206,20 @@ def liberar_vip_por_plano(user_id, plano, order_nsu=None):
         return novo_vip_ate, True
 
 
-def notificar_pagamento_confirmado(user_id, plano_nome, vip_ate, receipt_url=None):
+def notificar_pagamento_confirmado(user_id, plano_nome, vip_ate):
     try:
+        validade = formatar_validade_vip(vip_ate)
         texto = (
-            "🎉 *PAGAMENTO CONFIRMADO!*\n\n"
+            "✅ *Pagamento confirmado*\n\n"
             f"Plano: *{plano_nome}*\n"
-            f"Status: *VIP LIBERADO*\n"
-            f"Válido até: *{vip_ate}*\n\n"
-            "Seu acesso VIP já está ativo. 🚀"
+            "Status: *Acesso VIP ativo*\n"
+            f"Válido até: *{validade}*\n\n"
+            "Seu acesso já está liberado. Envie um link para começar. 🚀"
         )
 
-        markup = None
-        if receipt_url:
-            markup = types.InlineKeyboardMarkup()
-            markup.add(types.InlineKeyboardButton("🧾 Ver comprovante", url=receipt_url))
-
-        safe_send_message(int(user_id), texto, parse_mode="Markdown", reply_markup=markup)
+        safe_send_message(int(user_id), texto, parse_mode="Markdown")
     except Exception as e:
         logger.error(f"[NOTIFICAR_PAGAMENTO] user_id={user_id} erro={e}")
-
-
-def _escape_md(texto):
-    texto = str(texto)
-    for ch in r"_[]()~`>#+-=|{}.!":
-        texto = texto.replace(ch, "\\" + ch)
-    return texto
-
-
-def notificar_admin_privado(texto):
-    try:
-        safe_send_message(ADMIN_ID, texto, parse_mode="Markdown", disable_web_page_preview=True)
-    except Exception as e:
-        logger.error(f"[NOTIFICAR_ADMIN] erro={e}")
-
-
-def disparar_notificacao_admin(texto):
-    Thread(target=notificar_admin_privado, args=(texto,), daemon=True).start()
-
-
-def montar_texto_admin_webhook(status, order_nsu=None, user_id=None, plano_nome=None, valor_centavos=None, detalhe=None):
-    linhas = [status]
-    if order_nsu:
-        linhas.append(f"Pedido: `{_escape_md(order_nsu)}`")
-    if user_id is not None:
-        linhas.append(f"Usuário: `{_escape_md(user_id)}`")
-    if plano_nome:
-        linhas.append(f"Plano: *{_escape_md(plano_nome)}*")
-    if valor_centavos is not None:
-        try:
-            valor = int(valor_centavos) / 100
-            valor_formatado = f"{valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-            linhas.append(f"Valor: *R$ {valor_formatado}*")
-        except Exception:
-            linhas.append(f"Valor: `{_escape_md(valor_centavos)}`")
-    if detalhe:
-        linhas.append(f"Detalhe: {_escape_md(detalhe)}")
-    return "\n".join(linhas)
-
-
-def sanitizar_payload_webhook(payload):
-    campos = (
-        "order_nsu",
-        "transaction_nsu",
-        "invoice_slug",
-        "slug",
-        "amount",
-        "paid_amount",
-        "installments",
-        "capture_method",
-        "receipt_url",
-    )
-    return {campo: payload.get(campo) for campo in campos if campo in payload}
-
-
-def erro_pagamento_permanente(erro):
-    texto = str(erro or "").lower()
-    sinais = (
-        "pagamento_valor_divergente",
-        "pagamento_valor_invalido",
-        "pagamento_sem_transaction_ou_slug",
-        "transaction_nsu_ja_usado_em_outro_pedido",
-        "plano_invalido",
-    )
-    return any(sinal in texto for sinal in sinais)
-
-
-def processar_pagamento_pendente(order_nsu):
-    """Verifica e libera um pagamento fora da resposta HTTP do webhook."""
-    lock_pedido = obter_lock_distribuido_local(order_nsu, PAYMENT_ORDER_LOCKS)
-    with lock_pedido:
-        pedido = pedidos_col.find_one({"order_nsu": order_nsu})
-        if not pedido or pedido.get("status") == "paid":
-            return
-
-        payload = pedido.get("webhook_payload") or {}
-        plano = PLANOS.get(pedido.get("plano_key")) or {}
-        tentativas = int(pedido.get("payment_verification_attempts", 0) or 0) + 1
-        agora = agora_tz()
-
-        pedidos_col.update_one(
-            {"order_nsu": order_nsu, "status": {"$ne": "paid"}},
-            {
-                "$set": {
-                    "payment_verification_status": "verifying",
-                    "payment_verification_attempts": tentativas,
-                    "payment_verification_last_attempt_at": agora,
-                    # Se o processo for interrompido, o loop recupera após 5 min.
-                    "next_payment_retry_at": agora + timedelta(minutes=5),
-                }
-            },
-        )
-
-        try:
-            if not plano:
-                raise RuntimeError("PLANO_INVALIDO")
-
-            confirmacao = confirmar_pagamento_infinitepay(payload, pedido)
-            valor_recebido = confirmacao["amount"]
-            transaction_nsu = confirmacao["transaction_nsu"]
-            receipt_url = confirmacao["receipt_url"]
-            capture_method = confirmacao["capture_method"]
-
-            outro_pedido = pedidos_col.find_one({
-                "transaction_nsu": transaction_nsu,
-                "order_nsu": {"$ne": order_nsu},
-                "status": "paid",
-            })
-            if outro_pedido:
-                raise RuntimeError("TRANSACTION_NSU_JA_USADO_EM_OUTRO_PEDIDO")
-
-            logger.info(
-                f"[WEBHOOK_PROCESSANDO] order_nsu={order_nsu} "
-                f"user_id={pedido['user_id']} plano={plano['nome']} "
-                f"valor={valor_recebido} tentativa={tentativas}"
-            )
-
-            vip_ate, vip_aplicado = liberar_vip_por_plano(
-                pedido["user_id"],
-                plano,
-                order_nsu=order_nsu,
-            )
-
-            resultado_pedido = pedidos_col.update_one(
-                {"order_nsu": order_nsu, "status": {"$ne": "paid"}},
-                {
-                    "$set": {
-                        "status": "paid",
-                        "paid_at": agora_tz(),
-                        "transaction_nsu": transaction_nsu,
-                        "receipt_url": receipt_url,
-                        "capture_method": capture_method,
-                        "invoice_slug": confirmacao["invoice_slug"],
-                        "paid_amount": confirmacao["paid_amount"],
-                        "payment_check_verified_at": agora_tz(),
-                        "payment_verification_status": "verified",
-                        "vip_liberado_ate": vip_ate,
-                        "vip_aplicado_nesta_chamada": vip_aplicado,
-                    },
-                    "$unset": {
-                        "webhook_payload": "",
-                        "next_payment_retry_at": "",
-                        "payment_verification_error": "",
-                    },
-                },
-            )
-
-            if not resultado_pedido.modified_count:
-                logger.info(f"[WEBHOOK_CORRIDA_DUPLICADA] order_nsu={order_nsu}")
-                return
-
-            logger.info(
-                f"[WEBHOOK_APROVADO] order_nsu={order_nsu} "
-                f"user_id={pedido['user_id']} plano={plano['nome']} "
-                f"vip_ate={vip_ate}"
-            )
-            disparar_notificacao_admin(
-                montar_texto_admin_webhook(
-                    "✅ *Pagamento aprovado e VIP liberado*",
-                    order_nsu=order_nsu,
-                    user_id=pedido.get("user_id"),
-                    plano_nome=plano.get("nome"),
-                    valor_centavos=valor_recebido,
-                    detalhe=f"VIP até: {vip_ate}",
-                )
-            )
-            Thread(
-                target=notificar_pagamento_confirmado,
-                args=(pedido["user_id"], plano["nome"], vip_ate, receipt_url),
-                daemon=True,
-            ).start()
-        except Exception as e:
-            permanente = erro_pagamento_permanente(e)
-            atraso = min(1800, 30 * (2 ** min(tentativas, 6)))
-            status_verificacao = "rejected" if permanente else "retry_pending"
-            atualizacao_erro = {
-                "payment_verification_status": status_verificacao,
-                "payment_verification_error": str(e)[:1000],
-                "payment_verification_failed_at": agora_tz(),
-            }
-            if not permanente:
-                atualizacao_erro["next_payment_retry_at"] = (
-                    agora_tz() + timedelta(seconds=atraso)
-                )
-
-            update = {"$set": atualizacao_erro}
-            if permanente:
-                update["$unset"] = {"next_payment_retry_at": ""}
-            pedidos_col.update_one(
-                {"order_nsu": order_nsu, "status": {"$ne": "paid"}},
-                update,
-            )
-            logger.error(
-                f"[PAYMENT_VERIFY] order_nsu={order_nsu} tentativa={tentativas} "
-                f"permanente={permanente} erro={e}"
-            )
-            if permanente or tentativas in (1, 3, 10):
-                disparar_notificacao_admin(
-                    montar_texto_admin_webhook(
-                        "❌ *Falha ao verificar pagamento*",
-                        order_nsu=order_nsu,
-                        user_id=pedido.get("user_id"),
-                        plano_nome=plano.get("nome"),
-                        detalhe=(
-                            f"tentativa={tentativas} permanente={permanente} erro={e}"
-                        ),
-                    )
-                )
-
-
-def agendar_processamento_pagamento(order_nsu):
-    try:
-        PAYMENT_EXECUTOR.submit(processar_pagamento_pendente, order_nsu)
-        return True
-    except Exception as e:
-        # O pedido já foi persistido como queued; o loop periódico o recupera.
-        logger.error(f"[PAYMENT_QUEUE] order_nsu={order_nsu} erro={e}")
-        return False
-
-
-def reprocessar_pagamentos_pendentes_periodicamente(interval_seconds=60):
-    intervalo = max(30, int(interval_seconds))
-    logger.info(f"[PAYMENT_RETRY_LOOP] iniciado interval_seconds={intervalo}")
-
-    while True:
-        try:
-            agora = agora_tz()
-            cursor = pedidos_col.find(
-                {
-                    "status": {"$ne": "paid"},
-                    "payment_verification_status": {
-                        "$in": ["queued", "retry_pending", "verifying"]
-                    },
-                    "next_payment_retry_at": {"$lte": agora},
-                },
-                {"order_nsu": 1},
-            ).limit(20)
-            for pedido in cursor:
-                order_nsu = pedido.get("order_nsu")
-                if order_nsu:
-                    agendar_processamento_pagamento(order_nsu)
-        except Exception as e:
-            logger.error(f"[PAYMENT_RETRY_LOOP] erro={e}")
-        time.sleep(intervalo)
 
 
 # =========================================
@@ -2389,10 +2283,6 @@ def is_vip_user(user):
         return False
 
 
-def is_vip(user_id):
-    return is_vip_user(obter_usuario(user_id))
-
-
 # =========================================
 # PINTEREST
 # =========================================
@@ -2401,26 +2291,38 @@ def resolver_link_pinterest(url):
         url = url.strip()
 
         if "pin.it/" in url.lower():
-            r = requests.get(
+            r, url_final = seguir_redirecionamentos_seguros(
                 url,
-                allow_redirects=True,
-                timeout=(5, 12),
                 headers={
                     "User-Agent": "Mozilla/5.0",
                     "Referer": "https://www.pinterest.com/",
                     "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8"
-                }
+                },
             )
-            if r.url:
-                logger.info(f"[PINTEREST_REDIRECT] {url} -> {r.url}")
-                return r.url
+            r.close()
+            if not detectar_plataforma_url(url_final)[0]:
+                raise RuntimeError("PINTEREST_REDIRECIONAMENTO_FORA_DA_PLATAFORMA")
+            logger.info(
+                f"[PINTEREST_REDIRECT] origem={referencia_url_log(url)} "
+                f"destino={referencia_url_log(url_final)}"
+            )
+            return url_final
 
     except Timeout as e:
-        logger.warning(f"[PINTEREST_TIMEOUT] url={url} erro={e}")
+        logger.warning(
+            f"[PINTEREST_TIMEOUT] url_ref={referencia_url_log(url)} "
+            f"erro={sanitizar_erro_log(e)}"
+        )
     except RequestException as e:
-        logger.warning(f"[PINTEREST_REQUEST_ERROR] url={url} erro={e}")
+        logger.warning(
+            f"[PINTEREST_REQUEST_ERROR] url_ref={referencia_url_log(url)} "
+            f"erro={sanitizar_erro_log(e)}"
+        )
     except Exception as e:
-        logger.warning(f"[PINTEREST_UNKNOWN_ERROR] url={url} erro={e}")
+        logger.warning(
+            f"[PINTEREST_UNKNOWN_ERROR] url_ref={referencia_url_log(url)} "
+            f"erro={sanitizar_erro_log(e)}"
+        )
 
     return url
 
@@ -2448,12 +2350,18 @@ def baixar_pinterest_capado(url, prefix, info=None):
 
             arquivo = encontrar_arquivo_baixado(prefix)
             if arquivo and os.path.exists(arquivo):
-                logger.info(f"[PINTEREST_OK] formato={fmt} url={url}")
+                logger.info(
+                    f"[PINTEREST_OK] formato={fmt} "
+                    f"url_ref={referencia_url_log(url)}"
+                )
                 return arquivo
 
         except Exception as e:
             ultimo_erro = str(e)
-            logger.warning(f"[PINTEREST_TENTATIVA] formato={fmt} url={url} erro={e}")
+            logger.warning(
+                f"[PINTEREST_TENTATIVA] formato={fmt} "
+                f"url_ref={referencia_url_log(url)} erro={sanitizar_erro_log(e)}"
+            )
 
     raise Exception(ultimo_erro or "Falha ao baixar Pinterest")
 
@@ -2478,9 +2386,11 @@ def configurar_menu_comandos():
     ]
 
     try:
+        # Remove comandos globais antigos para que eles não apareçam em grupos.
+        bot.delete_my_commands(scope=types.BotCommandScopeDefault())
         bot.set_my_commands(
             comandos_usuario,
-            scope=types.BotCommandScopeDefault(),
+            scope=types.BotCommandScopeAllPrivateChats(),
         )
         bot.set_my_commands(
             comandos_admin,
@@ -2506,7 +2416,7 @@ def mostrar_planos_chat(chat_id, user_id):
 
     texto = (
         "🚀 *LIBERAR ACESSO VIP*\n\n"
-        "Escolha o plano ideal para ativar seus downloads ilimitados.\n\n"
+        "Escolha o plano ideal para baixar sem limite diário.\n\n"
         "✅ Sem limite diário\n"
         "✅ Prioridade no processamento\n"
         "✅ Uso liberado para TikTok, Pinterest, Instagram e RedNote\n"
@@ -2619,22 +2529,15 @@ def consultar_docs_backup(tipo):
                     "status": 1,
                     "created_at": 1,
                     "paid_at": 1,
-                    "transaction_nsu": 1,
-                    "receipt_url": 1,
                     "capture_method": 1,
                     "vip_liberado_ate": 1,
                     "vip_aplicado_nesta_chamada": 1,
-                    "checkout_url": 1,
-                    "invoice_slug": 1,
                     "paid_amount": 1,
-                    "payment_check_verified_at": 1,
                     "payment_verification_status": 1,
-                    "payment_verification_attempts": 1,
-                    "payment_verification_last_attempt_at": 1,
-                    "payment_verification_failed_at": 1,
-                    "payment_verification_error": 1,
-                    "webhook_received_at": 1,
-                    "next_payment_retry_at": 1,
+                    "expires_at": 1,
+                    "expired_at": 1,
+                    "cancelled_at": 1,
+                    "delivery_failed_at": 1,
                     "receipt_requested_at": 1,
                     "receipt_submitted_at": 1,
                     "receipt_telegram_file_id": 1,
@@ -2696,22 +2599,15 @@ def consultar_docs_backup(tipo):
                     "status": 1,
                     "created_at": 1,
                     "paid_at": 1,
-                    "transaction_nsu": 1,
-                    "receipt_url": 1,
                     "capture_method": 1,
                     "vip_liberado_ate": 1,
                     "vip_aplicado_nesta_chamada": 1,
-                    "checkout_url": 1,
-                    "invoice_slug": 1,
                     "paid_amount": 1,
-                    "payment_check_verified_at": 1,
                     "payment_verification_status": 1,
-                    "payment_verification_attempts": 1,
-                    "payment_verification_last_attempt_at": 1,
-                    "payment_verification_failed_at": 1,
-                    "payment_verification_error": 1,
-                    "webhook_received_at": 1,
-                    "next_payment_retry_at": 1,
+                    "expires_at": 1,
+                    "expired_at": 1,
+                    "cancelled_at": 1,
+                    "delivery_failed_at": 1,
                     "receipt_requested_at": 1,
                     "receipt_submitted_at": 1,
                     "receipt_telegram_file_id": 1,
@@ -2800,7 +2696,7 @@ def processar_backup_admin(tipo, origem_chat_id=None):
 # =========================================
 @bot.message_handler(commands=["darvip"])
 def dar_vip_manual(message):
-    if message.from_user.id != ADMIN_ID:
+    if not exigir_admin_privado(message):
         return
 
     try:
@@ -2808,12 +2704,16 @@ def dar_vip_manual(message):
         if len(args) < 3:
             return safe_reply_to(message, "❌ Use: `/darvip ID DIAS`", parse_mode="Markdown")
 
-        alvo_id = args[1]
+        alvo_id = str(args[1]).strip()
+        if not re.fullmatch(r"[1-9]\d{0,19}", alvo_id):
+            raise ValueError("ID inválida")
         dias = int(args[2])
+        if dias < 1 or dias > 3650:
+            raise ValueError("dias fora do intervalo")
 
         nova_data = (
-            "Vitalício" if dias >= 3650
-            else (agora_tz() + timedelta(days=dias)).strftime("%Y-%m-%d")
+            "Vitalício" if dias == 3650
+            else calcular_nova_data_vip(obter_usuario(alvo_id), dias)
         )
 
         usuarios_col.update_one(
@@ -2830,20 +2730,30 @@ def dar_vip_manual(message):
             upsert=True
         )
 
-        safe_reply_to(message, f"✅ VIP liberado para {alvo_id}!")
+        validade = formatar_validade_vip(nova_data)
+        safe_reply_to(
+            message,
+            f"✅ VIP liberado para `{alvo_id}` até *{validade}*.",
+            parse_mode="Markdown",
+        )
         safe_send_message(
             int(alvo_id),
-            "🎉 *PAGAMENTO CONFIRMADO!*\nSeu acesso VIP foi liberado.",
+            "💎 *Acesso VIP liberado*\n\n"
+            f"Seu acesso está ativo até *{validade}*.",
             parse_mode="Markdown"
         )
     except Exception as e:
-        logger.error(f"[DARVIP] erro={e}")
-        safe_reply_to(message, "❌ Use: `/darvip ID DIAS`", parse_mode="Markdown")
+        logger.error(f"[DARVIP] erro={sanitizar_erro_log(e)}")
+        safe_reply_to(
+            message,
+            "❌ Use: `/darvip ID DIAS` (de 1 a 3650).",
+            parse_mode="Markdown",
+        )
 
 
 @bot.message_handler(commands=["zerar"])
 def zerar_contador(message):
-    if message.from_user.id != ADMIN_ID:
+    if not exigir_admin_privado(message):
         return
 
     try:
@@ -2851,7 +2761,9 @@ def zerar_contador(message):
         if len(args) < 2:
             return safe_reply_to(message, "❌ Use: `/zerar ID`", parse_mode="Markdown")
 
-        alvo_id = args[1]
+        alvo_id = str(args[1]).strip()
+        if not re.fullmatch(r"[1-9]\d{0,19}", alvo_id):
+            raise ValueError("ID inválida")
 
         usuarios_col.update_one(
             {"_id": str(alvo_id)},
@@ -2947,7 +2859,7 @@ def processar_aviso_geral(admin_chat_id, msg_texto):
 
 @bot.message_handler(commands=["avisogeral"])
 def aviso_geral(message):
-    if message.from_user.id != ADMIN_ID:
+    if not exigir_admin_privado(message):
         return
 
     try:
@@ -2969,7 +2881,7 @@ def aviso_geral(message):
 
 @bot.message_handler(commands=["backupusuarios"])
 def backup_usuarios(message):
-    if message.from_user.id != ADMIN_ID:
+    if not exigir_admin_privado(message):
         return
 
     Thread(
@@ -2983,7 +2895,7 @@ def backup_usuarios(message):
 
 @bot.message_handler(commands=["backupvips"])
 def backup_vips(message):
-    if message.from_user.id != ADMIN_ID:
+    if not exigir_admin_privado(message):
         return
 
     Thread(
@@ -2997,7 +2909,7 @@ def backup_vips(message):
 
 @bot.message_handler(commands=["backuppedidos"])
 def backup_pedidos(message):
-    if message.from_user.id != ADMIN_ID:
+    if not exigir_admin_privado(message):
         return
 
     Thread(
@@ -3011,7 +2923,7 @@ def backup_pedidos(message):
 
 @bot.message_handler(commands=["backupgeral"])
 def backup_geral(message):
-    if message.from_user.id != ADMIN_ID:
+    if not exigir_admin_privado(message):
         return
 
     Thread(
@@ -3026,7 +2938,7 @@ def backup_geral(message):
 @bot.message_handler(commands=["painel"])
 @bot.message_handler(func=lambda m: m.text == "⚙️ Painel Admin")
 def painel_admin(message):
-    if message.from_user.id != ADMIN_ID:
+    if not exigir_admin_privado(message):
         return
 
     try:
@@ -3073,22 +2985,20 @@ def painel_admin(message):
 # =========================================
 @bot.message_handler(commands=["start", "perfil"])
 def start(message):
+    if not is_chat_privado(message):
+        orientar_uso_no_privado(message)
+        return
+
     user = obter_usuario(message.from_user.id)
     vip = is_vip_user(user)
 
     if vip:
-        vip_ate = user.get("vip_ate")
-        if vip_ate == "Vitalício":
-            validade = "Vitalício"
-        else:
-            try:
-                validade = datetime.strptime(vip_ate, "%Y-%m-%d").strftime("%d/%m/%Y")
-            except (TypeError, ValueError):
-                validade = str(vip_ate or "Ativo")
+        validade = formatar_validade_vip(user.get("vip_ate"))
 
         status = (
             "💎 *Acesso VIP ativo*\n\n"
-            "• Downloads: ilimitados\n"
+            "• Sem limite diário\n"
+            "• Prioridade na fila: ativa\n"
             f"• Válido até: *{validade}*"
         )
     else:
@@ -3119,17 +3029,26 @@ def start(message):
 
 @bot.message_handler(commands=["vip", "planos"])
 def cmd_planos(message):
+    if not is_chat_privado(message):
+        orientar_uso_no_privado(message)
+        return
     mostrar_planos_chat(message.chat.id, message.from_user.id)
 
 
 @bot.message_handler(func=lambda m: m.text in ["🚀 Liberar VIP", "💎 VIP"])
 def mostrar_planos(message):
+    if not is_chat_privado(message):
+        orientar_uso_no_privado(message)
+        return
     mostrar_planos_chat(message.chat.id, message.from_user.id)
 
 
 @bot.message_handler(commands=["suporte"])
 @bot.message_handler(func=lambda m: m.text == "📞 Suporte")
 def suporte(message):
+    if not is_chat_privado(message):
+        orientar_uso_no_privado(message)
+        return
     try:
         markup = types.InlineKeyboardMarkup()
         markup.add(types.InlineKeyboardButton("Chamar no Suporte", url=LINK_SUPORTE))
@@ -3144,9 +3063,72 @@ def suporte(message):
         safe_send_message(message.chat.id, f"Suporte: {LINK_SUPORTE}")
 
 
+def normalizar_datetime_tz(valor):
+    if not isinstance(valor, datetime):
+        return None
+    if valor.tzinfo is None:
+        valor = valor.replace(tzinfo=timezone.utc)
+    return valor.astimezone(TZ)
+
+
+def pedido_pix_expirado(pedido):
+    expira_em = normalizar_datetime_tz(pedido.get("expires_at"))
+    if expira_em is None:
+        criado_em = normalizar_datetime_tz(pedido.get("created_at"))
+        if criado_em is None:
+            return True
+        expira_em = criado_em + timedelta(hours=PIX_ORDER_EXPIRATION_HOURS)
+    return expira_em <= agora_tz()
+
+
+def buscar_pedido_pix_ativo(user_id):
+    return pedidos_col.find_one(
+        {
+            "user_id": str(user_id),
+            "status": {"$in": ["awaiting_pix", "receipt_submitted"]},
+        },
+        sort=[("created_at", -1)],
+    )
+
+
+def enviar_instrucoes_pix(chat_id, pedido, plano):
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton(
+        "✅ Já fiz o Pix — enviar comprovante",
+        callback_data=f"pix_paid_{pedido['order_nsu']}",
+    ))
+
+    valor_reais = int(plano["preco_centavos"]) / 100
+    valor_formatado = (
+        f"{valor_reais:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    )
+    texto = (
+        f"💎 <b>{html.escape(plano['nome'])}</b>\n\n"
+        "Pagamento exclusivamente via <b>Pix</b>.\n\n"
+        f"💰 Valor exato: <b>R$ {valor_formatado}</b>\n"
+        f"🔑 Chave Pix: <code>{html.escape(PIX_KEY)}</code>\n"
+        f"👤 Recebedor: <b>{html.escape(PIX_RECEIVER_NAME)}</b>\n"
+        f"🏦 Instituição: <b>{html.escape(PIX_RECEIVER_BANK)}</b>\n"
+        f"🧾 Pedido: <code>{html.escape(pedido['order_nsu'])}</code>\n\n"
+        f"Este pedido fica disponível por {PIX_ORDER_EXPIRATION_HOURS} horas. "
+        "Depois de pagar, toque no botão abaixo e envie o comprovante. "
+        "O VIP será liberado após a entrada do Pix ser conferida."
+    )
+    return safe_send_message(
+        chat_id,
+        texto,
+        parse_mode="HTML",
+        reply_markup=markup,
+    )
+
+
 @bot.callback_query_handler(func=lambda call: call.data.startswith("pay_"))
 def iniciar_pagamento_pix_manual(call):
     try:
+        if not is_chat_privado(call.message):
+            orientar_uso_no_privado(call.message)
+            return
+
         valor = call.data.split("_", 1)[1]
         plano = obter_plano_por_callback(valor)
 
@@ -3154,22 +3136,43 @@ def iniciar_pagamento_pix_manual(call):
             safe_send_message(call.message.chat.id, "❌ Plano inválido.")
             return
 
-        if not PIX_KEY:
-            logger.error("[PIX_MANUAL] variável PIX_KEY não configurada")
+        pedido_ativo = buscar_pedido_pix_ativo(call.from_user.id)
+        if pedido_ativo and pedido_ativo.get("status") == "receipt_submitted":
             safe_send_message(
                 call.message.chat.id,
-                "❌ O pagamento via Pix está temporariamente indisponível. "
-                "Fale com o suporte.",
-            )
-            safe_send_message(
-                ADMIN_ID,
-                "⚠️ Configure a variável `PIX_KEY` no Railway para receber pagamentos Pix.",
-                parse_mode="Markdown",
+                "🧾 Seu comprovante já foi recebido e está aguardando conferência. "
+                "Você será avisado aqui.",
             )
             return
 
-        order_nsu = gerar_order_nsu(call.from_user.id)
+        if pedido_ativo and pedido_pix_expirado(pedido_ativo):
+            pedidos_col.update_one(
+                {"order_nsu": pedido_ativo["order_nsu"], "status": "awaiting_pix"},
+                {"$set": {"status": "expired", "expired_at": agora_tz()}},
+            )
+            pedido_ativo = None
 
+        if pedido_ativo and pedido_ativo.get("plano_key") == valor:
+            if not enviar_instrucoes_pix(call.message.chat.id, pedido_ativo, plano):
+                raise RuntimeError("falha ao reenviar instruções Pix")
+            return
+
+        if pedido_ativo:
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton(
+                "Cancelar pedido anterior",
+                callback_data=f"pix_cancel_{pedido_ativo['order_nsu']}",
+            ))
+            safe_send_message(
+                call.message.chat.id,
+                "⚠️ Você já possui um pedido Pix em aberto. Cancele o pedido "
+                "anterior antes de escolher outro plano.",
+                reply_markup=markup,
+            )
+            return
+
+        agora = agora_tz()
+        order_nsu = gerar_order_nsu(call.from_user.id)
         pedido = {
             "order_nsu": order_nsu,
             "user_id": str(call.from_user.id),
@@ -3177,47 +3180,17 @@ def iniciar_pagamento_pix_manual(call):
             "plano_nome": plano["nome"],
             "valor_centavos": int(plano["preco_centavos"]),
             "status": "awaiting_pix",
-            "created_at": agora_tz(),
-            "checkout_url": None,
-            "transaction_nsu": None,
-            "receipt_url": None,
-            "capture_method": "pix_manual",
+            "created_at": agora,
+            "expires_at": agora + timedelta(hours=PIX_ORDER_EXPIRATION_HOURS),
             "payment_verification_status": "awaiting_manual_receipt",
         }
-
         pedidos_col.insert_one(pedido)
-
-        markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton(
-            "✅ Já fiz o Pix — enviar comprovante",
-            callback_data=f"pix_paid_{order_nsu}",
-        ))
-
-        valor_reais = int(plano["preco_centavos"]) / 100
-        valor_formatado = f"{valor_reais:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-        nome_recebedor = html.escape(PIX_RECEIVER_NAME or "Titular da conta")
-        banco_recebedor = html.escape(PIX_RECEIVER_BANK)
-        chave_pix = html.escape(PIX_KEY)
-        pedido_html = html.escape(order_nsu)
-
-        texto = (
-            f"💎 <b>{html.escape(plano['nome'])}</b>\n\n"
-            "Pagamento exclusivamente via <b>Pix</b>.\n\n"
-            f"💰 Valor exato: <b>R$ {valor_formatado}</b>\n"
-            f"🔑 Chave Pix: <code>{chave_pix}</code>\n"
-            f"👤 Recebedor: <b>{nome_recebedor}</b>\n"
-            f"🏦 Instituição: <b>{banco_recebedor}</b>\n"
-            f"🧾 Pedido: <code>{pedido_html}</code>\n\n"
-            "Depois de pagar, toque no botão abaixo e envie o comprovante. "
-            "O VIP será liberado após a entrada do Pix ser conferida."
-        )
-
-        safe_send_message(
-            call.message.chat.id,
-            texto,
-            parse_mode="HTML",
-            reply_markup=markup
-        )
+        if not enviar_instrucoes_pix(call.message.chat.id, pedido, plano):
+            pedidos_col.update_one(
+                {"order_nsu": order_nsu, "status": "awaiting_pix"},
+                {"$set": {"status": "delivery_failed", "delivery_failed_at": agora_tz()}},
+            )
+            raise RuntimeError("falha ao entregar instruções Pix")
 
     except Exception as e:
         logger.error(f"[PIX_MANUAL_INICIO] erro={e}")
@@ -3230,9 +3203,45 @@ def iniciar_pagamento_pix_manual(call):
         safe_answer_callback(call.id)
 
 
+@bot.callback_query_handler(func=lambda call: call.data.startswith("pix_cancel_"))
+def cancelar_pedido_pix(call):
+    try:
+        if not is_chat_privado(call.message):
+            orientar_uso_no_privado(call.message)
+            return
+        order_nsu = call.data[len("pix_cancel_"):].strip()
+        resultado = pedidos_col.update_one(
+            {
+                "order_nsu": order_nsu,
+                "user_id": str(call.from_user.id),
+                "status": "awaiting_pix",
+            },
+            {"$set": {"status": "cancelled", "cancelled_at": agora_tz()}},
+        )
+        if not resultado.modified_count:
+            safe_answer_callback(call.id, text="Pedido não disponível.", show_alert=True)
+            return
+        usuarios_col.update_one(
+            {"_id": str(call.from_user.id), "pix_order_aguardando_comprovante": order_nsu},
+            {"$unset": {"pix_order_aguardando_comprovante": ""}},
+        )
+        safe_edit_message(
+            call.message.chat.id,
+            call.message.message_id,
+            "✅ Pedido anterior cancelado. Agora você pode escolher outro plano.",
+        )
+        safe_answer_callback(call.id, text="Pedido cancelado.")
+    except Exception as e:
+        logger.error(f"[PIX_CANCELAR] erro={sanitizar_erro_log(e)}")
+        safe_answer_callback(call.id, text="Não foi possível cancelar agora.", show_alert=True)
+
+
 @bot.callback_query_handler(func=lambda call: call.data.startswith("pix_paid_"))
 def solicitar_comprovante_pix(call):
     try:
+        if not is_chat_privado(call.message):
+            orientar_uso_no_privado(call.message)
+            return
         order_nsu = call.data[len("pix_paid_"):].strip()
         pedido = pedidos_col.find_one({"order_nsu": order_nsu})
 
@@ -3244,22 +3253,50 @@ def solicitar_comprovante_pix(call):
             safe_answer_callback(call.id, text="Este pedido já foi aprovado.", show_alert=True)
             return
 
-        if pedido.get("status") not in ("awaiting_pix", "receipt_submitted"):
+        if pedido.get("status") == "receipt_submitted":
+            safe_answer_callback(
+                call.id,
+                text="Seu comprovante já está aguardando conferência.",
+                show_alert=True,
+            )
+            return
+
+        if pedido.get("status") != "awaiting_pix":
             safe_answer_callback(call.id, text="Este pedido não está disponível.", show_alert=True)
             return
 
-        obter_usuario(call.from_user.id)
+        if pedido_pix_expirado(pedido):
+            pedidos_col.update_one(
+                {"order_nsu": order_nsu, "status": "awaiting_pix"},
+                {"$set": {"status": "expired", "expired_at": agora_tz()}},
+            )
+            safe_answer_callback(
+                call.id,
+                text="Este pedido expirou. Escolha o plano novamente.",
+                show_alert=True,
+            )
+            return
+
         agora = agora_tz()
-        usuarios_col.update_one(
-            {"_id": str(call.from_user.id)},
-            {"$set": {"pix_order_aguardando_comprovante": order_nsu}},
-        )
-        pedidos_col.update_one(
-            {"order_nsu": order_nsu, "status": {"$ne": "paid"}},
+        resultado = pedidos_col.update_one(
+            {"order_nsu": order_nsu, "status": "awaiting_pix"},
             {"$set": {
                 "receipt_requested_at": agora,
                 "payment_verification_status": "waiting_receipt_upload",
+                "expires_at": agora + timedelta(hours=PIX_ORDER_EXPIRATION_HOURS),
             }},
+        )
+        if not resultado.modified_count:
+            safe_answer_callback(
+                call.id,
+                text="O pedido mudou de estado. Abra os planos novamente.",
+                show_alert=True,
+            )
+            return
+        obter_usuario(call.from_user.id)
+        usuarios_col.update_one(
+            {"_id": str(call.from_user.id)},
+            {"$set": {"pix_order_aguardando_comprovante": order_nsu}},
         )
         safe_send_message(
             call.message.chat.id,
@@ -3276,6 +3313,10 @@ def solicitar_comprovante_pix(call):
 @bot.message_handler(content_types=["photo", "document"])
 def receber_comprovante_pix(message):
     try:
+        if not is_chat_privado(message):
+            orientar_uso_no_privado(message)
+            return
+
         user = obter_usuario(message.from_user.id)
         order_nsu = str(user.get("pix_order_aguardando_comprovante") or "").strip()
         if not order_nsu:
@@ -3285,7 +3326,8 @@ def receber_comprovante_pix(message):
         if (
             not pedido
             or str(pedido.get("user_id")) != str(message.from_user.id)
-            or pedido.get("status") == "paid"
+            or pedido.get("status") != "awaiting_pix"
+            or pedido_pix_expirado(pedido)
         ):
             usuarios_col.update_one(
                 {"_id": str(message.from_user.id)},
@@ -3311,37 +3353,34 @@ def receber_comprovante_pix(message):
             safe_send_message(message.chat.id, "❌ Não consegui ler esse comprovante.")
             return
 
-        agora = agora_tz()
-        pedidos_col.update_one(
-            {"order_nsu": order_nsu, "status": {"$ne": "paid"}},
-            {"$set": {
-                "status": "receipt_submitted",
-                "payment_verification_status": "manual_review_pending",
-                "receipt_submitted_at": agora,
-                "receipt_telegram_file_id": file_id,
-                "receipt_telegram_type": tipo,
-                "receipt_source_chat_id": message.chat.id,
-                "receipt_source_message_id": message.message_id,
-            }},
-        )
-        usuarios_col.update_one(
-            {"_id": str(message.from_user.id)},
-            {"$unset": {"pix_order_aguardando_comprovante": ""}},
-        )
-
+        comprovante_entregue = False
         try:
             bot.forward_message(ADMIN_ID, message.chat.id, message.message_id)
+            comprovante_entregue = True
         except Exception as e:
-            logger.warning(f"[PIX_FORWARD_RECEIPT] order_nsu={order_nsu} erro={e}")
+            logger.warning(
+                f"[PIX_FORWARD_RECEIPT] order_nsu={order_nsu} "
+                f"erro={sanitizar_erro_log(e)}"
+            )
             try:
                 if tipo == "photo":
                     bot.send_photo(ADMIN_ID, file_id, caption=f"Comprovante do pedido {order_nsu}")
                 else:
                     bot.send_document(ADMIN_ID, file_id, caption=f"Comprovante do pedido {order_nsu}")
+                comprovante_entregue = True
             except Exception as envio_erro:
                 logger.error(
-                    f"[PIX_SEND_RECEIPT] order_nsu={order_nsu} erro={envio_erro}"
+                    f"[PIX_SEND_RECEIPT] order_nsu={order_nsu} "
+                    f"erro={sanitizar_erro_log(envio_erro)}"
                 )
+
+        if not comprovante_entregue:
+            safe_send_message(
+                message.chat.id,
+                "❌ Não consegui entregar o comprovante ao responsável. "
+                "Tente enviá-lo novamente em instantes.",
+            )
+            return
 
         plano = PLANOS.get(pedido.get("plano_key")) or {}
         markup = types.InlineKeyboardMarkup(row_width=1)
@@ -3363,28 +3402,69 @@ def receber_comprovante_pix(message):
             f"Plano: <b>{html.escape(plano.get('nome') or pedido.get('plano_nome') or 'Desconhecido')}</b>\n"
             f"Valor esperado: <b>R$ {int(pedido.get('valor_centavos') or 0) / 100:.2f}</b>\n\n"
             "⚠️ O comprovante sozinho não confirma o pagamento. Antes de aprovar, "
-            "confira se o Pix entrou na sua conta InfinitePay.",
+            f"confira se o Pix entrou na conta da instituição "
+            f"<b>{html.escape(PIX_RECEIVER_BANK)}</b>.",
             parse_mode="HTML",
             reply_markup=markup,
         )
-        if controle:
-            pedidos_col.update_one(
-                {"order_nsu": order_nsu},
-                {"$set": {"admin_review_message_id": controle.message_id}},
+
+        if not controle:
+            safe_send_message(
+                message.chat.id,
+                "❌ Não consegui abrir a análise do comprovante. "
+                "Tente enviá-lo novamente em instantes.",
             )
+            return
+
+        agora = agora_tz()
+        resultado = pedidos_col.update_one(
+            {"order_nsu": order_nsu, "status": "awaiting_pix"},
+            {
+                "$set": {
+                    "status": "receipt_submitted",
+                    "payment_verification_status": "manual_review_pending",
+                    "receipt_submitted_at": agora,
+                    "receipt_telegram_file_id": file_id,
+                    "receipt_telegram_type": tipo,
+                    "receipt_source_chat_id": message.chat.id,
+                    "receipt_source_message_id": message.message_id,
+                    "admin_review_message_id": controle.message_id,
+                },
+                "$unset": {"expires_at": ""},
+            },
+        )
+        if not resultado.modified_count:
+            safe_delete_message(ADMIN_ID, controle.message_id)
+            safe_send_message(
+                message.chat.id,
+                "❌ O estado desse pedido mudou. Abra os planos e tente novamente.",
+            )
+            return
+
+        usuarios_col.update_one(
+            {"_id": str(message.from_user.id), "pix_order_aguardando_comprovante": order_nsu},
+            {"$unset": {"pix_order_aguardando_comprovante": ""}},
+        )
 
         safe_send_message(
             message.chat.id,
             "✅ Comprovante recebido! O pagamento será conferido e você será avisado aqui.",
         )
     except Exception as e:
-        logger.error(f"[PIX_RECEBER_COMPROVANTE] user_id={message.from_user.id} erro={e}")
+        logger.error(
+            f"[PIX_RECEBER_COMPROVANTE] user_id={message.from_user.id} "
+            f"erro={sanitizar_erro_log(e)}"
+        )
         safe_send_message(message.chat.id, "❌ Não consegui registrar o comprovante. Tente novamente.")
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith(("pix_ok_", "pix_no_")))
 def revisar_comprovante_pix(call):
-    if call.from_user.id != ADMIN_ID:
+    if (
+        call.from_user.id != ADMIN_ID
+        or not is_chat_privado(call.message)
+        or call.message.chat.id != ADMIN_ID
+    ):
         safe_answer_callback(call.id, text="Acesso restrito ao administrador.", show_alert=True)
         return
 
@@ -3402,6 +3482,13 @@ def revisar_comprovante_pix(call):
             if pedido.get("status") == "paid":
                 safe_answer_callback(call.id, text="Pedido já aprovado.", show_alert=True)
                 return
+            if pedido.get("status") != "receipt_submitted":
+                safe_answer_callback(
+                    call.id,
+                    text="Este pedido não está aguardando análise.",
+                    show_alert=True,
+                )
+                return
 
             plano = PLANOS.get(pedido.get("plano_key")) or {}
             if not plano:
@@ -3415,29 +3502,39 @@ def revisar_comprovante_pix(call):
                     order_nsu=order_nsu,
                 )
                 agora = agora_tz()
-                pedidos_col.update_one(
-                    {"order_nsu": order_nsu, "status": {"$ne": "paid"}},
-                    {"$set": {
-                        "status": "paid",
-                        "paid_at": agora,
-                        "paid_amount": int(pedido.get("valor_centavos") or 0),
-                        "capture_method": "pix_manual",
-                        "payment_verification_status": "manual_verified",
-                        "payment_check_verified_at": agora,
-                        "manual_verified_by": str(ADMIN_ID),
-                        "manual_verified_at": agora,
-                        "vip_liberado_ate": vip_ate,
-                        "vip_aplicado_nesta_chamada": vip_aplicado,
-                    }},
+                resultado = pedidos_col.update_one(
+                    {"order_nsu": order_nsu, "status": "receipt_submitted"},
+                    {
+                        "$set": {
+                            "status": "paid",
+                            "paid_at": agora,
+                            "paid_amount": int(pedido.get("valor_centavos") or 0),
+                            "capture_method": "pix_manual",
+                            "payment_verification_status": "manual_verified",
+                            "manual_verified_by": str(ADMIN_ID),
+                            "manual_verified_at": agora,
+                            "vip_liberado_ate": vip_ate,
+                            "vip_aplicado_nesta_chamada": vip_aplicado,
+                        },
+                        "$unset": {"expires_at": ""},
+                    },
                 )
+                if not resultado.modified_count:
+                    safe_answer_callback(
+                        call.id,
+                        text="O pedido mudou de estado. Atualize o painel.",
+                        show_alert=True,
+                    )
+                    return
                 notificar_pagamento_confirmado(
-                    pedido["user_id"], plano["nome"], vip_ate, receipt_url=None
+                    pedido["user_id"], plano["nome"], vip_ate
                 )
                 safe_edit_message(
                     call.message.chat.id,
                     call.message.message_id,
                     "✅ Pagamento Pix conferido e VIP liberado.\n"
-                    f"Pedido: `{order_nsu}`\nVIP até: *{vip_ate}*",
+                    f"Pedido: `{order_nsu}`\n"
+                    f"VIP até: *{formatar_validade_vip(vip_ate)}*",
                     parse_mode="Markdown",
                 )
                 safe_answer_callback(call.id, text="VIP liberado com sucesso.")
@@ -3448,13 +3545,14 @@ def revisar_comprovante_pix(call):
             else:
                 agora = agora_tz()
                 pedidos_col.update_one(
-                    {"order_nsu": order_nsu, "status": {"$ne": "paid"}},
+                    {"order_nsu": order_nsu, "status": "receipt_submitted"},
                     {
                         "$set": {
                             "status": "awaiting_pix",
                             "payment_verification_status": "manual_receipt_rejected",
                             "receipt_rejected_at": agora,
                             "receipt_rejected_by": str(ADMIN_ID),
+                            "expires_at": agora + timedelta(hours=PIX_ORDER_EXPIRATION_HOURS),
                         },
                         "$unset": {
                             "receipt_telegram_file_id": "",
@@ -3478,7 +3576,10 @@ def revisar_comprovante_pix(call):
                 safe_answer_callback(call.id, text="Comprovante rejeitado.")
                 logger.info(f"[PIX_MANUAL_REJEITADO] order_nsu={order_nsu}")
     except Exception as e:
-        logger.error(f"[PIX_MANUAL_REVISAO] order_nsu={order_nsu} erro={e}")
+        logger.error(
+            f"[PIX_MANUAL_REVISAO] order_nsu={order_nsu} "
+            f"erro={sanitizar_erro_log(e)}"
+        )
         safe_answer_callback(call.id, text="Erro ao revisar o pagamento.", show_alert=True)
 
 
@@ -3528,38 +3629,30 @@ def formatos_por_plataforma(is_tiktok=False, is_instagram=False, is_pinterest=Fa
     return formatos_capados_gerais()
 
 
-@bot.message_handler(func=lambda message: message.text and "http" in message.text.lower())
-def handle_download(message):
+def _processar_download(message, url, status_msg):
     user = obter_usuario(message.from_user.id)
     vip_status = is_vip_user(user)
     prefix = None
 
-    if not vip_status and user.get("downloads_hoje", 0) >= FREE_DAILY_LIMIT:
-        safe_reply_to(
-            message,
-            f"⚠️ *Limite diário atingido ({FREE_DAILY_LIMIT}/{FREE_DAILY_LIMIT})!*\n"
-            "Para continuar baixando sem limites, libere o VIP abaixo: 👇",
-            parse_mode="Markdown"
-        )
-        return mostrar_planos_chat(message.chat.id, message.from_user.id)
-
-    url = extrair_primeira_url(message.text)
-    if not url:
-        return safe_reply_to(message, "❌ Não encontrei um link válido na sua mensagem.")
-
-    status_msg = safe_reply_to(
-        message,
-        "✅ Seu link entrou na fila de download! Aguarde só alguns instantes 👊"
-    )
-
     try:
+        if status_msg:
+            safe_edit_message(
+                message.chat.id,
+                status_msg.message_id,
+                "🔄 Processando seu vídeo...",
+            )
+
+        url = resolver_url_compartilhada(url)
         is_pinterest, is_tiktok, is_instagram, is_rednote = detectar_plataforma(url)
         plataforma = nome_plataforma(is_pinterest, is_tiktok, is_instagram, is_rednote)
 
         if is_instagram:
             url = normalizar_url_instagram(url)
 
-        logger.info(f"[DOWNLOAD_INICIO] user_id={message.from_user.id} plataforma={plataforma} url={url}")
+        logger.info(
+            f"[DOWNLOAD_INICIO] user_id={message.from_user.id} "
+            f"plataforma={plataforma} url_ref={referencia_url_log(url)}"
+        )
 
         if not (is_pinterest or is_tiktok or is_instagram or is_rednote):
             texto_nao_reconhecido = "❌ Link não reconhecido. Envie um link do TikTok, Pinterest, Instagram ou RedNote."
@@ -3567,14 +3660,6 @@ def handle_download(message):
                 safe_edit_message(message.chat.id, status_msg.message_id, texto_nao_reconhecido)
             else:
                 safe_send_message(message.chat.id, texto_nao_reconhecido)
-            return
-
-        autorizado, mensagem_limite = autorizar_tentativa_download(message.from_user.id)
-        if not autorizado:
-            if status_msg:
-                safe_edit_message(message.chat.id, status_msg.message_id, mensagem_limite)
-            else:
-                safe_send_message(message.chat.id, mensagem_limite)
             return
 
         if is_pinterest:
@@ -3693,7 +3778,10 @@ def handle_download(message):
                 return
 
             except Exception as e:
-                logger.error(f"[ERRO_PINTEREST] user_id={message.from_user.id} url={url} erro={e}")
+                logger.error(
+                    f"[ERRO_PINTEREST] user_id={message.from_user.id} "
+                    f"url_ref={referencia_url_log(url)} erro={sanitizar_erro_log(e)}"
+                )
                 texto_erro = mapear_erro_download(str(e), plataforma="pinterest")
 
                 if status_msg:
@@ -3813,7 +3901,8 @@ def handle_download(message):
                     ultimo_erro = str(e)
                     logger.warning(
                         f"[DOWNLOAD_TENTATIVA] plataforma={plataforma} "
-                        f"usar_cookies={usar_cookies} formato={fmt} url={url} erro={e}"
+                        f"usar_cookies={usar_cookies} formato={fmt} "
+                        f"url_ref={referencia_url_log(url)} erro={sanitizar_erro_log(e)}"
                     )
 
             if baixou:
@@ -3862,7 +3951,10 @@ def handle_download(message):
             safe_delete_message(message.chat.id, status_msg.message_id)
 
     except Exception as e:
-        logger.error(f"[ERRO_DOWNLOAD] user_id={message.from_user.id} url={url} erro={e}")
+        logger.error(
+            f"[ERRO_DOWNLOAD] user_id={message.from_user.id} "
+            f"url_ref={referencia_url_log(url)} erro={sanitizar_erro_log(e)}"
+        )
         url_erro = (url or "").lower()
         if "instagram.com" in url_erro or "instagr.am" in url_erro:
             plataforma_erro = "instagram"
@@ -3882,179 +3974,173 @@ def handle_download(message):
             cleanup_prefix(prefix)
 
 
-# =========================================
-# ROTAS INFINITEPAY
-# =========================================
-@app.route("/pagamento/sucesso")
-def pagamento_sucesso():
-    order_nsu = html.escape(request.args.get("order_nsu", ""), quote=True)
-    capture_method = html.escape(request.args.get("capture_method", ""), quote=True)
-    return f"""
-    <html>
-        <head><title>Pagamento recebido</title></head>
-        <body style="font-family: Arial, sans-serif; text-align: center; padding: 40px;">
-            <h2>✅ Pagamento recebido</h2>
-            <p>Seu pagamento foi processado.</p>
-            <p><strong>Pedido:</strong> {order_nsu}</p>
-            <p><strong>Forma:</strong> {capture_method}</p>
-            <p>Você já pode voltar para o Telegram.</p>
-        </body>
-    </html>
-    """, 200
+def loop_fila_downloads():
+    logger.info(f"[DOWNLOAD_QUEUE] worker iniciado capacidade={DOWNLOAD_QUEUE_MAX}")
+    while True:
+        _prioridade, _sequencia, trabalho = DOWNLOAD_QUEUE.get()
+        message = trabalho["message"]
+        user_id = str(message.from_user.id)
+        try:
+            _processar_download(
+                message,
+                trabalho["url"],
+                trabalho.get("status_msg"),
+            )
+        except Exception as e:
+            logger.error(
+                f"[DOWNLOAD_WORKER] user_id={user_id} "
+                f"erro={sanitizar_erro_log(e)}"
+            )
+            safe_send_message(
+                message.chat.id,
+                "❌ Não consegui processar esse vídeo agora. Tente novamente em instantes.",
+            )
+        finally:
+            with DOWNLOAD_PENDING_LOCK:
+                DOWNLOAD_PENDING_USERS.discard(user_id)
+            DOWNLOAD_QUEUE.task_done()
 
 
-@app.route("/webhook/infinitepay", methods=["POST"])
-def webhook_infinitepay():
+@bot.message_handler(func=lambda message: message.text and "http" in message.text.lower())
+def handle_download(message):
+    if not is_chat_privado(message):
+        orientar_uso_no_privado(message)
+        return
+
+    user = obter_usuario(message.from_user.id)
+    vip_status = is_vip_user(user)
+    if not vip_status and user.get("downloads_hoje", 0) >= FREE_DAILY_LIMIT:
+        safe_reply_to(
+            message,
+            f"⚠️ *Limite diário atingido ({FREE_DAILY_LIMIT}/{FREE_DAILY_LIMIT})!*\n"
+            "Para continuar baixando sem limite diário, libere o VIP abaixo: 👇",
+            parse_mode="Markdown",
+        )
+        mostrar_planos_chat(message.chat.id, message.from_user.id)
+        return
+
+    url = extrair_primeira_url(message.text)
+    if not url or not validar_url_http_publica(url, resolver_dns=False):
+        safe_reply_to(message, "❌ Não encontrei um link válido na sua mensagem.")
+        return
+
+    if not any(detectar_plataforma(url)):
+        safe_reply_to(
+            message,
+            "❌ Link não reconhecido. Envie um link do TikTok, Pinterest, "
+            "Instagram ou RedNote.",
+        )
+        return
+
+    user_id = str(message.from_user.id)
+    with DOWNLOAD_PENDING_LOCK:
+        if user_id in DOWNLOAD_PENDING_USERS:
+            safe_reply_to(
+                message,
+                "⏳ Seu vídeo anterior ainda está na fila. Aguarde a conclusão antes "
+                "de enviar outro link.",
+            )
+            return
+        if DOWNLOAD_QUEUE.full():
+            safe_reply_to(
+                message,
+                "⏳ A fila está cheia neste momento. Aguarde um pouco e tente novamente.",
+            )
+            return
+
+    autorizado, mensagem_limite = autorizar_tentativa_download(message.from_user.id)
+    if not autorizado:
+        safe_reply_to(message, mensagem_limite)
+        return
+
+    status_msg = safe_reply_to(
+        message,
+        "💎 Link recebido com prioridade VIP. Aguarde o processamento..."
+        if vip_status
+        else "⏳ Link recebido. Aguarde o processamento...",
+    )
+
+    with DOWNLOAD_PENDING_LOCK:
+        if user_id in DOWNLOAD_PENDING_USERS:
+            if status_msg:
+                safe_delete_message(message.chat.id, status_msg.message_id)
+            return
+        DOWNLOAD_PENDING_USERS.add(user_id)
+
     try:
-        secret_recebido = (request.args.get("secret") or "").strip()
-        if not secrets.compare_digest(secret_recebido, INFINITEPAY_WEBHOOK_SECRET):
-            logger.warning("[WEBHOOK_INFINITEPAY] acesso negado: secret inválido")
-            return jsonify({
-                "success": False,
-                "message": "Não autorizado"
-            }), 403
-
-        if not webhook_dentro_do_limite(request.remote_addr):
-            logger.warning("[WEBHOOK_INFINITEPAY] limite por minuto excedido")
-            return jsonify({"success": False, "message": "Muitas requisições"}), 429
-
-        payload = request.get_json(silent=True) or {}
-        if not isinstance(payload, dict):
-            return jsonify({"success": False, "message": "JSON inválido"}), 400
-
-        order_nsu = str(payload.get("order_nsu") or "").strip()
-        transaction_nsu = str(payload.get("transaction_nsu") or "").strip()
-        amount = payload.get("amount")
-        capture_method = payload.get("capture_method")
-
-        logger.info(
-            f"[WEBHOOK_INFINITEPAY] recebido order_nsu={order_nsu} transaction_nsu={transaction_nsu} "
-            f"amount={amount} capture_method={capture_method}"
-        )
-        if not order_nsu:
-            logger.warning("[WEBHOOK_INFINITEPAY] order_nsu ausente")
-            return jsonify({
-                "success": False,
-                "message": "order_nsu ausente"
-            }), 400
-
-        pedido = pedidos_col.find_one({"order_nsu": order_nsu})
-        if not pedido:
-            logger.warning(f"[WEBHOOK_PEDIDO_NAO_ENCONTRADO] order_nsu={order_nsu}")
-            return jsonify({
-                "success": False,
-                "message": "Pedido não encontrado"
-            }), 400
-
-        plano = PLANOS.get(pedido.get("plano_key")) or {}
-        plano_nome = plano.get("nome")
-
-        if pedido.get("status") == "paid":
-            logger.info(f"[WEBHOOK_PEDIDO_JA_PAGO] order_nsu={order_nsu}")
-            return jsonify({
-                "success": True,
-                "message": None
-            }), 200
-
-        if not plano:
-            logger.warning(f"[WEBHOOK_PLANO_INVALIDO] order_nsu={order_nsu} plano_key={pedido.get('plano_key')}")
-            disparar_notificacao_admin(
-                montar_texto_admin_webhook(
-                    "❌ *Plano inválido no webhook*",
-                    order_nsu=order_nsu,
-                    user_id=pedido.get("user_id"),
-                    detalhe=f"plano_key={pedido.get('plano_key')}"
-                )
-            )
-            return jsonify({
-                "success": False,
-                "message": "Plano inválido"
-            }), 400
-
-        invoice_slug = str(
-            payload.get("invoice_slug") or payload.get("slug") or ""
-        ).strip()
-        if not transaction_nsu or not invoice_slug:
-            logger.warning(
-                f"[WEBHOOK_DADOS_AUSENTES] order_nsu={order_nsu} "
-                f"transaction={bool(transaction_nsu)} slug={bool(invoice_slug)}"
-            )
-            return jsonify({
-                "success": False,
-                "message": "Dados da transação ausentes",
-            }), 400
-
-        # Persiste antes de responder. Se o processo reiniciar logo depois do
-        # HTTP 200, o loop periódico recupera esta verificação da base.
-        agora = agora_tz()
-        pedidos_col.update_one(
-            {"order_nsu": order_nsu, "status": {"$ne": "paid"}},
-            {
-                "$set": {
-                    "webhook_payload": sanitizar_payload_webhook(payload),
-                    "webhook_received_at": agora,
-                    "payment_verification_status": "queued",
-                    "next_payment_retry_at": agora,
-                },
-                "$unset": {"payment_verification_error": ""},
-            },
-        )
-
-        agendar_processamento_pagamento(order_nsu)
-
-        return jsonify({
-            "success": True,
-            "message": "Recebido para verificação"
-        }), 200
-
-    except Exception as e:
-        logger.error(f"[WEBHOOK_INFINITEPAY] erro={e}")
-        disparar_notificacao_admin(
-            montar_texto_admin_webhook(
-                "❌ *Erro interno no webhook*",
-                detalhe=str(e)
+        DOWNLOAD_QUEUE.put_nowait(
+            (
+                0 if vip_status else 1,
+                next(DOWNLOAD_SEQUENCE),
+                {"message": message, "url": url, "status_msg": status_msg},
             )
         )
-        return jsonify({
-            "success": False,
-            "message": "Erro interno no webhook"
-        }), 400
-
+    except Full:
+        with DOWNLOAD_PENDING_LOCK:
+            DOWNLOAD_PENDING_USERS.discard(user_id)
+        if status_msg:
+            safe_edit_message(
+                message.chat.id,
+                status_msg.message_id,
+                "⏳ A fila ficou cheia. Aguarde um pouco e tente novamente.",
+            )
 
 
 # =========================================
 # HEALTHCHECK
 # =========================================
-@app.route("/")
-def root_status():
-    return "ONLINE", 200
+def obter_estado_bot():
+    with BOT_STATE_LOCK:
+        return BOT_STATE, BOT_LAST_UPDATE_AT
 
-@app.route("/health")
-def health():
-    return jsonify({
-        "status": "ok",
+
+def montar_payload_health():
+    estado, ultima_atividade = obter_estado_bot()
+    return {
+        "status": "ok" if estado == "polling" else "degraded",
         "service": SERVICE_NAME,
-        "version": APP_VERSION,
-        "deployment_id": DEPLOYMENT_ID,
-        "environment": ENVIRONMENT_NAME,
+        "bot": estado,
         "started_at": APP_STARTED_AT,
-        "bot": "running",
-        "flask": "running",
-        "yt_dlp_version": YT_DLP_VERSION,
-        "tiktok_impersonation": TIKTOK_IMPERSONATION_DISPONIVEL,
-        "curl_cffi_version": CURL_CFFI_VERSION,
-        "media_profile": MEDIA_PROFILE_VERSION,
-        "max_duration_seconds": MAX_DURATION_SECONDS,
-        "max_source_file_mb": MAX_SOURCE_FILE_MB,
-        "max_output_file_mb": MAX_OUTPUT_FILE_MB,
-        "payment_mode": "manual_pix",
-        "pix_configured": bool(PIX_KEY),
-        "download_cooldown_seconds": DOWNLOAD_COOLDOWN_SECONDS,
-        "max_downloads_per_user_hour": MAX_DOWNLOADS_PER_USER_HOUR,
-        "max_downloads_global_hour": MAX_DOWNLOADS_GLOBAL_HOUR,
-        "payment_workers": PAYMENT_WORKERS,
-        "payment_retry_scan_seconds": PAYMENT_RETRY_SCAN_SECONDS,
-    }), 200
+        "last_update_at": ultima_atividade,
+    }
+
+
+class HealthRequestHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        caminho = urlparse(self.path).path
+        if caminho == "/":
+            corpo = b"ONLINE"
+            content_type = "text/plain; charset=utf-8"
+            status = 200
+        elif caminho == "/health":
+            corpo = json.dumps(
+                montar_payload_health(), ensure_ascii=False
+            ).encode("utf-8")
+            content_type = "application/json; charset=utf-8"
+            # O endpoint é de vida do contêiner. Durante uma reconexão do
+            # Telegram ele continua 200, mas informa "degraded" no JSON.
+            status = 200
+        else:
+            corpo = b"NOT FOUND"
+            content_type = "text/plain; charset=utf-8"
+            status = 404
+
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(corpo)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(corpo)
+
+    def log_message(self, _format, *_args):
+        return
+
+
+def servir_healthcheck():
+    porta = int(os.environ.get("PORT", 8080))
+    servidor = ThreadingHTTPServer(("0.0.0.0", porta), HealthRequestHandler)
+    logger.info(f"[HEALTH] servidor iniciado porta={porta}")
+    servidor.serve_forever()
 
 
 # =========================================
@@ -4073,13 +4159,7 @@ if __name__ == "__main__":
         f"user_hour={MAX_DOWNLOADS_PER_USER_HOUR} "
         f"global_hour={MAX_DOWNLOADS_GLOBAL_HOUR}"
     )
-    if PIX_KEY:
-        logger.info("[PAGAMENTO_CONFIG] modo=manual_pix configurado=True")
-    else:
-        logger.error(
-            "[PAGAMENTO_CONFIG] modo=manual_pix configurado=False; "
-            "defina PIX_KEY no Railway"
-        )
+    logger.info("[PAGAMENTO_CONFIG] modo=manual_pix configurado=True")
     if TIKTOK_IMPERSONATION_DISPONIVEL:
         logger.info(f"[TIKTOK_DEPENDENCIAS] curl_cffi={CURL_CFFI_VERSION}")
     else:
@@ -4090,6 +4170,7 @@ if __name__ == "__main__":
     inicializar_metricas_diarias()
     cleanup_download_dir_old_files(max_age_hours=6)
     configurar_menu_comandos()
+    bot.set_update_listener(registrar_atividade_bot)
 
     Thread(
         target=cleanup_download_dir_periodicamente,
@@ -4097,26 +4178,22 @@ if __name__ == "__main__":
         daemon=True
     ).start()
 
-    # Mantém a recuperação apenas para pagamentos de links InfinitePay que
-    # possam ter sido criados antes da mudança para Pix manual.
     Thread(
-        target=reprocessar_pagamentos_pendentes_periodicamente,
-        kwargs={"interval_seconds": PAYMENT_RETRY_SCAN_SECONDS},
+        target=loop_fila_downloads,
         daemon=True,
     ).start()
 
     Thread(
-        target=lambda: app.run(
-            host="0.0.0.0",
-            port=int(os.environ.get("PORT", 8080))
-        ),
+        target=servir_healthcheck,
         daemon=True
     ).start()
 
     while True:
         try:
+            atualizar_estado_bot("polling")
             logger.info("Iniciando bot.infinity_polling...")
-            bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20)
+            bot.infinity_polling(skip_pending=False, timeout=20, long_polling_timeout=20)
         except Exception as e:
-            logger.error(f"[POLLING] erro={e}")
+            atualizar_estado_bot("reconnecting")
+            logger.error(f"[POLLING] erro={sanitizar_erro_log(e)}")
             time.sleep(5)
