@@ -89,6 +89,7 @@ MAX_DURATION_SECONDS = 90
 INSTAGRAM_COOKIES_TEXT = os.environ.get("INSTAGRAM_COOKIES_TEXT", "")
 TIKTOK_COOKIES_TEXT = os.environ.get("TIKTOK_COOKIES_TEXT", "")
 TIKTOK_DEVICE_ID_TEXT = os.environ.get("TIKTOK_DEVICE_ID", "")
+TIKWM_API_URL = os.environ.get("TIKWM_API_URL", "https://www.tikwm.com/api/").strip()
 
 TIKTOK_COOKIE_LOCK = Lock()
 TIKTOK_COOKIES_ENV_APLICADOS = False
@@ -469,8 +470,10 @@ def converter_para_h264_compativel(arquivo_entrada, info=None):
 def converter_para_720x1280_30fps(arquivo_entrada):
     """
     Garante saída final em no máximo 720x1280, 30fps, H.264/AAC.
-    Mantém a proporção original sem adicionar bordas.
+    Mantém a proporção original sem adicionar bordas e nunca amplia vídeos
+    que já tenham resolução menor que o limite.
     """
+    info = obter_info_midia(arquivo_entrada) or {}
     base, _ = os.path.splitext(arquivo_entrada)
     arquivo_saida = f"{base}_720x1280_30fps.mp4"
 
@@ -478,7 +481,15 @@ def converter_para_720x1280_30fps(arquivo_entrada):
         "ffmpeg",
         "-y",
         "-i", arquivo_entrada,
-        "-vf", "scale=720:1280:force_original_aspect_ratio=decrease:force_divisible_by=2,fps=30",
+    ]
+
+    # Só adiciona escala se o vídeo realmente ultrapassar 720x1280. Se ele
+    # for menor e precisar apenas de ajuste de fps/codec, preserva a resolução.
+    vf = montar_vf_limite_720x1280_30fps(info)
+    if vf:
+        cmd += ["-vf", vf]
+
+    cmd += [
         "-c:v", "libx264",
         "-preset", "veryfast",
         "-crf", "25",
@@ -966,6 +977,133 @@ def extrair_info_tiktok_embed(url):
     }
 
 
+def normalizar_url_midia_tikwm(url):
+    url = str(url or "").strip()
+    if url.startswith("//"):
+        return f"https:{url}"
+    if url.startswith("/"):
+        return f"https://www.tikwm.com{url}"
+    return url
+
+
+def extrair_info_tiktok_hd_sem_marca(url):
+    """Obtém a variante HD sem marca e evita deliberadamente o campo wmplay.
+
+    No Railway, o curl_cffi pode receber uma resposta diferente da biblioteca
+    requests por causa do fingerprint/TLS ou do IP do datacenter. Por isso a
+    consulta tenta POST e GET comuns antes do cliente com impersonação.
+    """
+    if not TIKWM_API_URL:
+        raise RuntimeError("TIKWM_API_DESATIVADA")
+
+    payload = {"url": url, "hd": "1"}
+    headers = {
+        **DEFAULT_HEADERS,
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+        "Origin": "https://www.tikwm.com",
+        "Referer": "https://www.tikwm.com/",
+    }
+
+    # Mantém uma URL configurável, mas sempre tenta também o endereço canônico.
+    api_urls = []
+    for api_url in (TIKWM_API_URL, "https://www.tikwm.com/api/"):
+        api_url = str(api_url or "").strip()
+        if api_url and api_url not in api_urls:
+            api_urls.append(api_url)
+
+    metodos = ["requests_post", "requests_get"]
+    if curl_requests is not None:
+        metodos.append("curl_cffi_post")
+
+    ultimo_erro = None
+    for api_url in api_urls:
+        for metodo in metodos:
+            try:
+                logger.info(
+                    f"[TIKTOK_SEM_MARCA_TENTATIVA] metodo={metodo} api={api_url}"
+                )
+                if metodo == "requests_post":
+                    resposta = requests.post(
+                        api_url,
+                        data=payload,
+                        timeout=30,
+                        headers=headers,
+                    )
+                elif metodo == "requests_get":
+                    resposta = requests.get(
+                        api_url,
+                        params=payload,
+                        timeout=30,
+                        headers=headers,
+                    )
+                else:
+                    resposta = curl_requests.post(
+                        api_url,
+                        data=payload,
+                        impersonate="chrome",
+                        timeout=30,
+                        headers=headers,
+                    )
+
+                resposta.raise_for_status()
+                resultado = resposta.json()
+                dados = resultado.get("data") or {}
+                if resultado.get("code") not in (0, None) or not dados:
+                    raise RuntimeError(
+                        f"TIKWM_API_ERRO: {resultado.get('msg') or 'resposta sem dados'}"
+                    )
+
+                # hdplay é HD sem marca; play é o fallback sem marca comum.
+                # wmplay nunca é selecionado porque contém marca d'água.
+                url_hd = normalizar_url_midia_tikwm(dados.get("hdplay"))
+                url_sem_marca = normalizar_url_midia_tikwm(dados.get("play"))
+                video_url = url_hd or url_sem_marca
+                if not video_url.startswith("http"):
+                    raise RuntimeError("TIKWM_URL_SEM_MARCA_NAO_ENCONTRADA")
+
+                usou_hd = bool(url_hd)
+                video_id = str(dados.get("id") or extrair_tiktok_video_id(url))
+                tamanho = dados.get("hd_size") if usou_hd else dados.get("size")
+                logger.info(
+                    f"[TIKTOK_HD_OK] video_id={video_id} sem_marca=True "
+                    f"hd={usou_hd} metodo={metodo} duration={dados.get('duration')} "
+                    f"tamanho={tamanho}"
+                )
+                return {
+                    "id": video_id,
+                    "title": dados.get("title") or f"TikTok {video_id}",
+                    "duration": dados.get("duration"),
+                    "webpage_url": url,
+                    "extractor": "TikTokHDSemMarca",
+                    "extractor_key": "TikTokHDSemMarca",
+                    "formats": [
+                        {
+                            "format_id": (
+                                "tiktok_hd_sem_marca" if usou_hd else "tiktok_sem_marca"
+                            ),
+                            "format_note": "HD sem marca" if usou_hd else "Sem marca",
+                            "url": video_url,
+                            "ext": "mp4",
+                            "filesize": tamanho,
+                            "http_headers": {
+                                "Referer": "https://www.tiktok.com/",
+                                "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+                            },
+                        }
+                    ],
+                }
+            except Exception as e:
+                ultimo_erro = e
+                status = getattr(getattr(e, "response", None), "status_code", None)
+                logger.warning(
+                    f"[TIKTOK_SEM_MARCA_FALHA] metodo={metodo} api={api_url} "
+                    f"status={status} erro={e}"
+                )
+
+    raise RuntimeError(f"TIKWM_SEM_MARCA_FALHOU: {ultimo_erro}")
+
+
 def montar_info_opts(
     is_instagram=False,
     is_pinterest=False,
@@ -1106,12 +1244,12 @@ def erro_tiktok_permite_nova_tentativa(erro):
 
 
 def extrair_info_tiktok_com_fallback(url):
-    """Tenta o embed público e mantém o yt-dlp como fallback."""
+    """Prioriza HD sem marca e nunca aceita o embed público com marca."""
     try:
-        logger.info(f"[TIKTOK_INFO] estrategia=embed_publico url={url}")
-        return extrair_info_tiktok_embed(url), False, None
+        logger.info(f"[TIKTOK_INFO] estrategia=hd_sem_marca url={url}")
+        return extrair_info_tiktok_hd_sem_marca(url), False, None
     except Exception as e:
-        logger.warning(f"[TIKTOK_EMBED_FALHA] url={url} erro={e}")
+        logger.warning(f"[TIKTOK_HD_FALHA] url={url} erro={e}")
 
     estrategias = []
 
@@ -1186,7 +1324,15 @@ def extrair_info_tiktok_com_fallback(url):
                     if erro_tiktok_permite_nova_tentativa(e):
                         time.sleep(tentativa)
 
-    raise ultimo_erro or Exception("Falha ao consultar o TikTok")
+    # O embed público foi removido do fluxo de download: ele só disponibiliza
+    # a cópia 576x1024 com a marca do TikTok. É melhor informar indisponibilidade
+    # do que entregar ao usuário um arquivo diferente do prometido.
+    logger.error(
+        f"[TIKTOK_SEM_MARCA_INDISPONIVEL] url={url} ultimo_erro={ultimo_erro}"
+    )
+    raise RuntimeError(
+        f"TIKTOK_SEM_MARCA_INDISPONIVEL: {ultimo_erro or 'fontes sem marca falharam'}"
+    )
 
 
 def baixar_info_tiktok_ja_extraida(info, opts):
@@ -1226,6 +1372,11 @@ def mapear_erro_download(err_text, plataforma="geral"):
         return "❌ Não consegui baixar esse link do Instagram agora."
 
     if plataforma == "tiktok":
+        if "tiktok_sem_marca_indisponivel" in err or "tikwm_sem_marca_falhou" in err:
+            return (
+                "❌ Não encontrei uma versão sem marca d'água deste TikTok agora. "
+                "Tente novamente em alguns instantes."
+            )
         if "tiktok_cookies_text_invalido" in err:
             return "❌ Os cookies do TikTok estão em formato inválido. Use o formato Netscape e tente novamente."
         if "impersonat" in err or "curl_cffi" in err or "curl-cffi" in err:
@@ -2317,7 +2468,13 @@ def formatos_por_plataforma(is_tiktok=False, is_instagram=False, is_pinterest=Fa
             "best[width<=720][height<=1280]"
         ]
 
-    if is_tiktok or is_rednote:
+    if is_tiktok:
+        # A fonte HD sem marca não informa resolução antes do download. Baixa
+        # a melhor variante e o pipeline de mídia aplica depois o limite
+        # uniforme de 720x1280 e 30 fps.
+        return ["best[ext=mp4]/best"] + formatos_capados_gerais()
+
+    if is_rednote:
         return formatos_capados_gerais() + [
             "best[ext=mp4]/best"
         ]
