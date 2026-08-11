@@ -2461,15 +2461,40 @@ def baixar_pinterest_capado(url, prefix, info=None):
 # =========================================
 # MENU / UI
 # =========================================
-def enviar_menu_principal(is_admin=False):
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    markup.row("🚀 Liberar VIP", "📋 Como funciona")
-    markup.row("📞 Suporte")
+def configurar_menu_comandos():
+    """Configura o menu nativo do Telegram para usuários e administrador."""
+    comandos_usuario = [
+        types.BotCommand("start", "Início e status do plano"),
+        types.BotCommand("vip", "Conhecer os planos VIP"),
+        types.BotCommand("suporte", "Falar com o suporte"),
+    ]
 
-    if is_admin:
-        markup.row("⚙️ Painel Admin")
+    comandos_admin = comandos_usuario + [
+        types.BotCommand("painel", "Abrir o Painel Admin"),
+        types.BotCommand("darvip", "Liberar VIP manualmente"),
+        types.BotCommand("zerar", "Zerar o limite de um usuário"),
+        types.BotCommand("avisogeral", "Enviar comunicado aos usuários"),
+        types.BotCommand("backupgeral", "Gerar backup completo"),
+    ]
 
-    return markup
+    try:
+        bot.set_my_commands(
+            comandos_usuario,
+            scope=types.BotCommandScopeDefault(),
+        )
+        bot.set_my_commands(
+            comandos_admin,
+            scope=types.BotCommandScopeChat(chat_id=ADMIN_ID),
+        )
+        logger.info(
+            "[TELEGRAM_MENU] configurado usuarios=%s admin=%s",
+            len(comandos_usuario),
+            len(comandos_admin),
+        )
+        return True
+    except Exception as e:
+        logger.warning(f"[TELEGRAM_MENU] não foi possível configurar: {e}")
+        return False
 
 
 def mostrar_planos_chat(chat_id, user_id):
@@ -2998,6 +3023,7 @@ def backup_geral(message):
     safe_reply_to(message, "🗂 Gerando backup geral e enviando no seu privado...")
 
 
+@bot.message_handler(commands=["painel"])
 @bot.message_handler(func=lambda m: m.text == "⚙️ Painel Admin")
 def painel_admin(message):
     if message.from_user.id != ADMIN_ID:
@@ -3035,19 +3061,7 @@ def painel_admin(message):
             f"✅ Pagamentos aprovados: `{pedidos_pagos}`"
         )
 
-        comandos_admin = (
-            "*Comandos:*\n"
-            "• `/darvip [ID] [Dias]`\n"
-            "• `/zerar [ID]`\n"
-            "• `/avisogeral [Mensagem]`\n"
-            "• `/backupusuarios`\n"
-            "• `/backupvips`\n"
-            "• `/backuppedidos`\n"
-            "• `/backupgeral`"
-        )
-
         safe_send_message(message.chat.id, resumo_admin, parse_mode="Markdown")
-        safe_send_message(message.chat.id, comandos_admin, parse_mode="Markdown")
     except Exception as e:
         logger.error(f"[PAINEL_ADMIN] erro={e}")
         safe_send_message(message.chat.id, "❌ Erro ao abrir painel admin.")
@@ -3091,18 +3105,19 @@ def start(message):
         f"• Duração máxima: {MAX_DURATION_SECONDS} segundos\n"
         f"• ID de usuário: `{message.from_user.id}`\n\n"
         f"{status}\n\n"
-        "Envie o link de um vídeo para começar."
+        "Envie o link de um vídeo para começar ou use o botão *Menu* "
+        "para ver as opções."
     )
 
     safe_send_message(
         message.chat.id,
         texto,
         parse_mode="Markdown",
-        reply_markup=enviar_menu_principal(is_admin=(message.from_user.id == ADMIN_ID))
+        reply_markup=types.ReplyKeyboardRemove()
     )
 
 
-@bot.message_handler(commands=["planos"])
+@bot.message_handler(commands=["vip", "planos"])
 def cmd_planos(message):
     mostrar_planos_chat(message.chat.id, message.from_user.id)
 
@@ -3112,41 +3127,7 @@ def mostrar_planos(message):
     mostrar_planos_chat(message.chat.id, message.from_user.id)
 
 
-@bot.message_handler(func=lambda m: m.text == "📋 Como funciona")
-def como_funciona(message):
-    texto = (
-        "📋 *COMO FUNCIONA*\n\n"
-        "Envie o link de um vídeo do:\n"
-        "• TikTok\n"
-        "• Pinterest\n"
-        "• Instagram\n"
-        "• RedNote\n\n"
-        "O bot faz o download automaticamente.\n\n"
-        "✅ Sem marca d'água\n"
-        "✅ Qualidade em HD\n"
-        "✅ Rápido e prático\n\n"
-        "*Plano grátis:*\n"
-        f"• {FREE_DAILY_LIMIT} downloads por dia\n\n"
-        "*VIP libera:*\n"
-        "• Downloads ilimitados\n"
-        "• Prioridade no processamento\n"
-        "• Sem limite diário\n"
-        "• Pagamento exclusivamente via Pix\n"
-        "• Liberação após conferência do pagamento\n\n"
-        "*Regras:*\n"
-        f"• Vídeos de até {MAX_DURATION_SECONDS} segundos\n"
-        "• Máximo 720x1280 em até 30 fps\n"
-        "• Envie apenas o link do vídeo\n\n"
-        "*Como usar:*\n"
-        "1. Copie o link do vídeo\n"
-        "2. Envie aqui no chat\n"
-        "3. Aguarde o download\n\n"
-        "Use o botão *🚀 Liberar VIP* para ativar o acesso ilimitado."
-    )
-
-    safe_send_message(message.chat.id, texto, parse_mode="Markdown")
-
-
+@bot.message_handler(commands=["suporte"])
 @bot.message_handler(func=lambda m: m.text == "📞 Suporte")
 def suporte(message):
     try:
@@ -4108,6 +4089,7 @@ if __name__ == "__main__":
         )
     inicializar_metricas_diarias()
     cleanup_download_dir_old_files(max_age_hours=6)
+    configurar_menu_comandos()
 
     Thread(
         target=cleanup_download_dir_periodicamente,
