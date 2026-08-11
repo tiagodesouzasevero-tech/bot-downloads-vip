@@ -4,7 +4,7 @@ import glob
 import uuid
 import time
 import logging
-from threading import Lock, Thread
+from threading import Thread
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -13,7 +13,6 @@ import telebot
 import yt_dlp
 import subprocess
 import json
-from yt_dlp.version import __version__ as YT_DLP_VERSION
 
 from flask import Flask, request, jsonify
 from telebot import types
@@ -74,13 +73,7 @@ APP_STARTED_AT = datetime.now(TZ).isoformat()
 FREE_DAILY_LIMIT = 3
 MAX_DURATION_SECONDS = 90
 
-INSTAGRAM_COOKIES_TEXT = os.environ.get("INSTAGRAM_COOKIES_TEXT", "")
-TIKTOK_COOKIES_TEXT = os.environ.get("TIKTOK_COOKIES_TEXT", "")
-TIKTOK_DEVICE_ID_TEXT = os.environ.get("TIKTOK_DEVICE_ID", "")
-
-TIKTOK_COOKIE_LOCK = Lock()
-TIKTOK_COOKIES_ENV_APLICADOS = False
-TIKTOK_DEVICE_LOCK = Lock()
+INSTAGRAM_COOKIES_TEXT = os.environ.get("INSTAGRAM_COOKIES_TEXT", "").strip()
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
@@ -100,7 +93,6 @@ client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
 db = client[MONGO_DB_NAME]
 usuarios_col = db["usuarios"]
 pedidos_col = db["pedidos"]
-metricas_col = db["metricas_diarias"]
 
 try:
     usuarios_col.create_index("vip_ate")
@@ -126,6 +118,21 @@ PINTEREST_HEADERS = {
     "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8"
 }
 
+INSTAGRAM_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/134.0.0.0 Safari/537.36"
+    ),
+    "Referer": "https://www.instagram.com/",
+    "Origin": "https://www.instagram.com",
+    "Accept": "*/*",
+    "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-origin"
+}
+
 PLANOS = {
     "10.00": {
         "nome": "VIP Mensal",
@@ -138,6 +145,13 @@ PLANOS = {
         "preco_centavos": 7990,
         "dias": 365,
         "descricao": "VIP Anual 365 dias"
+    },
+    "297.00": {
+        "nome": "VIP Vitalício",
+        "preco_centavos": 29700,
+        "dias": None,
+        "descricao": "VIP Vitalício",
+        "vitalicio": True
     }
 }
 
@@ -167,22 +181,6 @@ def extrair_primeira_url(texto):
     if not match:
         return None
     return match.group(1).strip().rstrip(".,);]}>\"'")
-
-
-def normalizar_url_instagram(url):
-    """Remove parâmetros de rastreamento e padroniza links de post/Reel."""
-    match = re.search(
-        r"https?://(?:www\.)?instagram\.com/(?:[^/?#]+/)?(p|reels?|tv)/([^/?#&]+)",
-        url,
-        flags=re.IGNORECASE,
-    )
-    if not match:
-        return url
-
-    tipo = match.group(1).lower()
-    if tipo in ("reel", "reels"):
-        tipo = "reel"
-    return f"https://www.instagram.com/{tipo}/{match.group(2)}/"
 
 
 def cleanup_prefix(prefix):
@@ -633,263 +631,35 @@ def nome_plataforma(is_pinterest, is_tiktok, is_instagram, is_rednote):
 
 
 def get_instagram_cookiefile():
-    texto = (INSTAGRAM_COOKIES_TEXT or "").strip()
-    if not texto:
-        return None
-
-    # Algumas plataformas salvam quebras de linha como os caracteres \n.
-    if "\n" not in texto and "\\n" in texto:
-        texto = texto.replace("\\r\\n", "\n").replace("\\n", "\n")
-
-    texto = texto.replace("\r\n", "\n").replace("\r", "\n").strip()
-
-    # O yt-dlp espera o formato Netscape/Mozilla.
-    if not texto.startswith("# Netscape HTTP Cookie File") and not texto.startswith("# HTTP Cookie File"):
-        texto = "# Netscape HTTP Cookie File\n" + texto
-
-    cookie_path = os.path.join(DOWNLOAD_DIR, "instagram_cookies.txt")
-    with open(cookie_path, "w", encoding="utf-8", newline="\n") as f:
-        f.write(texto + "\n")
-
-    linhas = [linha for linha in texto.splitlines() if linha and not linha.startswith("#")]
-    tem_sessionid = any(
-        len(partes := linha.split("\t")) >= 7 and partes[5] == "sessionid"
-        for linha in linhas
-    )
-    logger.info(
-        f"[INSTAGRAM_COOKIES] arquivo_criado=True linhas={len(linhas)} "
-        f"tem_sessionid={tem_sessionid}"
-    )
-    return cookie_path
-
-
-def normalizar_tiktok_cookies_text(texto):
-    texto = (texto or "").strip().lstrip("\ufeff")
-    if not texto:
-        return ""
-
-    # A Railway pode preservar as quebras/tabs ou recebê-las escapadas.
-    if "\n" not in texto and "\\n" in texto:
-        texto = texto.replace("\\r\\n", "\n").replace("\\n", "\n")
-    if "\t" not in texto and "\\t" in texto:
-        texto = texto.replace("\\t", "\t")
-
-    return texto.replace("\r\n", "\n").replace("\r", "\n").strip()
-
-
-def linhas_validas_tiktok_cookies(texto):
-    """Retorna somente registros compatíveis com o formato Netscape."""
-    linhas_validas = []
-    for linha_original in (texto or "").splitlines():
-        linha = linha_original.strip("\r\n")
-        linha_sem_espacos = linha.strip()
-        if not linha_sem_espacos:
-            continue
-        if linha_sem_espacos.startswith("#") and not linha_sem_espacos.startswith("#HttpOnly_"):
-            continue
-        if len(linha.split("\t")) >= 7:
-            linhas_validas.append(linha)
-    return linhas_validas
-
-
-def get_tiktok_cookiefile():
-    """Aplica cookies da Railway e preserva a sessão atualizada pelo yt-dlp."""
-    global TIKTOK_COOKIES_ENV_APLICADOS
-
-    cookie_path = os.path.join(DOWNLOAD_DIR, "tiktok_cookies.txt")
-    texto_env = normalizar_tiktok_cookies_text(TIKTOK_COOKIES_TEXT)
-    linhas_env = linhas_validas_tiktok_cookies(texto_env)
-
-    if texto_env and not linhas_env:
-        logger.error(
-            "[TIKTOK_COOKIES_INVALIDOS] A variável TIKTOK_COOKIES_TEXT não "
-            "contém registros no formato Netscape."
-        )
-        raise RuntimeError(
-            "TIKTOK_COOKIES_TEXT_INVALIDO: use um arquivo de cookies no formato Netscape"
-        )
-
-    with TIKTOK_COOKIE_LOCK:
-        texto_arquivo = ""
-        if os.path.exists(cookie_path):
-            try:
-                with open(cookie_path, "r", encoding="utf-8") as f:
-                    texto_arquivo = f.read()
-            except OSError as e:
-                logger.warning(f"[TIKTOK_COOKIES_LEITURA_FALHA] erro={e}")
-
-        linhas_arquivo = linhas_validas_tiktok_cookies(texto_arquivo)
-
-        # Na primeira chamada de cada implantação, a variável da Railway é a
-        # fonte principal. Isso substitui inclusive o antigo arquivo que tinha
-        # apenas o cabeçalho e fazia os cookies reais serem ignorados.
-        if linhas_env and not TIKTOK_COOKIES_ENV_APLICADOS:
-            texto_gravar = texto_env
-            if not (
-                texto_gravar.startswith("# Netscape HTTP Cookie File")
-                or texto_gravar.startswith("# HTTP Cookie File")
-            ):
-                texto_gravar = "# Netscape HTTP Cookie File\n" + texto_gravar
-
-            with open(cookie_path, "w", encoding="utf-8", newline="\n") as f:
-                f.write(texto_gravar.rstrip("\n") + "\n")
-
-            TIKTOK_COOKIES_ENV_APLICADOS = True
-            logger.info(
-                f"[TIKTOK_COOKIES] origem=variavel_railway "
-                f"cookies_fornecidos=True linhas={len(linhas_env)}"
-            )
-            return cookie_path
-
-        # Depois da primeira aplicação, mantém eventuais cookies de desafio
-        # que o próprio yt-dlp tenha atualizado durante a sessão.
-        if linhas_arquivo:
-            logger.info(
-                f"[TIKTOK_COOKIES] origem=arquivo_persistente "
-                f"cookies_fornecidos=True linhas={len(linhas_arquivo)}"
-            )
-            return cookie_path
-
-        # Se o arquivo sumir durante a execução, recria os cookies fornecidos.
-        if linhas_env:
-            texto_gravar = texto_env
-            if not (
-                texto_gravar.startswith("# Netscape HTTP Cookie File")
-                or texto_gravar.startswith("# HTTP Cookie File")
-            ):
-                texto_gravar = "# Netscape HTTP Cookie File\n" + texto_gravar
-
-            with open(cookie_path, "w", encoding="utf-8", newline="\n") as f:
-                f.write(texto_gravar.rstrip("\n") + "\n")
-
-            TIKTOK_COOKIES_ENV_APLICADOS = True
-            logger.info(
-                f"[TIKTOK_COOKIES] origem=variavel_railway_recriada "
-                f"cookies_fornecidos=True linhas={len(linhas_env)}"
-            )
-            return cookie_path
-
-        # Sem configuração, mantém um cookiefile válido e vazio para o yt-dlp
-        # poder salvar uma sessão caso o desafio do TikTok permita.
+    if INSTAGRAM_COOKIES_TEXT:
+        cookie_path = os.path.join(DOWNLOAD_DIR, "instagram_cookies.txt")
         with open(cookie_path, "w", encoding="utf-8", newline="\n") as f:
-            f.write("# Netscape HTTP Cookie File\n")
-
-        logger.info(
-            "[TIKTOK_COOKIES] origem=nenhuma cookies_fornecidos=False linhas=0"
-        )
+            f.write(INSTAGRAM_COOKIES_TEXT)
         return cookie_path
+    return None
 
 
-def validar_tiktok_device_id(valor):
-    """Aceita apenas o identificador numérico de 19 dígitos usado pelo app."""
-    valor = str(valor or "").strip()
-    return valor if re.fullmatch(r"\d{19}", valor) else None
-
-
-def get_tiktok_device_id():
-    """Mantém um device_id estável entre reinícios usando o volume da Railway."""
-    device_path = os.path.join(DOWNLOAD_DIR, "tiktok_device_id.txt")
-
-    with TIKTOK_DEVICE_LOCK:
-        device_id_env = validar_tiktok_device_id(TIKTOK_DEVICE_ID_TEXT)
-        if TIKTOK_DEVICE_ID_TEXT.strip() and not device_id_env:
-            logger.warning(
-                "[TIKTOK_DEVICE_ID_INVALIDO] A variável TIKTOK_DEVICE_ID deve "
-                "conter exatamente 19 dígitos; será usado o identificador persistente."
-            )
-
-        if device_id_env:
-            try:
-                with open(device_path, "w", encoding="utf-8", newline="\n") as f:
-                    f.write(device_id_env + "\n")
-            except OSError as e:
-                logger.warning(f"[TIKTOK_DEVICE_ID_GRAVACAO_FALHA] origem=variavel erro={e}")
-            logger.info("[TIKTOK_DEVICE_ID] origem=variavel_railway valido=True")
-            return device_id_env
-
-        if os.path.exists(device_path):
-            try:
-                with open(device_path, "r", encoding="utf-8") as f:
-                    device_id_arquivo = validar_tiktok_device_id(f.read())
-                if device_id_arquivo:
-                    logger.info("[TIKTOK_DEVICE_ID] origem=arquivo_persistente valido=True")
-                    return device_id_arquivo
-            except OSError as e:
-                logger.warning(f"[TIKTOK_DEVICE_ID_LEITURA_FALHA] erro={e}")
-
-        # O intervalo é o mesmo usado pelo próprio extrator do yt-dlp. Gravar
-        # no volume evita apresentar um aparelho diferente a cada tentativa.
-        inicio = 7250000000000000000
-        fim = 7325099899999994577
-        device_id_novo = str(inicio + (uuid.uuid4().int % (fim - inicio + 1)))
-        try:
-            with open(device_path, "w", encoding="utf-8", newline="\n") as f:
-                f.write(device_id_novo + "\n")
-            logger.info("[TIKTOK_DEVICE_ID] origem=gerado_persistente valido=True")
-        except OSError as e:
-            logger.warning(f"[TIKTOK_DEVICE_ID_GRAVACAO_FALHA] origem=gerado erro={e}")
-        return device_id_novo
-
-
-def montar_tiktok_extractor_args(api_hostname):
-    """Ativa o fallback pela API móvel nativa disponível no yt-dlp."""
-    return {
-        "tiktok": {
-            "device_id": [get_tiktok_device_id()],
-            "api_hostname": [api_hostname],
-            "app_name": ["musical_ly"],
-            "app_version": ["35.1.3"],
-            "manifest_app_version": ["2023501030"],
-            "aid": ["1233"],
-        }
-    }
-
-
-def montar_info_opts(
-    is_instagram=False,
-    is_pinterest=False,
-    usar_cookies=True,
-    is_tiktok=False,
-    tiktok_extractor_args=None,
-):
+def montar_info_opts(is_instagram=False, is_pinterest=False):
     opts = {
         "quiet": True,
         "nocheckcertificate": True,
         "noplaylist": True,
         "socket_timeout": 20,
-        "retries": 3,
-        "extractor_retries": 3,
+        "retries": 2
     }
 
     if is_instagram:
-        # O extrator do yt-dlp configura os cabeçalhos e a impersonação.
-        # Cabeçalhos manuais podem ficar incompatíveis quando o Instagram muda.
-        if usar_cookies:
-            cookiefile = get_instagram_cookiefile()
-            if cookiefile:
-                opts["cookiefile"] = cookiefile
+        opts["http_headers"] = INSTAGRAM_HEADERS
+        cookiefile = get_instagram_cookiefile()
+        if cookiefile:
+            opts["cookiefile"] = cookiefile
     elif is_pinterest:
         opts["http_headers"] = PINTEREST_HEADERS
-    elif is_tiktok:
-        # O extrator do TikTok já solicita impersonação via curl-cffi.
-        # Uma pequena pausa reduz falhas intermitentes do desafio da página.
-        opts["sleep_interval_requests"] = 1
-        if usar_cookies:
-            opts["cookiefile"] = get_tiktok_cookiefile()
-        if tiktok_extractor_args:
-            opts["extractor_args"] = tiktok_extractor_args
 
     return opts
 
 
-def montar_download_opts(
-    prefix,
-    is_instagram=False,
-    is_pinterest=False,
-    usar_cookies=True,
-    is_tiktok=False,
-    tiktok_extractor_args=None,
-):
+def montar_download_opts(prefix, is_instagram=False, is_pinterest=False):
     opts = {
         "outtmpl": f"{prefix}.%(ext)s",
         "nocheckcertificate": True,
@@ -903,153 +673,14 @@ def montar_download_opts(
     }
 
     if is_instagram:
-        opts.pop("http_headers", None)
-        if usar_cookies:
-            cookiefile = get_instagram_cookiefile()
-            if cookiefile:
-                opts["cookiefile"] = cookiefile
+        opts["http_headers"] = INSTAGRAM_HEADERS
+        cookiefile = get_instagram_cookiefile()
+        if cookiefile:
+            opts["cookiefile"] = cookiefile
     elif is_pinterest:
         opts["http_headers"] = PINTEREST_HEADERS
-    elif is_tiktok:
-        # Evita sobrescrever os cabeçalhos definidos pelo próprio extrator.
-        opts.pop("http_headers", None)
-        opts["extractor_retries"] = 3
-        opts["sleep_interval_requests"] = 1
-        if usar_cookies:
-            opts["cookiefile"] = get_tiktok_cookiefile()
-        if tiktok_extractor_args:
-            opts["extractor_args"] = tiktok_extractor_args
 
     return opts
-
-
-def erro_instagram_permite_fallback(erro):
-    texto = str(erro or "").lower()
-    sinais = (
-        "http error 400",
-        "bad request",
-        "instagram api is not granting access",
-        "video info extraction failed",
-        "rate-limit reached",
-        "requested content is not available",
-    )
-    return any(sinal in texto for sinal in sinais)
-
-
-def extrair_info_instagram_com_fallback(url):
-    """Tenta com cookies e repete anonimamente para Reels públicos."""
-    tentativas = [True]
-    if INSTAGRAM_COOKIES_TEXT.strip():
-        tentativas.append(False)
-
-    ultimo_erro = None
-    for usar_cookies in tentativas:
-        try:
-            logger.info(f"[INSTAGRAM_INFO] usar_cookies={usar_cookies} url={url}")
-            opts = montar_info_opts(is_instagram=True, usar_cookies=usar_cookies)
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=False)
-            return info, usar_cookies
-        except Exception as e:
-            ultimo_erro = e
-            logger.warning(
-                f"[INSTAGRAM_INFO_FALHA] usar_cookies={usar_cookies} url={url} erro={e}"
-            )
-            if not usar_cookies or not erro_instagram_permite_fallback(e):
-                raise
-
-    raise ultimo_erro or Exception("Falha ao consultar o Instagram")
-
-
-def erro_tiktok_permite_nova_tentativa(erro):
-    texto = str(erro or "").lower()
-    sinais = (
-        "unexpected response from webpage request",
-        "unable to extract challenge data",
-        "unable to solve js challenge",
-        "unable to extract universal data for rehydration",
-        "http error 403",
-        "http error 429",
-        "too many requests",
-        "timed out",
-        "timeout",
-        "temporarily unavailable",
-    )
-    return any(sinal in texto for sinal in sinais)
-
-
-def extrair_info_tiktok_com_fallback(url):
-    """Tenta página web e, em último caso, a API móvel nativa do yt-dlp."""
-    estrategias = [
-        {
-            "usar_cookies": True,
-            "total_tentativas": 2,
-            "nome": "sessao",
-            "extractor_args": None,
-        },
-        {
-            "usar_cookies": False,
-            "total_tentativas": 1,
-            "nome": "anonima",
-            "extractor_args": None,
-        },
-        {
-            "usar_cookies": True,
-            "total_tentativas": 1,
-            "nome": "mobile_api_padrao",
-            "extractor_args": montar_tiktok_extractor_args(
-                "api16-normal-c-useast1a.tiktokv.com"
-            ),
-        },
-        {
-            "usar_cookies": True,
-            "total_tentativas": 1,
-            "nome": "mobile_api_global",
-            "extractor_args": montar_tiktok_extractor_args(
-                "api22-normal-c-alisg.tiktokv.com"
-            ),
-        },
-    ]
-    ultimo_erro = None
-
-    for estrategia in estrategias:
-        usar_cookies = estrategia["usar_cookies"]
-        total_tentativas = estrategia["total_tentativas"]
-        nome_estrategia = estrategia["nome"]
-        extractor_args = estrategia["extractor_args"]
-
-        for tentativa in range(1, total_tentativas + 1):
-            try:
-                logger.info(
-                    f"[TIKTOK_INFO] estrategia={nome_estrategia} "
-                    f"tentativa={tentativa}/{total_tentativas} url={url}"
-                )
-                opts = montar_info_opts(
-                    is_tiktok=True,
-                    usar_cookies=usar_cookies,
-                    tiktok_extractor_args=extractor_args,
-                )
-                with yt_dlp.YoutubeDL(opts) as ydl:
-                    info = ydl.extract_info(url, download=False)
-                return info, usar_cookies, extractor_args
-            except Exception as e:
-                ultimo_erro = e
-                logger.warning(
-                    f"[TIKTOK_INFO_FALHA] estrategia={nome_estrategia} "
-                    f"tentativa={tentativa}/{total_tentativas} url={url} erro={e}"
-                )
-
-                # Falhas da página que não indicam bloqueio devem parar cedo.
-                # Já no fallback móvel, uma API pode rejeitar a combinação
-                # enquanto a seguinte ainda funciona, então deixa o laço
-                # avançar para o próximo endpoint.
-                if extractor_args is None and not erro_tiktok_permite_nova_tentativa(e):
-                    raise
-
-                if tentativa < total_tentativas:
-                    time.sleep(tentativa)
-
-    raise ultimo_erro or Exception("Falha ao consultar o TikTok")
 
 
 def mapear_erro_download(err_text, plataforma="geral"):
@@ -1077,24 +708,6 @@ def mapear_erro_download(err_text, plataforma="geral"):
         if "timed out" in err:
             return "❌ O Instagram demorou para responder. Tente novamente."
         return "❌ Não consegui baixar esse link do Instagram agora."
-
-    if plataforma == "tiktok":
-        if "tiktok_cookies_text_invalido" in err:
-            return "❌ Os cookies do TikTok estão em formato inválido. Use o formato Netscape e tente novamente."
-        if (
-            "unexpected response from webpage request" in err
-            or "unable to extract challenge data" in err
-            or "unable to solve js challenge" in err
-            or "unable to extract universal data for rehydration" in err
-            or "403" in err
-            or "429" in err
-        ):
-            return "❌ O TikTok bloqueou temporariamente esse acesso. Aguarde alguns instantes e tente novamente."
-        if "private" in err or "login required" in err:
-            return "❌ Esse vídeo do TikTok é privado ou exige login."
-        if "timed out" in err or "timeout" in err:
-            return "❌ O TikTok demorou para responder. Tente novamente."
-        return "❌ Não consegui baixar esse link do TikTok agora."
 
     texto_erro = "❌ Erro no link ou formato."
     if "unsupported url" in err:
@@ -1129,76 +742,6 @@ def incrementar_download_gratis(user, chat_id, from_user_id):
             parse_mode="Markdown"
         )
         mostrar_planos_chat(chat_id, from_user_id)
-
-
-def somar_downloads_gratuitos_usuarios_hoje():
-    hoje = hoje_str()
-    pipeline = [
-        {"$match": {"ultima_data": hoje}},
-        {"$group": {"_id": None, "total": {"$sum": "$downloads_hoje"}}}
-    ]
-    resultado = list(usuarios_col.aggregate(pipeline))
-    return int(resultado[0]["total"]) if resultado else 0
-
-
-def inicializar_metricas_diarias():
-    """Preserva como base os downloads gratuitos já feitos antes desta versão."""
-    try:
-        hoje = hoje_str()
-        if metricas_col.find_one({"_id": hoje}, {"_id": 1}):
-            return
-
-        gratuitos_existentes = somar_downloads_gratuitos_usuarios_hoje()
-        agora = agora_tz()
-
-        metricas_col.update_one(
-            {"_id": hoje},
-            {
-                "$setOnInsert": {
-                    "data": hoje,
-                    "downloads_total": gratuitos_existentes,
-                    "downloads_gratuitos": gratuitos_existentes,
-                    "downloads_vips": 0,
-                    "created_at": agora,
-                    "updated_at": agora,
-                }
-            },
-            upsert=True,
-        )
-
-        logger.info(
-            f"[METRICAS_INIT] data={hoje} gratuitos_base={gratuitos_existentes}"
-        )
-    except Exception as e:
-        logger.error(f"[METRICAS_INIT] erro={e}")
-
-
-def registrar_download_diario(vip_status):
-    """Registra um download concluído sem interferir no limite do usuário gratuito."""
-    try:
-        hoje = hoje_str()
-        agora = agora_tz()
-        campo_tipo = "downloads_vips" if vip_status else "downloads_gratuitos"
-
-        metricas_col.update_one(
-            {"_id": hoje},
-            {
-                "$inc": {
-                    "downloads_total": 1,
-                    campo_tipo: 1,
-                },
-                "$set": {
-                    "updated_at": agora,
-                },
-                "$setOnInsert": {
-                    "data": hoje,
-                    "created_at": agora,
-                },
-            },
-            upsert=True,
-        )
-    except Exception as e:
-        logger.error(f"[METRICAS_DOWNLOAD] vip={vip_status} erro={e}")
 
 
 def gerar_order_nsu(user_id):
@@ -1499,7 +1042,8 @@ def mostrar_planos_chat(chat_id, user_id):
     markup = types.InlineKeyboardMarkup(row_width=1)
     markup.add(
         types.InlineKeyboardButton("💳 VIP Mensal - R$ 10,00", callback_data="pay_10.00"),
-        types.InlineKeyboardButton("💳 VIP Anual - R$ 79,90", callback_data="pay_79.90")
+        types.InlineKeyboardButton("💳 VIP Anual - R$ 79,90", callback_data="pay_79.90"),
+        types.InlineKeyboardButton("💎 VIP Vitalício - R$ 297,00", callback_data="pay_297.00")
     )
 
     texto = (
@@ -1651,9 +1195,6 @@ def consultar_docs_backup(tipo):
                 }
             ).sort("created_at", -1)
         )
-        metricas_docs = list(
-            metricas_col.find({}).sort("_id", -1)
-        )
         payload = {
             "generated_at": agora_tz().isoformat(),
             "service": SERVICE_NAME,
@@ -1662,11 +1203,9 @@ def consultar_docs_backup(tipo):
             "usuarios_count": len(usuarios_docs),
             "vips_ativos_count": len(vips_docs),
             "pedidos_count": len(pedidos_docs),
-            "metricas_diarias_count": len(metricas_docs),
             "usuarios": [serializar_para_json(doc) for doc in usuarios_docs],
             "vips_ativos": [serializar_para_json(doc) for doc in vips_docs],
             "pedidos": [serializar_para_json(doc) for doc in pedidos_docs],
-            "metricas_diarias": [serializar_para_json(doc) for doc in metricas_docs],
         }
         return payload, "backup_geral", "🗂 Backup geral gerado"
 
@@ -1684,7 +1223,6 @@ def processar_backup_admin(tipo, origem_chat_id=None):
                 int(payload.get("usuarios_count", 0))
                 + int(payload.get("vips_ativos_count", 0))
                 + int(payload.get("pedidos_count", 0))
-                + int(payload.get("metricas_diarias_count", 0))
             )
         else:
             documentos = resultado
@@ -1910,10 +1448,9 @@ def painel_admin(message):
             ]
         })
 
-        metricas_hoje = metricas_col.find_one({"_id": hoje}) or {}
-        downloads_totais_hoje = int(metricas_hoje.get("downloads_total", 0) or 0)
-        downloads_gratuitos_hoje = int(metricas_hoje.get("downloads_gratuitos", 0) or 0)
-        downloads_vips_hoje = int(metricas_hoje.get("downloads_vips", 0) or 0)
+        pipeline = [{"$group": {"_id": None, "total": {"$sum": "$downloads_hoje"}}}]
+        res_downloads = list(usuarios_col.aggregate(pipeline))
+        downloads_totais_hoje = res_downloads[0]["total"] if res_downloads else 0
 
         pedidos_pendentes = pedidos_col.count_documents({"status": "pending"})
         pedidos_pagos = pedidos_col.count_documents({"status": "paid"})
@@ -1923,8 +1460,6 @@ def painel_admin(message):
             f"👥 Usuários: `{total_users}`\n"
             f"💎 VIPs: `{vips_ativos}`\n"
             f"📥 Downloads hoje: `{downloads_totais_hoje}`\n"
-            f"   ├ 👤 Gratuitos: `{downloads_gratuitos_hoje}`\n"
-            f"   └ 💎 VIPs: `{downloads_vips_hoje}`\n"
             f"🕒 Pendentes: `{pedidos_pendentes}`\n"
             f"✅ Pagos: `{pedidos_pagos}`"
         )
@@ -2168,9 +1703,6 @@ def handle_download(message):
         is_pinterest, is_tiktok, is_instagram, is_rednote = detectar_plataforma(url_lower)
         plataforma = nome_plataforma(is_pinterest, is_tiktok, is_instagram, is_rednote)
 
-        if is_instagram:
-            url = normalizar_url_instagram(url)
-
         logger.info(f"[DOWNLOAD_INICIO] user_id={message.from_user.id} plataforma={plataforma} url={url}")
 
         if not (is_pinterest or is_tiktok or is_instagram or is_rednote):
@@ -2210,8 +1742,6 @@ def handle_download(message):
                 if not enviado:
                     raise Exception("Falha ao enviar arquivo ao Telegram")
 
-                registrar_download_diario(vip_status)
-
                 if not vip_status:
                     incrementar_download_gratis(user, message.chat.id, message.from_user.id)
 
@@ -2235,19 +1765,8 @@ def handle_download(message):
 
         prefix = os.path.join(DOWNLOAD_DIR, f"v_{message.from_user.id}_{uuid.uuid4().hex}")
 
-        usar_cookies_plataforma = True
-        tiktok_extractor_args_usados = None
-        if is_instagram:
-            info, usar_cookies_plataforma = extrair_info_instagram_com_fallback(url)
-        elif is_tiktok:
-            (
-                info,
-                usar_cookies_plataforma,
-                tiktok_extractor_args_usados,
-            ) = extrair_info_tiktok_com_fallback(url)
-        else:
-            with yt_dlp.YoutubeDL(montar_info_opts()) as ydl:
-                info = ydl.extract_info(url, download=False)
+        with yt_dlp.YoutubeDL(montar_info_opts(is_instagram=is_instagram)) as ydl:
+            info = ydl.extract_info(url, download=False)
 
         duracao = info.get("duration")
         logger.info(f"[META] plataforma={plataforma} user_id={message.from_user.id} duration={duracao}")
@@ -2260,6 +1779,7 @@ def handle_download(message):
                 safe_send_message(message.chat.id, texto)
             return
 
+        common_opts = montar_download_opts(prefix, is_instagram=is_instagram)
         formatos = formatos_por_plataforma(
             is_tiktok=is_tiktok,
             is_instagram=is_instagram,
@@ -2269,50 +1789,24 @@ def handle_download(message):
         baixou = False
         ultimo_erro = None
 
-        if is_instagram:
-            modos_cookie = [usar_cookies_plataforma]
-            if usar_cookies_plataforma and INSTAGRAM_COOKIES_TEXT.strip():
-                modos_cookie.append(False)
-        elif is_tiktok:
-            modos_cookie = [usar_cookies_plataforma]
-            if usar_cookies_plataforma:
-                modos_cookie.append(False)
-        else:
-            modos_cookie = [False]
+        for fmt in formatos:
+            try:
+                cleanup_prefix(prefix)
 
-        for usar_cookies in modos_cookie:
-            common_opts = montar_download_opts(
-                prefix,
-                is_instagram=is_instagram,
-                usar_cookies=usar_cookies,
-                is_tiktok=is_tiktok,
-                tiktok_extractor_args=tiktok_extractor_args_usados,
-            )
+                opts = common_opts.copy()
+                opts["format"] = fmt
 
-            for fmt in formatos:
-                try:
-                    cleanup_prefix(prefix)
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    ydl.download([url])
 
-                    opts = common_opts.copy()
-                    opts["format"] = fmt
+                arquivo_baixado = encontrar_arquivo_baixado(prefix)
+                if arquivo_baixado and os.path.exists(arquivo_baixado):
+                    baixou = True
+                    break
 
-                    with yt_dlp.YoutubeDL(opts) as ydl:
-                        ydl.download([url])
-
-                    arquivo_baixado = encontrar_arquivo_baixado(prefix)
-                    if arquivo_baixado and os.path.exists(arquivo_baixado):
-                        baixou = True
-                        break
-
-                except Exception as e:
-                    ultimo_erro = str(e)
-                    logger.warning(
-                        f"[DOWNLOAD_TENTATIVA] plataforma={plataforma} "
-                        f"usar_cookies={usar_cookies} formato={fmt} url={url} erro={e}"
-                    )
-
-            if baixou:
-                break
+            except Exception as e:
+                ultimo_erro = str(e)
+                logger.warning(f"[DOWNLOAD_TENTATIVA] plataforma={plataforma} formato={fmt} url={url} erro={e}")
 
         if not baixou:
             raise Exception(ultimo_erro or "Falha ao baixar dentro do limite 720x1280 30fps")
@@ -2328,8 +1822,6 @@ def handle_download(message):
         if not enviado:
             raise Exception("Falha ao enviar arquivo ao Telegram")
 
-        registrar_download_diario(vip_status)
-
         if not vip_status:
             incrementar_download_gratis(user, message.chat.id, message.from_user.id)
 
@@ -2338,14 +1830,7 @@ def handle_download(message):
 
     except Exception as e:
         logger.error(f"[ERRO_DOWNLOAD] user_id={message.from_user.id} url={url} erro={e}")
-        url_erro = (url or "").lower()
-        if "instagram.com" in url_erro or "instagr.am" in url_erro:
-            plataforma_erro = "instagram"
-        elif "tiktok.com" in url_erro:
-            plataforma_erro = "tiktok"
-        else:
-            plataforma_erro = "geral"
-        texto_erro = mapear_erro_download(str(e), plataforma=plataforma_erro)
+        texto_erro = mapear_erro_download(str(e), plataforma=("instagram" if "instagram.com" in url.lower() else "geral"))
 
         if status_msg:
             safe_edit_message(message.chat.id, status_msg.message_id, texto_erro)
@@ -2588,8 +2073,6 @@ def health():
 # MAIN
 # =========================================
 if __name__ == "__main__":
-    logger.info(f"[YT_DLP] versao={YT_DLP_VERSION}")
-    inicializar_metricas_diarias()
     cleanup_download_dir_old_files(max_age_hours=6)
 
     Thread(
