@@ -93,6 +93,7 @@ client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
 db = client[MONGO_DB_NAME]
 usuarios_col = db["usuarios"]
 pedidos_col = db["pedidos"]
+metricas_col = db["metricas_diarias"]
 
 try:
     usuarios_col.create_index("vip_ate")
@@ -801,6 +802,76 @@ def incrementar_download_gratis(user, chat_id, from_user_id):
         mostrar_planos_chat(chat_id, from_user_id)
 
 
+def somar_downloads_gratuitos_usuarios_hoje():
+    hoje = hoje_str()
+    pipeline = [
+        {"$match": {"ultima_data": hoje}},
+        {"$group": {"_id": None, "total": {"$sum": "$downloads_hoje"}}}
+    ]
+    resultado = list(usuarios_col.aggregate(pipeline))
+    return int(resultado[0]["total"]) if resultado else 0
+
+
+def inicializar_metricas_diarias():
+    """Preserva como base os downloads gratuitos já feitos antes desta versão."""
+    try:
+        hoje = hoje_str()
+        if metricas_col.find_one({"_id": hoje}, {"_id": 1}):
+            return
+
+        gratuitos_existentes = somar_downloads_gratuitos_usuarios_hoje()
+        agora = agora_tz()
+
+        metricas_col.update_one(
+            {"_id": hoje},
+            {
+                "$setOnInsert": {
+                    "data": hoje,
+                    "downloads_total": gratuitos_existentes,
+                    "downloads_gratuitos": gratuitos_existentes,
+                    "downloads_vips": 0,
+                    "created_at": agora,
+                    "updated_at": agora,
+                }
+            },
+            upsert=True,
+        )
+
+        logger.info(
+            f"[METRICAS_INIT] data={hoje} gratuitos_base={gratuitos_existentes}"
+        )
+    except Exception as e:
+        logger.error(f"[METRICAS_INIT] erro={e}")
+
+
+def registrar_download_diario(vip_status):
+    """Registra um download concluído sem interferir no limite do usuário gratuito."""
+    try:
+        hoje = hoje_str()
+        agora = agora_tz()
+        campo_tipo = "downloads_vips" if vip_status else "downloads_gratuitos"
+
+        metricas_col.update_one(
+            {"_id": hoje},
+            {
+                "$inc": {
+                    "downloads_total": 1,
+                    campo_tipo: 1,
+                },
+                "$set": {
+                    "updated_at": agora,
+                },
+                "$setOnInsert": {
+                    "data": hoje,
+                    "created_at": agora,
+                },
+            },
+            upsert=True,
+        )
+    except Exception as e:
+        logger.error(f"[METRICAS_DOWNLOAD] vip={vip_status} erro={e}")
+
+
 def gerar_order_nsu(user_id):
     return f"{user_id}_{int(time.time())}_{uuid.uuid4().hex[:10]}"
 
@@ -1251,6 +1322,9 @@ def consultar_docs_backup(tipo):
                 }
             ).sort("created_at", -1)
         )
+        metricas_docs = list(
+            metricas_col.find({}).sort("_id", -1)
+        )
         payload = {
             "generated_at": agora_tz().isoformat(),
             "service": SERVICE_NAME,
@@ -1259,9 +1333,11 @@ def consultar_docs_backup(tipo):
             "usuarios_count": len(usuarios_docs),
             "vips_ativos_count": len(vips_docs),
             "pedidos_count": len(pedidos_docs),
+            "metricas_diarias_count": len(metricas_docs),
             "usuarios": [serializar_para_json(doc) for doc in usuarios_docs],
             "vips_ativos": [serializar_para_json(doc) for doc in vips_docs],
             "pedidos": [serializar_para_json(doc) for doc in pedidos_docs],
+            "metricas_diarias": [serializar_para_json(doc) for doc in metricas_docs],
         }
         return payload, "backup_geral", "🗂 Backup geral gerado"
 
@@ -1279,6 +1355,7 @@ def processar_backup_admin(tipo, origem_chat_id=None):
                 int(payload.get("usuarios_count", 0))
                 + int(payload.get("vips_ativos_count", 0))
                 + int(payload.get("pedidos_count", 0))
+                + int(payload.get("metricas_diarias_count", 0))
             )
         else:
             documentos = resultado
@@ -1504,12 +1581,10 @@ def painel_admin(message):
             ]
         })
 
-        pipeline = [
-            {"$match": {"ultima_data": hoje}},
-            {"$group": {"_id": None, "total": {"$sum": "$downloads_hoje"}}}
-        ]
-        res_downloads = list(usuarios_col.aggregate(pipeline))
-        downloads_totais_hoje = res_downloads[0]["total"] if res_downloads else 0
+        metricas_hoje = metricas_col.find_one({"_id": hoje}) or {}
+        downloads_totais_hoje = int(metricas_hoje.get("downloads_total", 0) or 0)
+        downloads_gratuitos_hoje = int(metricas_hoje.get("downloads_gratuitos", 0) or 0)
+        downloads_vips_hoje = int(metricas_hoje.get("downloads_vips", 0) or 0)
 
         pedidos_pendentes = pedidos_col.count_documents({"status": "pending"})
         pedidos_pagos = pedidos_col.count_documents({"status": "paid"})
@@ -1519,6 +1594,8 @@ def painel_admin(message):
             f"👥 Usuários: `{total_users}`\n"
             f"💎 VIPs: `{vips_ativos}`\n"
             f"📥 Downloads hoje: `{downloads_totais_hoje}`\n"
+            f"   ├ 👤 Gratuitos: `{downloads_gratuitos_hoje}`\n"
+            f"   └ 💎 VIPs: `{downloads_vips_hoje}`\n"
             f"🕒 Pendentes: `{pedidos_pendentes}`\n"
             f"✅ Pagos: `{pedidos_pagos}`"
         )
@@ -1804,6 +1881,8 @@ def handle_download(message):
                 if not enviado:
                     raise Exception("Falha ao enviar arquivo ao Telegram")
 
+                registrar_download_diario(vip_status)
+
                 if not vip_status:
                     incrementar_download_gratis(user, message.chat.id, message.from_user.id)
 
@@ -1903,6 +1982,8 @@ def handle_download(message):
         enviado = enviar_arquivo_com_fallback(message.chat.id, arquivo_envio)
         if not enviado:
             raise Exception("Falha ao enviar arquivo ao Telegram")
+
+        registrar_download_diario(vip_status)
 
         if not vip_status:
             incrementar_download_gratis(user, message.chat.id, message.from_user.id)
@@ -2155,6 +2236,7 @@ def health():
 # MAIN
 # =========================================
 if __name__ == "__main__":
+    inicializar_metricas_diarias()
     cleanup_download_dir_old_files(max_age_hours=6)
 
     Thread(
