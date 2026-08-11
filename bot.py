@@ -3,6 +3,7 @@ import re
 import glob
 import uuid
 import time
+import copy
 import logging
 from threading import Lock, Thread
 from datetime import datetime, timedelta
@@ -14,6 +15,14 @@ import yt_dlp
 import subprocess
 import json
 from yt_dlp.version import __version__ as YT_DLP_VERSION
+
+try:
+    import curl_cffi
+    CURL_CFFI_VERSION = getattr(curl_cffi, "__version__", "instalado")
+    TIKTOK_IMPERSONATION_DISPONIVEL = True
+except ImportError:
+    CURL_CFFI_VERSION = None
+    TIKTOK_IMPERSONATION_DISPONIVEL = False
 
 from flask import Flask, request, jsonify
 from telebot import types
@@ -832,15 +841,15 @@ def get_tiktok_device_id():
 
 
 def montar_tiktok_extractor_args(api_hostname):
-    """Ativa o fallback pela API móvel nativa disponível no yt-dlp."""
+    """Ativa a API móvel sem fixar versões internas que mudam no TikTok.
+
+    O yt-dlp mantém os valores compatíveis de app, versão e aid. Fixá-los aqui
+    faz o bot quebrar quando o TikTok ou o extrator são atualizados.
+    """
     return {
         "tiktok": {
             "device_id": [get_tiktok_device_id()],
             "api_hostname": [api_hostname],
-            "app_name": ["musical_ly"],
-            "app_version": ["35.1.3"],
-            "manifest_app_version": ["2023501030"],
-            "aid": ["1233"],
         }
     }
 
@@ -974,22 +983,35 @@ def erro_tiktok_permite_nova_tentativa(erro):
         "timed out",
         "timeout",
         "temporarily unavailable",
+        "unable to extract aweme detail info",
+        "no working app info is available",
+        "failed to parse json",
+        "no video formats found",
+        "login required",
+        "requiring login",
     )
     return any(sinal in texto for sinal in sinais)
 
 
 def extrair_info_tiktok_com_fallback(url):
     """Tenta página web e, em último caso, a API móvel nativa do yt-dlp."""
-    estrategias = [
-        {
+    estrategias = []
+
+    # Cookies vencidos podem falhar enquanto o mesmo vídeo público funciona
+    # anonimamente. Só faz a tentativa autenticada quando cookies foram
+    # realmente configurados.
+    if TIKTOK_COOKIES_TEXT.strip():
+        estrategias.append({
             "usar_cookies": True,
             "total_tentativas": 2,
             "nome": "sessao",
             "extractor_args": None,
-        },
+        })
+
+    estrategias.extend([
         {
             "usar_cookies": False,
-            "total_tentativas": 1,
+            "total_tentativas": 2,
             "nome": "anonima",
             "extractor_args": None,
         },
@@ -1009,7 +1031,7 @@ def extrair_info_tiktok_com_fallback(url):
                 "api22-normal-c-alisg.tiktokv.com"
             ),
         },
-    ]
+    ])
     ultimo_erro = None
 
     for estrategia in estrategias:
@@ -1039,17 +1061,24 @@ def extrair_info_tiktok_com_fallback(url):
                     f"tentativa={tentativa}/{total_tentativas} url={url} erro={e}"
                 )
 
-                # Falhas da página que não indicam bloqueio devem parar cedo.
-                # Já no fallback móvel, uma API pode rejeitar a combinação
-                # enquanto a seguinte ainda funciona, então deixa o laço
-                # avançar para o próximo endpoint.
-                if extractor_args is None and not erro_tiktok_permite_nova_tentativa(e):
-                    raise
-
                 if tentativa < total_tentativas:
-                    time.sleep(tentativa)
+                    # Retenta rapidamente bloqueios transitórios. Para erros
+                    # definitivos, ainda avança às demais estratégias em vez
+                    # de impedir o fallback anônimo/móvel.
+                    if erro_tiktok_permite_nova_tentativa(e):
+                        time.sleep(tentativa)
 
     raise ultimo_erro or Exception("Falha ao consultar o TikTok")
+
+
+def baixar_info_tiktok_ja_extraida(info, opts):
+    """Baixa usando os formatos já consultados, sem abrir a página novamente.
+
+    Reextrair o link em cada formato multiplicava as requisições ao TikTok e
+    frequentemente acionava o desafio/HTTP 429 entre a leitura e o download.
+    """
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        return ydl.process_ie_result(copy.deepcopy(info), download=True)
 
 
 def mapear_erro_download(err_text, plataforma="geral"):
@@ -1081,6 +1110,8 @@ def mapear_erro_download(err_text, plataforma="geral"):
     if plataforma == "tiktok":
         if "tiktok_cookies_text_invalido" in err:
             return "❌ Os cookies do TikTok estão em formato inválido. Use o formato Netscape e tente novamente."
+        if "impersonat" in err or "curl_cffi" in err or "curl-cffi" in err:
+            return "❌ O servidor está sem o suporte de navegador exigido pelo TikTok. Instale yt-dlp[default,curl-cffi] e faça um novo deploy."
         if (
             "unexpected response from webpage request" in err
             or "unable to extract challenge data" in err
@@ -2333,8 +2364,13 @@ def handle_download(message):
                     opts = common_opts.copy()
                     opts["format"] = fmt
 
-                    with yt_dlp.YoutubeDL(opts) as ydl:
-                        ydl.download([url])
+                    if is_tiktok:
+                        # O info bruto já contém as URLs dos formatos. Reusá-lo
+                        # evita uma nova extração e reduz bloqueios do TikTok.
+                        baixar_info_tiktok_ja_extraida(info, opts)
+                    else:
+                        with yt_dlp.YoutubeDL(opts) as ydl:
+                            ydl.download([url])
 
                     arquivo_baixado = encontrar_arquivo_baixado(prefix)
                     if arquivo_baixado and os.path.exists(arquivo_baixado):
@@ -2617,7 +2653,10 @@ def health():
         "environment": ENVIRONMENT_NAME,
         "started_at": APP_STARTED_AT,
         "bot": "running",
-        "flask": "running"
+        "flask": "running",
+        "yt_dlp_version": YT_DLP_VERSION,
+        "tiktok_impersonation": TIKTOK_IMPERSONATION_DISPONIVEL,
+        "curl_cffi_version": CURL_CFFI_VERSION,
     }), 200
 
 
@@ -2626,6 +2665,13 @@ def health():
 # =========================================
 if __name__ == "__main__":
     logger.info(f"[YT_DLP] versao={YT_DLP_VERSION}")
+    if TIKTOK_IMPERSONATION_DISPONIVEL:
+        logger.info(f"[TIKTOK_DEPENDENCIAS] curl_cffi={CURL_CFFI_VERSION}")
+    else:
+        logger.warning(
+            "[TIKTOK_DEPENDENCIAS] curl_cffi ausente. No requirements.txt, "
+            "use yt-dlp[default,curl-cffi] para habilitar a impersonacao."
+        )
     inicializar_metricas_diarias()
     cleanup_download_dir_old_files(max_age_hours=6)
 
