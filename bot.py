@@ -13,6 +13,7 @@ import telebot
 import yt_dlp
 import subprocess
 import json
+from yt_dlp.version import __version__ as YT_DLP_VERSION
 
 from flask import Flask, request, jsonify
 from telebot import types
@@ -74,6 +75,7 @@ FREE_DAILY_LIMIT = 3
 MAX_DURATION_SECONDS = 90
 
 INSTAGRAM_COOKIES_TEXT = os.environ.get("INSTAGRAM_COOKIES_TEXT", "")
+TIKTOK_COOKIES_TEXT = os.environ.get("TIKTOK_COOKIES_TEXT", "")
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
@@ -656,13 +658,48 @@ def get_instagram_cookiefile():
     return cookie_path
 
 
-def montar_info_opts(is_instagram=False, is_pinterest=False, usar_cookies=True):
+def get_tiktok_cookiefile():
+    """Mantém uma sessão do TikTok entre tentativas e aceita cookies opcionais."""
+    cookie_path = os.path.join(DOWNLOAD_DIR, "tiktok_cookies.txt")
+
+    # Não sobrescreve o arquivo existente: o yt-dlp pode ter atualizado a sessão.
+    if os.path.exists(cookie_path) and os.path.getsize(cookie_path) > 0:
+        return cookie_path
+
+    texto = (TIKTOK_COOKIES_TEXT or "").strip()
+    if texto:
+        if "\n" not in texto and "\\n" in texto:
+            texto = texto.replace("\\r\\n", "\n").replace("\\n", "\n")
+        texto = texto.replace("\r\n", "\n").replace("\r", "\n").strip()
+
+    if not texto:
+        texto = "# Netscape HTTP Cookie File"
+    elif not texto.startswith("# Netscape HTTP Cookie File") and not texto.startswith("# HTTP Cookie File"):
+        texto = "# Netscape HTTP Cookie File\n" + texto
+
+    with open(cookie_path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(texto + "\n")
+
+    linhas = [linha for linha in texto.splitlines() if linha and not linha.startswith("#")]
+    logger.info(
+        f"[TIKTOK_COOKIES] arquivo_criado=True cookies_fornecidos={bool(linhas)}"
+    )
+    return cookie_path
+
+
+def montar_info_opts(
+    is_instagram=False,
+    is_pinterest=False,
+    usar_cookies=True,
+    is_tiktok=False,
+):
     opts = {
         "quiet": True,
         "nocheckcertificate": True,
         "noplaylist": True,
         "socket_timeout": 20,
-        "retries": 2
+        "retries": 3,
+        "extractor_retries": 3,
     }
 
     if is_instagram:
@@ -674,11 +711,23 @@ def montar_info_opts(is_instagram=False, is_pinterest=False, usar_cookies=True):
                 opts["cookiefile"] = cookiefile
     elif is_pinterest:
         opts["http_headers"] = PINTEREST_HEADERS
+    elif is_tiktok:
+        # O extrator do TikTok já solicita impersonação via curl-cffi.
+        # Uma pequena pausa reduz falhas intermitentes do desafio da página.
+        opts["sleep_interval_requests"] = 1
+        if usar_cookies:
+            opts["cookiefile"] = get_tiktok_cookiefile()
 
     return opts
 
 
-def montar_download_opts(prefix, is_instagram=False, is_pinterest=False, usar_cookies=True):
+def montar_download_opts(
+    prefix,
+    is_instagram=False,
+    is_pinterest=False,
+    usar_cookies=True,
+    is_tiktok=False,
+):
     opts = {
         "outtmpl": f"{prefix}.%(ext)s",
         "nocheckcertificate": True,
@@ -699,6 +748,13 @@ def montar_download_opts(prefix, is_instagram=False, is_pinterest=False, usar_co
                 opts["cookiefile"] = cookiefile
     elif is_pinterest:
         opts["http_headers"] = PINTEREST_HEADERS
+    elif is_tiktok:
+        # Evita sobrescrever os cabeçalhos definidos pelo próprio extrator.
+        opts.pop("http_headers", None)
+        opts["extractor_retries"] = 3
+        opts["sleep_interval_requests"] = 1
+        if usar_cookies:
+            opts["cookiefile"] = get_tiktok_cookiefile()
 
     return opts
 
@@ -741,6 +797,61 @@ def extrair_info_instagram_com_fallback(url):
     raise ultimo_erro or Exception("Falha ao consultar o Instagram")
 
 
+def erro_tiktok_permite_nova_tentativa(erro):
+    texto = str(erro or "").lower()
+    sinais = (
+        "unexpected response from webpage request",
+        "unable to extract challenge data",
+        "unable to solve js challenge",
+        "unable to extract universal data for rehydration",
+        "http error 403",
+        "http error 429",
+        "too many requests",
+        "timed out",
+        "timeout",
+        "temporarily unavailable",
+    )
+    return any(sinal in texto for sinal in sinais)
+
+
+def extrair_info_tiktok_com_fallback(url):
+    """Tenta com sessão persistente e depois com uma sessão anônima limpa."""
+    estrategias = [
+        (True, 2, "sessao"),
+        (False, 1, "anonima"),
+    ]
+    ultimo_erro = None
+
+    for usar_cookies, total_tentativas, nome_estrategia in estrategias:
+        for tentativa in range(1, total_tentativas + 1):
+            try:
+                logger.info(
+                    f"[TIKTOK_INFO] estrategia={nome_estrategia} "
+                    f"tentativa={tentativa}/{total_tentativas} url={url}"
+                )
+                opts = montar_info_opts(
+                    is_tiktok=True,
+                    usar_cookies=usar_cookies,
+                )
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(url, download=False)
+                return info, usar_cookies
+            except Exception as e:
+                ultimo_erro = e
+                logger.warning(
+                    f"[TIKTOK_INFO_FALHA] estrategia={nome_estrategia} "
+                    f"tentativa={tentativa}/{total_tentativas} url={url} erro={e}"
+                )
+
+                if not erro_tiktok_permite_nova_tentativa(e):
+                    raise
+
+                if tentativa < total_tentativas:
+                    time.sleep(tentativa)
+
+    raise ultimo_erro or Exception("Falha ao consultar o TikTok")
+
+
 def mapear_erro_download(err_text, plataforma="geral"):
     err = (err_text or "").lower()
 
@@ -766,6 +877,22 @@ def mapear_erro_download(err_text, plataforma="geral"):
         if "timed out" in err:
             return "❌ O Instagram demorou para responder. Tente novamente."
         return "❌ Não consegui baixar esse link do Instagram agora."
+
+    if plataforma == "tiktok":
+        if (
+            "unexpected response from webpage request" in err
+            or "unable to extract challenge data" in err
+            or "unable to solve js challenge" in err
+            or "unable to extract universal data for rehydration" in err
+            or "403" in err
+            or "429" in err
+        ):
+            return "❌ O TikTok bloqueou temporariamente esse acesso. Aguarde alguns instantes e tente novamente."
+        if "private" in err or "login required" in err:
+            return "❌ Esse vídeo do TikTok é privado ou exige login."
+        if "timed out" in err or "timeout" in err:
+            return "❌ O TikTok demorou para responder. Tente novamente."
+        return "❌ Não consegui baixar esse link do TikTok agora."
 
     texto_erro = "❌ Erro no link ou formato."
     if "unsupported url" in err:
@@ -1906,9 +2033,11 @@ def handle_download(message):
 
         prefix = os.path.join(DOWNLOAD_DIR, f"v_{message.from_user.id}_{uuid.uuid4().hex}")
 
-        usar_cookies_instagram = True
+        usar_cookies_plataforma = True
         if is_instagram:
-            info, usar_cookies_instagram = extrair_info_instagram_com_fallback(url)
+            info, usar_cookies_plataforma = extrair_info_instagram_com_fallback(url)
+        elif is_tiktok:
+            info, usar_cookies_plataforma = extrair_info_tiktok_com_fallback(url)
         else:
             with yt_dlp.YoutubeDL(montar_info_opts()) as ydl:
                 info = ydl.extract_info(url, download=False)
@@ -1933,15 +2062,23 @@ def handle_download(message):
         baixou = False
         ultimo_erro = None
 
-        modos_cookie = [usar_cookies_instagram] if is_instagram else [False]
-        if is_instagram and usar_cookies_instagram and INSTAGRAM_COOKIES_TEXT.strip():
-            modos_cookie.append(False)
+        if is_instagram:
+            modos_cookie = [usar_cookies_plataforma]
+            if usar_cookies_plataforma and INSTAGRAM_COOKIES_TEXT.strip():
+                modos_cookie.append(False)
+        elif is_tiktok:
+            modos_cookie = [usar_cookies_plataforma]
+            if usar_cookies_plataforma:
+                modos_cookie.append(False)
+        else:
+            modos_cookie = [False]
 
         for usar_cookies in modos_cookie:
             common_opts = montar_download_opts(
                 prefix,
                 is_instagram=is_instagram,
                 usar_cookies=usar_cookies,
+                is_tiktok=is_tiktok,
             )
 
             for fmt in formatos:
@@ -1993,7 +2130,14 @@ def handle_download(message):
 
     except Exception as e:
         logger.error(f"[ERRO_DOWNLOAD] user_id={message.from_user.id} url={url} erro={e}")
-        texto_erro = mapear_erro_download(str(e), plataforma=("instagram" if "instagram.com" in url.lower() else "geral"))
+        url_erro = (url or "").lower()
+        if "instagram.com" in url_erro or "instagr.am" in url_erro:
+            plataforma_erro = "instagram"
+        elif "tiktok.com" in url_erro:
+            plataforma_erro = "tiktok"
+        else:
+            plataforma_erro = "geral"
+        texto_erro = mapear_erro_download(str(e), plataforma=plataforma_erro)
 
         if status_msg:
             safe_edit_message(message.chat.id, status_msg.message_id, texto_erro)
@@ -2236,6 +2380,7 @@ def health():
 # MAIN
 # =========================================
 if __name__ == "__main__":
+    logger.info(f"[YT_DLP] versao={YT_DLP_VERSION}")
     inicializar_metricas_diarias()
     cleanup_download_dir_old_files(max_age_hours=6)
 
