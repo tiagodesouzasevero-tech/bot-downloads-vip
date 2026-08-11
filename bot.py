@@ -4,6 +4,7 @@ import glob
 import uuid
 import time
 import copy
+import html
 import logging
 from threading import Lock, Thread
 from datetime import datetime, timedelta
@@ -18,9 +19,11 @@ from yt_dlp.version import __version__ as YT_DLP_VERSION
 
 try:
     import curl_cffi
+    from curl_cffi import requests as curl_requests
     CURL_CFFI_VERSION = getattr(curl_cffi, "__version__", "instalado")
     TIKTOK_IMPERSONATION_DISPONIVEL = True
 except ImportError:
+    curl_requests = None
     CURL_CFFI_VERSION = None
     TIKTOK_IMPERSONATION_DISPONIVEL = False
 
@@ -854,6 +857,115 @@ def montar_tiktok_extractor_args(api_hostname):
     }
 
 
+def fazer_requisicao_tiktok(url, **kwargs):
+    """Faz uma requisição com a mesma impressão TLS de um navegador real."""
+    timeout = kwargs.pop("timeout", 25)
+    headers = {
+        "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+        **kwargs.pop("headers", {}),
+    }
+
+    if curl_requests is not None:
+        return curl_requests.get(
+            url,
+            impersonate="chrome",
+            timeout=timeout,
+            headers=headers,
+            **kwargs,
+        )
+
+    return requests.get(
+        url,
+        timeout=timeout,
+        headers={**DEFAULT_HEADERS, **headers},
+        **kwargs,
+    )
+
+
+def extrair_tiktok_video_id(url):
+    """Obtém o ID numérico tanto de URLs completas quanto de vt/vm.tiktok."""
+    padrao = r"(?:/video/|/v/)(\d{15,22})(?:[/?#]|$)"
+    match = re.search(padrao, url or "", flags=re.IGNORECASE)
+    if match:
+        return match.group(1)
+
+    resposta = fazer_requisicao_tiktok(url, allow_redirects=True)
+    resposta.raise_for_status()
+
+    for candidato in (str(resposta.url), resposta.text):
+        match = re.search(padrao, candidato or "", flags=re.IGNORECASE)
+        if match:
+            return match.group(1)
+
+    raise RuntimeError("TIKTOK_EMBED_ID_NAO_ENCONTRADO")
+
+
+def extrair_info_tiktok_embed(url):
+    """Extrai o MP4 pelo endpoint público de incorporação do TikTok.
+
+    Este caminho é independente do JSON da página principal que, em mudanças
+    recentes do TikTok, pode não ser reconhecido pelo extrator do yt-dlp.
+    """
+    video_id = extrair_tiktok_video_id(url)
+    embed_url = f"https://www.tiktok.com/embed/v2/{video_id}"
+    resposta = fazer_requisicao_tiktok(embed_url)
+    resposta.raise_for_status()
+
+    match = re.search(
+        r'<script[^>]+id=["\']__FRONTITY_CONNECT_STATE__["\'][^>]*>(.*?)</script>',
+        resposta.text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if not match:
+        raise RuntimeError("TIKTOK_EMBED_DADOS_NAO_ENCONTRADOS")
+
+    estado = json.loads(html.unescape(match.group(1)))
+    dados_source = estado.get("source", {}).get("data", {})
+    bloco = dados_source.get(f"/embed/v2/{video_id}", {})
+    video_data = bloco.get("videoData", {})
+
+    # Protege contra pequenas mudanças no nome da chave da rota.
+    if not video_data:
+        for valor in dados_source.values():
+            if isinstance(valor, dict) and isinstance(valor.get("videoData"), dict):
+                video_data = valor["videoData"]
+                break
+
+    item = video_data.get("itemInfos", {})
+    video = item.get("video", {})
+    video_meta = video.get("videoMeta", {})
+    urls = [u for u in video.get("urls", []) if isinstance(u, str) and u.startswith("http")]
+    if not urls:
+        raise RuntimeError("TIKTOK_EMBED_URL_MP4_NAO_ENCONTRADA")
+
+    logger.info(
+        f"[TIKTOK_EMBED_OK] video_id={video_id} "
+        f"duration={video_meta.get('duration')} "
+        f"resolucao={video_meta.get('width')}x{video_meta.get('height')}"
+    )
+    return {
+        "id": video_id,
+        "title": item.get("text") or f"TikTok {video_id}",
+        "duration": video_meta.get("duration"),
+        "webpage_url": url,
+        "extractor": "TikTokEmbedFallback",
+        "extractor_key": "TikTokEmbedFallback",
+        "formats": [
+            {
+                "format_id": "tiktok_embed_mp4",
+                "url": urls[0],
+                "ext": "mp4",
+                "width": video_meta.get("width"),
+                "height": video_meta.get("height"),
+                "http_headers": {
+                    "Referer": embed_url,
+                    "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+                },
+            }
+        ],
+    }
+
+
 def montar_info_opts(
     is_instagram=False,
     is_pinterest=False,
@@ -994,7 +1106,13 @@ def erro_tiktok_permite_nova_tentativa(erro):
 
 
 def extrair_info_tiktok_com_fallback(url):
-    """Tenta página web e, em último caso, a API móvel nativa do yt-dlp."""
+    """Tenta o embed público e mantém o yt-dlp como fallback."""
+    try:
+        logger.info(f"[TIKTOK_INFO] estrategia=embed_publico url={url}")
+        return extrair_info_tiktok_embed(url), False, None
+    except Exception as e:
+        logger.warning(f"[TIKTOK_EMBED_FALHA] url={url} erro={e}")
+
     estrategias = []
 
     # Cookies vencidos podem falhar enquanto o mesmo vídeo público funciona
