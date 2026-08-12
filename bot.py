@@ -10,6 +10,7 @@ import ipaddress
 import itertools
 import logging
 import socket
+import shutil
 from collections import defaultdict, deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from queue import Full, PriorityQueue
@@ -133,6 +134,15 @@ TIKWM_CIRCUIT_FAILURES = get_env_int("TIKWM_CIRCUIT_FAILURES", 3, 1, 10)
 TIKWM_CIRCUIT_COOLDOWN_SECONDS = get_env_int(
     "TIKWM_CIRCUIT_COOLDOWN_SECONDS", 300, 30, 1800
 )
+MONITOR_FAILURE_THRESHOLD = get_env_int(
+    "MONITOR_FAILURE_THRESHOLD", 3, 2, 10
+)
+MONITOR_FAILURE_WINDOW_SECONDS = get_env_int(
+    "MONITOR_FAILURE_WINDOW_SECONDS", 900, 60, 3600
+)
+MONITOR_ALERT_COOLDOWN_SECONDS = get_env_int(
+    "MONITOR_ALERT_COOLDOWN_SECONDS", 3600, 300, 86400
+)
 MEDIA_PROFILE_VERSION = (
     f"720x1280_30fps_h264_crf{VIDEO_CRF}_audio{AUDIO_BITRATE}_sem_marca_v2"
 )
@@ -147,6 +157,7 @@ TIKTOK_COOKIES_ENV_APLICADOS = False
 TIKTOK_DEVICE_LOCK = Lock()
 AVISO_GERAL_LOCK = Lock()
 BACKUP_ADMIN_LOCK = Lock()
+DIAGNOSTIC_ADMIN_LOCK = Lock()
 DOWNLOAD_RATE_LOCK = Lock()
 DOWNLOAD_RATE_EVENTS = defaultdict(deque)
 DOWNLOAD_GLOBAL_EVENTS = deque()
@@ -161,6 +172,19 @@ TIKWM_CIRCUIT_STATE = {"failures": 0, "open_until": 0.0}
 BOT_STATE_LOCK = Lock()
 BOT_STATE = "starting"
 BOT_LAST_UPDATE_AT = None
+DOWNLOAD_WORKER_STATE_LOCK = Lock()
+DOWNLOAD_WORKER_RUNNING = False
+PLATFORM_MONITOR_LOCK = Lock()
+PLATFORM_MONITOR_STATE = {
+    plataforma: {
+        "failures": deque(),
+        "alert_active": False,
+        "last_alert_at": 0.0,
+        "last_error": None,
+        "last_success_at": None,
+    }
+    for plataforma in ("TikTok", "Instagram", "Pinterest", "RedNote")
+}
 
 ARQUIVOS_PERSISTENTES_DOWNLOAD_DIR = {
     "instagram_cookies.txt",
@@ -960,6 +984,164 @@ def safe_answer_callback(call_id, **kwargs):
         bot.answer_callback_query(call_id, **kwargs)
     except Exception as e:
         logger.warning(f"[CALLBACK_ANSWER] erro={e}")
+
+
+def normalizar_plataforma_monitoramento(plataforma):
+    mapa = {
+        "tiktok": "TikTok",
+        "instagram": "Instagram",
+        "pinterest": "Pinterest",
+        "rednote": "RedNote",
+    }
+    return mapa.get(str(plataforma or "").strip().lower())
+
+
+def falha_tecnica_monitoravel(erro):
+    """Separa falhas do serviço de limitações próprias do conteúdo enviado."""
+    texto = str(erro or "").lower()
+    marcadores_conteudo = (
+        "video_muito_longo",
+        "vídeo muito longo",
+        "arquivo_midia_muito_grande",
+        "arquivo muito grande",
+        "private video",
+        "this video is private",
+        "vídeo privado",
+        "video unavailable",
+        "video is currently unavailable",
+        "vídeo indisponível",
+        "no longer available",
+        "content is unavailable",
+        "has been deleted",
+        "removed by the uploader",
+        "account is private",
+        "pin not found",
+        "http error 404",
+        "not available in your country",
+        "geo-restricted",
+        "age-restricted",
+        "unsupported url",
+        "link não reconhecido",
+        "conteúdo não encontrado",
+        "content isn't available",
+        "post isn't available",
+        "redirecionamento_fora_da_plataforma",
+    )
+    return bool(texto) and not any(
+        marcador in texto for marcador in marcadores_conteudo
+    )
+
+
+def registrar_falha_plataforma(plataforma, erro):
+    """Alerta o administrador apenas após falhas técnicas repetidas."""
+    plataforma = normalizar_plataforma_monitoramento(plataforma)
+    if not plataforma or not falha_tecnica_monitoravel(erro):
+        return False
+
+    agora_monotonic = time.monotonic()
+    inicio_janela = agora_monotonic - MONITOR_FAILURE_WINDOW_SECONDS
+    erro_limpo = sanitizar_erro_log(erro, limite=500)
+    deve_alertar = False
+    total_falhas = 0
+
+    with PLATFORM_MONITOR_LOCK:
+        estado = PLATFORM_MONITOR_STATE[plataforma]
+        falhas = estado["failures"]
+        while falhas and falhas[0] < inicio_janela:
+            falhas.popleft()
+        falhas.append(agora_monotonic)
+        estado["last_error"] = erro_limpo
+        total_falhas = len(falhas)
+
+        cooldown_cumprido = (
+            agora_monotonic - float(estado.get("last_alert_at") or 0.0)
+            >= MONITOR_ALERT_COOLDOWN_SECONDS
+        )
+        if total_falhas >= MONITOR_FAILURE_THRESHOLD and (
+            not estado["alert_active"] or cooldown_cumprido
+        ):
+            estado["alert_active"] = True
+            estado["last_alert_at"] = agora_monotonic
+            deve_alertar = True
+
+    logger.warning(
+        f"[MONITOR_FALHA] plataforma={plataforma} "
+        f"falhas_janela={total_falhas} alerta={deve_alertar} erro={erro_limpo}"
+    )
+
+    if deve_alertar:
+        janela_minutos = max(1, MONITOR_FAILURE_WINDOW_SECONDS // 60)
+        safe_send_message(
+            ADMIN_ID,
+            "⚠️ <b>Alerta automático de funcionamento</b>\n\n"
+            f"Plataforma: <b>{html.escape(plataforma)}</b>\n"
+            f"Falhas técnicas: <b>{total_falhas}</b> nos últimos "
+            f"{janela_minutos} minutos\n"
+            f"Última falha: <code>{html.escape(erro_limpo)}</code>\n\n"
+            "O bot continuará tentando normalmente. Você será avisado quando "
+            "um download real voltar a funcionar.",
+            parse_mode="HTML",
+        )
+    return deve_alertar
+
+
+def registrar_sucesso_plataforma(plataforma):
+    """Limpa as falhas e avisa quando um serviço em alerta se recupera."""
+    plataforma = normalizar_plataforma_monitoramento(plataforma)
+    if not plataforma:
+        return False
+
+    recuperou = False
+    with PLATFORM_MONITOR_LOCK:
+        estado = PLATFORM_MONITOR_STATE[plataforma]
+        recuperou = bool(estado["alert_active"])
+        estado["failures"].clear()
+        estado["alert_active"] = False
+        estado["last_error"] = None
+        estado["last_success_at"] = agora_tz().isoformat()
+
+    logger.info(
+        f"[MONITOR_SUCESSO] plataforma={plataforma} recuperacao={recuperou}"
+    )
+    if recuperou:
+        safe_send_message(
+            ADMIN_ID,
+            "✅ <b>Serviço normalizado</b>\n\n"
+            f"A plataforma <b>{html.escape(plataforma)}</b> voltou a concluir "
+            "downloads reais normalmente.",
+            parse_mode="HTML",
+        )
+    return recuperou
+
+
+def obter_resumo_monitoramento():
+    agora_monotonic = time.monotonic()
+    inicio_janela = agora_monotonic - MONITOR_FAILURE_WINDOW_SECONDS
+    resumo = {}
+
+    with PLATFORM_MONITOR_LOCK:
+        for plataforma, estado in PLATFORM_MONITOR_STATE.items():
+            falhas = estado["failures"]
+            while falhas and falhas[0] < inicio_janela:
+                falhas.popleft()
+            resumo[plataforma] = {
+                "falhas_recentes": len(falhas),
+                "alerta_ativo": bool(estado["alert_active"]),
+                "ultimo_erro": estado.get("last_error"),
+                "ultimo_sucesso": estado.get("last_success_at"),
+            }
+    return resumo
+
+
+def definir_estado_worker_download(ativo):
+    global DOWNLOAD_WORKER_RUNNING
+    with DOWNLOAD_WORKER_STATE_LOCK:
+        DOWNLOAD_WORKER_RUNNING = bool(ativo)
+
+
+def worker_download_esta_ativo():
+    with DOWNLOAD_WORKER_STATE_LOCK:
+        return DOWNLOAD_WORKER_RUNNING
 
 
 def extrair_file_id_telegram(mensagem):
@@ -2382,6 +2564,7 @@ def configurar_menu_comandos():
         types.BotCommand("darvip", "Liberar VIP manualmente"),
         types.BotCommand("zerar", "Zerar o limite de um usuário"),
         types.BotCommand("avisogeral", "Enviar comunicado aos usuários"),
+        types.BotCommand("diagnostico", "Verificar a saúde do bot"),
         types.BotCommand("backupgeral", "Gerar backup completo"),
     ]
 
@@ -2691,9 +2874,176 @@ def processar_backup_admin(tipo, origem_chat_id=None):
         BACKUP_ADMIN_LOCK.release()
 
 
+def montar_relatorio_diagnostico():
+    """Verifica componentes locais e conexões sem baixar nenhum vídeo."""
+    linhas = ["🩺 <b>Diagnóstico do bot</b>", ""]
+    problemas = []
+
+    estado_bot, ultima_atividade = obter_estado_bot()
+    if estado_bot == "polling":
+        linhas.append("✅ Telegram: polling ativo")
+    else:
+        linhas.append(
+            f"⚠️ Telegram: estado {html.escape(str(estado_bot))}"
+        )
+        problemas.append("Telegram não está em polling")
+
+    try:
+        client.admin.command("ping")
+        linhas.append("✅ MongoDB: conectado")
+    except Exception as e:
+        linhas.append("❌ MongoDB: falha de conexão")
+        problemas.append(f"MongoDB: {sanitizar_erro_log(e, limite=180)}")
+
+    ffmpeg_ok = bool(shutil.which("ffmpeg"))
+    ffprobe_ok = bool(shutil.which("ffprobe"))
+    if ffmpeg_ok and ffprobe_ok:
+        linhas.append("✅ FFmpeg e FFprobe: disponíveis")
+    else:
+        linhas.append("❌ FFmpeg/FFprobe: dependência ausente")
+        problemas.append("FFmpeg ou FFprobe ausente")
+
+    worker_ativo = worker_download_esta_ativo()
+    linhas.append(
+        "✅ Worker de downloads: ativo"
+        if worker_ativo
+        else "❌ Worker de downloads: inativo"
+    )
+    if not worker_ativo:
+        problemas.append("Worker de downloads inativo")
+
+    fila_ocupada = DOWNLOAD_QUEUE.qsize()
+    fila_cheia = fila_ocupada >= DOWNLOAD_QUEUE_MAX
+    linhas.append(
+        f"{'⚠️' if fila_cheia else '✅'} Fila: "
+        f"{fila_ocupada}/{DOWNLOAD_QUEUE_MAX} ocupada"
+    )
+    if fila_cheia:
+        problemas.append("Fila de downloads cheia")
+
+    try:
+        uso_disco = shutil.disk_usage(DOWNLOAD_DIR)
+        livre_mb = uso_disco.free / (1024 * 1024)
+        livre_percentual = (
+            (uso_disco.free / uso_disco.total) * 100 if uso_disco.total else 0
+        )
+        icone_disco = "✅" if livre_percentual >= 10 else "⚠️"
+        linhas.append(
+            f"{icone_disco} Disco livre: {livre_mb:.0f} MB "
+            f"({livre_percentual:.0f}%)"
+        )
+        if livre_percentual < 10:
+            problemas.append("Pouco espaço livre em disco")
+    except Exception as e:
+        linhas.append("⚠️ Disco: não foi possível consultar")
+        problemas.append(f"Disco: {sanitizar_erro_log(e, limite=180)}")
+
+    if TIKTOK_IMPERSONATION_DISPONIVEL:
+        linhas.append("✅ TikTok: curl_cffi disponível")
+    else:
+        linhas.append("❌ TikTok: curl_cffi ausente")
+        problemas.append("curl_cffi ausente")
+
+    if tikwm_circuito_disponivel():
+        linhas.append("✅ TikTok sem marca: circuito disponível")
+    else:
+        linhas.append("⚠️ TikTok sem marca: pausa automática temporária")
+        problemas.append("Circuito TikTok temporariamente pausado")
+
+    linhas.append(
+        "✅ Cookies do Instagram: configurados"
+        if INSTAGRAM_COOKIES_TEXT.strip()
+        else "ℹ️ Cookies do Instagram: não configurados (opcional)"
+    )
+    linhas.append(
+        "✅ Cookies do TikTok: configurados"
+        if TIKTOK_COOKIES_TEXT.strip()
+        else "ℹ️ Cookies do TikTok: não configurados (opcional)"
+    )
+
+    resumo_monitor = obter_resumo_monitoramento()
+    alertas_ativos = [
+        plataforma
+        for plataforma, estado in resumo_monitor.items()
+        if estado["alerta_ativo"]
+    ]
+    falhas_recentes = sum(
+        estado["falhas_recentes"] for estado in resumo_monitor.values()
+    )
+    if alertas_ativos:
+        linhas.append(
+            "⚠️ Monitoramento: alerta em "
+            + html.escape(", ".join(alertas_ativos))
+        )
+        problemas.append("Há alerta automático ativo")
+    else:
+        linhas.append(
+            f"✅ Monitoramento: normal ({falhas_recentes} falhas técnicas recentes)"
+        )
+
+    if ultima_atividade:
+        linhas.append(
+            "ℹ️ Última atualização do Telegram: "
+            f"{html.escape(str(ultima_atividade))}"
+        )
+
+    linhas.extend(["", "<b>Resultado:</b>"])
+    if problemas:
+        linhas.append(
+            f"⚠️ Foram encontrados {len(problemas)} ponto(s) para atenção."
+        )
+    else:
+        linhas.append("✅ Todos os componentes verificados estão normais.")
+    linhas.append("Nenhum vídeo foi baixado durante este diagnóstico.")
+
+    return "\n".join(linhas)
+
+
+def processar_diagnostico_admin(chat_id, status_message_id=None):
+    if not DIAGNOSTIC_ADMIN_LOCK.acquire(blocking=False):
+        safe_send_message(chat_id, "⏳ Já existe um diagnóstico em andamento.")
+        return
+
+    try:
+        relatorio = montar_relatorio_diagnostico()
+        if status_message_id:
+            safe_edit_message(
+                chat_id,
+                status_message_id,
+                relatorio,
+                parse_mode="HTML",
+            )
+        else:
+            safe_send_message(chat_id, relatorio, parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"[DIAGNOSTICO] erro={sanitizar_erro_log(e)}")
+        safe_send_message(
+            chat_id,
+            "❌ Não foi possível concluir o diagnóstico agora.",
+        )
+    finally:
+        DIAGNOSTIC_ADMIN_LOCK.release()
+
+
 # =========================================
 # COMANDOS ADMIN
 # =========================================
+@bot.message_handler(commands=["diagnostico"])
+def diagnostico_admin(message):
+    if not exigir_admin_privado(message):
+        return
+
+    status = safe_reply_to(
+        message,
+        "🩺 Verificando os componentes do bot...",
+    )
+    Thread(
+        target=processar_diagnostico_admin,
+        args=(message.chat.id, getattr(status, "message_id", None)),
+        daemon=True,
+    ).start()
+
+
 @bot.message_handler(commands=["darvip"])
 def dar_vip_manual(message):
     if not exigir_admin_privado(message):
@@ -3633,6 +3983,7 @@ def _processar_download(message, url, status_msg):
     user = obter_usuario(message.from_user.id)
     vip_status = is_vip_user(user)
     prefix = None
+    plataforma = nome_plataforma(*detectar_plataforma(url))
 
     try:
         if status_msg:
@@ -3768,6 +4119,7 @@ def _processar_download(message, url, status_msg):
                 )
 
                 registrar_download_diario(vip_status)
+                registrar_sucesso_plataforma(plataforma)
 
                 if not vip_status:
                     incrementar_download_gratis(user, message.chat.id, message.from_user.id)
@@ -3778,6 +4130,7 @@ def _processar_download(message, url, status_msg):
                 return
 
             except Exception as e:
+                registrar_falha_plataforma(plataforma, e)
                 logger.error(
                     f"[ERRO_PINTEREST] user_id={message.from_user.id} "
                     f"url_ref={referencia_url_log(url)} erro={sanitizar_erro_log(e)}"
@@ -3943,6 +4296,7 @@ def _processar_download(message, url, status_msg):
         )
 
         registrar_download_diario(vip_status)
+        registrar_sucesso_plataforma(plataforma)
 
         if not vip_status:
             incrementar_download_gratis(user, message.chat.id, message.from_user.id)
@@ -3951,6 +4305,7 @@ def _processar_download(message, url, status_msg):
             safe_delete_message(message.chat.id, status_msg.message_id)
 
     except Exception as e:
+        registrar_falha_plataforma(plataforma, e)
         logger.error(
             f"[ERRO_DOWNLOAD] user_id={message.from_user.id} "
             f"url_ref={referencia_url_log(url)} erro={sanitizar_erro_log(e)}"
@@ -3976,29 +4331,34 @@ def _processar_download(message, url, status_msg):
 
 def loop_fila_downloads():
     logger.info(f"[DOWNLOAD_QUEUE] worker iniciado capacidade={DOWNLOAD_QUEUE_MAX}")
-    while True:
-        _prioridade, _sequencia, trabalho = DOWNLOAD_QUEUE.get()
-        message = trabalho["message"]
-        user_id = str(message.from_user.id)
-        try:
-            _processar_download(
-                message,
-                trabalho["url"],
-                trabalho.get("status_msg"),
-            )
-        except Exception as e:
-            logger.error(
-                f"[DOWNLOAD_WORKER] user_id={user_id} "
-                f"erro={sanitizar_erro_log(e)}"
-            )
-            safe_send_message(
-                message.chat.id,
-                "❌ Não consegui processar esse vídeo agora. Tente novamente em instantes.",
-            )
-        finally:
-            with DOWNLOAD_PENDING_LOCK:
-                DOWNLOAD_PENDING_USERS.discard(user_id)
-            DOWNLOAD_QUEUE.task_done()
+    definir_estado_worker_download(True)
+    try:
+        while True:
+            _prioridade, _sequencia, trabalho = DOWNLOAD_QUEUE.get()
+            message = trabalho["message"]
+            user_id = str(message.from_user.id)
+            try:
+                _processar_download(
+                    message,
+                    trabalho["url"],
+                    trabalho.get("status_msg"),
+                )
+            except Exception as e:
+                logger.error(
+                    f"[DOWNLOAD_WORKER] user_id={user_id} "
+                    f"erro={sanitizar_erro_log(e)}"
+                )
+                safe_send_message(
+                    message.chat.id,
+                    "❌ Não consegui processar esse vídeo agora. Tente novamente em instantes.",
+                )
+            finally:
+                with DOWNLOAD_PENDING_LOCK:
+                    DOWNLOAD_PENDING_USERS.discard(user_id)
+                DOWNLOAD_QUEUE.task_done()
+    finally:
+        definir_estado_worker_download(False)
+        logger.error("[DOWNLOAD_QUEUE] worker encerrado inesperadamente")
 
 
 @bot.message_handler(func=lambda message: message.text and "http" in message.text.lower())
@@ -4158,6 +4518,12 @@ if __name__ == "__main__":
         f"[CUSTO_CONFIG] cooldown={DOWNLOAD_COOLDOWN_SECONDS}s "
         f"user_hour={MAX_DOWNLOADS_PER_USER_HOUR} "
         f"global_hour={MAX_DOWNLOADS_GLOBAL_HOUR}"
+    )
+    logger.info(
+        f"[MONITOR_CONFIG] threshold={MONITOR_FAILURE_THRESHOLD} "
+        f"window={MONITOR_FAILURE_WINDOW_SECONDS}s "
+        f"alert_cooldown={MONITOR_ALERT_COOLDOWN_SECONDS}s "
+        "downloads_automaticos=False"
     )
     logger.info("[PAGAMENTO_CONFIG] modo=manual_pix configurado=True")
     if TIKTOK_IMPERSONATION_DISPONIVEL:
