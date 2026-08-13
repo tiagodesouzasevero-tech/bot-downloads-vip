@@ -112,6 +112,7 @@ ENVIRONMENT_NAME = get_first_env(
     default="production"
 )
 APP_STARTED_AT = datetime.now(TZ).isoformat()
+APP_INSTANCE_ID = uuid.uuid4().hex
 
 FREE_DAILY_LIMIT = 3
 MAX_DURATION_SECONDS = 90
@@ -165,6 +166,13 @@ SHUTDOWN_DRAIN_SECONDS = get_env_int(
 SHUTDOWN_SAFETY_MARGIN_SECONDS = min(
     15,
     max(5, SHUTDOWN_DRAIN_SECONDS // 8),
+)
+QUEUE_RECOVERY_TTL_HOURS = get_env_int(
+    "QUEUE_RECOVERY_TTL_HOURS", 24, 1, 168
+)
+QUEUE_RECOVERY_DELAY_SECONDS = min(
+    1800,
+    SHUTDOWN_DRAIN_SECONDS + 15,
 )
 PIX_ORDER_EXPIRATION_HOURS = get_env_int(
     "PIX_ORDER_EXPIRATION_HOURS", 24, 1, 168
@@ -444,6 +452,7 @@ metricas_col = db["metricas_diarias"]
 midia_cache_col = db["midia_cache"]
 auditoria_admin_col = db["auditoria_admin"]
 auditoria_sistema_col = db["auditoria_sistema"]
+fila_recuperacao_col = db["fila_recuperacao"]
 
 try:
     usuarios_col.create_index("vip_ate")
@@ -464,6 +473,10 @@ try:
     auditoria_sistema_col.create_index("created_at")
     auditoria_sistema_col.create_index(
         [("event_type", 1), ("status", 1), ("created_at", -1)]
+    )
+    fila_recuperacao_col.create_index("expires_at", expireAfterSeconds=0)
+    fila_recuperacao_col.create_index(
+        [("instance_id", 1), ("status", 1), ("updated_at", 1)]
     )
 except Exception as e:
     erro_inicio = re.sub(
@@ -881,10 +894,15 @@ def cleanup_download_dir_old_files(max_age_hours=6):
 def cleanup_download_dir_periodicamente(interval_minutes=60, max_age_hours=6):
     intervalo_segundos = max(300, int(interval_minutes * 60))
     proxima_limpeza = time.monotonic() + intervalo_segundos
+    recuperar_fila_em = time.monotonic() + QUEUE_RECOVERY_DELAY_SECONDS
+    recuperacao_fila_executada = False
     logger.info(
         f"[MAINTENANCE_LOOP] iniciado cleanup_minutes={interval_minutes} "
         f"max_age_hours={max_age_hours} "
-        f"watchdog_seconds={WORKER_WATCHDOG_INTERVAL_SECONDS}"
+        f"watchdog_seconds={WORKER_WATCHDOG_INTERVAL_SECONDS} "
+        f"queue_recovery_delay_seconds={QUEUE_RECOVERY_DELAY_SECONDS} "
+        f"queue_recovery_ttl_hours={QUEUE_RECOVERY_TTL_HOURS} "
+        "queue_recovery_contains_urls=False"
     )
 
     while not SHUTDOWN_EVENT.is_set():
@@ -894,6 +912,13 @@ def cleanup_download_dir_periodicamente(interval_minutes=60, max_age_hours=6):
             logger.warning(f"[WORKER_WATCHDOG] erro={sanitizar_erro_log(e)}")
 
         agora_monotonic = time.monotonic()
+        if (
+            not recuperacao_fila_executada
+            and agora_monotonic >= recuperar_fila_em
+        ):
+            recuperar_fila_interrompida()
+            recuperacao_fila_executada = True
+
         if agora_monotonic >= proxima_limpeza:
             try:
                 cleanup_download_dir_old_files(max_age_hours=max_age_hours)
@@ -901,7 +926,17 @@ def cleanup_download_dir_periodicamente(interval_minutes=60, max_age_hours=6):
                 logger.warning(f"[CLEANUP_LOOP] erro={sanitizar_erro_log(e)}")
             proxima_limpeza = agora_monotonic + intervalo_segundos
 
-        SHUTDOWN_EVENT.wait(WORKER_WATCHDOG_INTERVAL_SECONDS)
+        proxima_atividade = proxima_limpeza
+        if not recuperacao_fila_executada:
+            proxima_atividade = min(proxima_atividade, recuperar_fila_em)
+        espera = max(
+            0.25,
+            min(
+                WORKER_WATCHDOG_INTERVAL_SECONDS,
+                proxima_atividade - time.monotonic(),
+            ),
+        )
+        SHUTDOWN_EVENT.wait(espera)
 
 
 def encontrar_arquivo_baixado(prefix):
@@ -6680,6 +6715,198 @@ def _processar_download(message, url, status_msg):
             cleanup_prefix(prefix)
 
 
+def registrar_trabalho_fila_persistente(user_id):
+    """Salva só o necessário para avisar após uma queda; nunca salva o link."""
+    agora = datetime.now(timezone.utc).replace(tzinfo=None)
+    try:
+        fila_recuperacao_col.update_one(
+            {"_id": str(user_id)},
+            {
+                "$set": {
+                    "instance_id": APP_INSTANCE_ID,
+                    "status": "pending",
+                    "queued_at": agora,
+                    "updated_at": agora,
+                    "expires_at": agora + timedelta(
+                        hours=QUEUE_RECOVERY_TTL_HOURS
+                    ),
+                    "contains_url": False,
+                    "contains_message_text": False,
+                },
+                "$unset": {
+                    "recovery_claimed_by": "",
+                    "recovery_claimed_at": "",
+                },
+            },
+            upsert=True,
+        )
+        registrar_sucesso_componente("MongoDB")
+        return True
+    except Exception as e:
+        registrar_falha_componente("MongoDB", e)
+        logger.warning(
+            "[FILA_PERSISTENTE_REGISTRO] "
+            f"user_ref={referencia_usuario_log(user_id)} "
+            f"erro={sanitizar_erro_log(e)}"
+        )
+        return False
+
+
+def remover_trabalho_fila_persistente(user_id, instance_id=None):
+    """Remove somente o registro pertencente a esta execução do bot."""
+    filtro = {
+        "_id": str(user_id),
+        "instance_id": str(instance_id or APP_INSTANCE_ID),
+    }
+    try:
+        fila_recuperacao_col.delete_one(filtro)
+        registrar_sucesso_componente("MongoDB")
+        return True
+    except Exception as e:
+        registrar_falha_componente("MongoDB", e)
+        logger.warning(
+            "[FILA_PERSISTENTE_REMOCAO] "
+            f"user_ref={referencia_usuario_log(user_id)} "
+            f"erro={sanitizar_erro_log(e)}"
+        )
+        return False
+
+
+def _filtro_reivindicacao_recuperacao(documento):
+    filtro = {
+        "_id": documento["_id"],
+        "instance_id": documento.get("instance_id"),
+        "status": {"$in": ["pending", "recovering"]},
+    }
+    reivindicacao_anterior = documento.get("recovery_claimed_by")
+    if reivindicacao_anterior:
+        filtro["recovery_claimed_by"] = reivindicacao_anterior
+    else:
+        filtro["recovery_claimed_by"] = {"$exists": False}
+    return filtro
+
+
+def recuperar_fila_interrompida():
+    """Avisa usuários de outra execução sem restaurar nem armazenar URLs."""
+    if SHUTDOWN_EVENT.is_set():
+        return 0, 0
+
+    try:
+        documentos = list(
+            fila_recuperacao_col.find(
+                {
+                    "instance_id": {"$ne": APP_INSTANCE_ID},
+                    "status": {"$in": ["pending", "recovering"]},
+                },
+                {
+                    "_id": 1,
+                    "instance_id": 1,
+                    "status": 1,
+                    "recovery_claimed_by": 1,
+                },
+            ).limit(DOWNLOAD_QUEUE_MAX * 5)
+        )
+        registrar_sucesso_componente("MongoDB")
+    except Exception as e:
+        registrar_falha_componente("MongoDB", e)
+        logger.warning(
+            f"[FILA_RECUPERACAO_LISTAR] erro={sanitizar_erro_log(e)}"
+        )
+        return 0, 0
+
+    recuperados = 0
+    notificados = 0
+    for documento in documentos:
+        if SHUTDOWN_EVENT.is_set():
+            break
+
+        agora = datetime.now(timezone.utc).replace(tzinfo=None)
+        try:
+            resultado = fila_recuperacao_col.update_one(
+                _filtro_reivindicacao_recuperacao(documento),
+                {
+                    "$set": {
+                        "status": "recovering",
+                        "recovery_claimed_by": APP_INSTANCE_ID,
+                        "recovery_claimed_at": agora,
+                        "updated_at": agora,
+                    }
+                },
+            )
+            if not resultado.modified_count:
+                continue
+            recuperados += 1
+        except Exception as e:
+            registrar_falha_componente("MongoDB", e)
+            logger.warning(
+                f"[FILA_RECUPERACAO_REIVINDICAR] erro={sanitizar_erro_log(e)}"
+            )
+            continue
+
+        user_id = str(documento.get("_id") or "")
+        enviado = False
+        try:
+            enviado = bool(
+                safe_send_message(
+                    int(user_id),
+                    "⚠️ O bot foi reiniciado enquanto seu vídeo estava na "
+                    "fila ou em processamento.\n\n"
+                    "Envie o link novamente. A tentativa interrompida não "
+                    "consumiu seu limite diário de downloads.",
+                )
+            )
+        except (TypeError, ValueError):
+            logger.warning("[FILA_RECUPERACAO] identificador inválido")
+
+        try:
+            if enviado:
+                fila_recuperacao_col.delete_one(
+                    {
+                        "_id": user_id,
+                        "recovery_claimed_by": APP_INSTANCE_ID,
+                    }
+                )
+                notificados += 1
+            else:
+                fila_recuperacao_col.update_one(
+                    {
+                        "_id": user_id,
+                        "recovery_claimed_by": APP_INSTANCE_ID,
+                    },
+                    {
+                        "$set": {
+                            "status": "pending",
+                            "updated_at": agora,
+                        },
+                        "$unset": {
+                            "recovery_claimed_by": "",
+                            "recovery_claimed_at": "",
+                        },
+                    },
+                )
+            registrar_sucesso_componente("MongoDB")
+        except Exception as e:
+            registrar_falha_componente("MongoDB", e)
+            logger.warning(
+                f"[FILA_RECUPERACAO_FINALIZAR] erro={sanitizar_erro_log(e)}"
+            )
+
+    if recuperados:
+        safe_send_message(
+            ADMIN_ID,
+            "🔄 <b>Recuperação da fila concluída</b>\n\n"
+            f"Registros interrompidos: <b>{recuperados}</b>\n"
+            f"Usuários avisados: <b>{notificados}</b>\n\n"
+            "Nenhum link de vídeo foi armazenado.",
+            parse_mode="HTML",
+        )
+    logger.info(
+        f"[FILA_RECUPERACAO] recuperados={recuperados} "
+        f"notificados={notificados}"
+    )
+    return recuperados, notificados
+
+
 def mensagem_desligamento_para_usuario(em_processamento=False):
     if em_processamento:
         situacao = "O processamento do seu vídeo ainda estava ativo e precisou ser interrompido."
@@ -6714,6 +6941,8 @@ def cancelar_trabalho_aguardando_desligamento(trabalho):
     if user_id:
         with DOWNLOAD_PENDING_LOCK:
             DOWNLOAD_PENDING_USERS.discard(user_id)
+        if trabalho.get("persistent_recorded"):
+            remover_trabalho_fila_persistente(user_id)
     return notificado
 
 
@@ -6795,10 +7024,12 @@ def aguardar_trabalho_ativo_no_desligamento():
 
     user_id = obter_usuario_ativo_worker()
     if user_id:
-        safe_send_message(
+        enviado = safe_send_message(
             int(user_id),
             mensagem_desligamento_para_usuario(em_processamento=True),
         )
+        if enviado:
+            remover_trabalho_fila_persistente(user_id)
     return False
 
 
@@ -6859,6 +7090,8 @@ def loop_fila_downloads():
                     "❌ Não consegui processar esse vídeo agora. Tente novamente em instantes.",
                 )
             finally:
+                if trabalho.get("persistent_recorded"):
+                    remover_trabalho_fila_persistente(user_id)
                 with DOWNLOAD_PENDING_LOCK:
                     DOWNLOAD_PENDING_USERS.discard(user_id)
                 concluir_trabalho_worker()
@@ -6938,13 +7171,6 @@ def handle_download(message):
         safe_reply_to(message, mensagem_limite)
         return
 
-    status_msg = safe_reply_to(
-        message,
-        "💎 Link recebido com prioridade VIP. Aguarde o processamento..."
-        if vip_status
-        else "⏳ Link recebido. Aguarde o processamento...",
-    )
-
     recusado_desligamento = False
     duplicado = False
     fila_ficou_cheia = False
@@ -6955,48 +7181,93 @@ def handle_download(message):
             with DOWNLOAD_PENDING_LOCK:
                 if user_id in DOWNLOAD_PENDING_USERS:
                     duplicado = True
+                elif DOWNLOAD_QUEUE.full():
+                    fila_ficou_cheia = True
                 else:
                     DOWNLOAD_PENDING_USERS.add(user_id)
 
-            if not duplicado:
-                try:
-                    DOWNLOAD_QUEUE.put_nowait(
-                        (
-                            0 if vip_status else 1,
-                            next(DOWNLOAD_SEQUENCE),
-                            {
-                                "message": message,
-                                "url": url,
-                                "status_msg": status_msg,
-                            },
-                        )
+    if recusado_desligamento:
+        safe_reply_to(
+            message,
+            "🔄 O bot está concluindo uma atualização. Aguarde alguns "
+            "instantes e envie o link novamente.",
+        )
+        return
+    if duplicado:
+        safe_reply_to(
+            message,
+            "⏳ Seu vídeo anterior ainda está na fila. Aguarde a conclusão "
+            "antes de enviar outro link.",
+        )
+        return
+    if fila_ficou_cheia:
+        safe_reply_to(
+            message,
+            "⏳ A fila está cheia neste momento. Aguarde um pouco e tente novamente.",
+        )
+        return
+
+    registro_persistido = registrar_trabalho_fila_persistente(user_id)
+    status_msg = safe_reply_to(
+        message,
+        "💎 Link recebido com prioridade VIP. Aguarde o processamento..."
+        if vip_status
+        else "⏳ Link recebido. Aguarde o processamento...",
+    )
+
+    recusado_desligamento = False
+    fila_ficou_cheia = False
+    with DOWNLOAD_QUEUE_STATE_LOCK:
+        if SHUTDOWN_EVENT.is_set():
+            recusado_desligamento = True
+        else:
+            try:
+                DOWNLOAD_QUEUE.put_nowait(
+                    (
+                        0 if vip_status else 1,
+                        next(DOWNLOAD_SEQUENCE),
+                        {
+                            "message": message,
+                            "url": url,
+                            "status_msg": status_msg,
+                            "persistent_recorded": registro_persistido,
+                        },
                     )
-                except Full:
-                    fila_ficou_cheia = True
-                    with DOWNLOAD_PENDING_LOCK:
-                        DOWNLOAD_PENDING_USERS.discard(user_id)
+                )
+            except Full:
+                fila_ficou_cheia = True
+
+    if recusado_desligamento or fila_ficou_cheia:
+        with DOWNLOAD_PENDING_LOCK:
+            DOWNLOAD_PENDING_USERS.discard(user_id)
+        if registro_persistido:
+            remover_trabalho_fila_persistente(user_id)
 
     if recusado_desligamento:
+        texto = (
+            "🔄 O bot está concluindo uma atualização. Aguarde alguns "
+            "instantes e envie o link novamente."
+        )
         if status_msg:
             safe_edit_message(
                 message.chat.id,
                 status_msg.message_id,
-                "🔄 O bot está concluindo uma atualização. Aguarde alguns "
-                "instantes e envie o link novamente.",
+                texto,
             )
+        else:
+            safe_reply_to(message, texto)
         return
 
-    if duplicado:
+    if fila_ficou_cheia:
+        texto = "⏳ A fila ficou cheia. Aguarde um pouco e tente novamente."
         if status_msg:
-            safe_delete_message(message.chat.id, status_msg.message_id)
-        return
-
-    if fila_ficou_cheia and status_msg:
-        safe_edit_message(
-            message.chat.id,
-            status_msg.message_id,
-            "⏳ A fila ficou cheia. Aguarde um pouco e tente novamente.",
-        )
+            safe_edit_message(
+                message.chat.id,
+                status_msg.message_id,
+                texto,
+            )
+        else:
+            safe_reply_to(message, texto)
 
 
 # =========================================
