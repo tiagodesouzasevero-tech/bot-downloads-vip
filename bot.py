@@ -112,6 +112,15 @@ FFPROBE_TIMEOUT_SECONDS = get_env_int("FFPROBE_TIMEOUT_SECONDS", 30, 5, 120)
 FFMPEG_TIMEOUT_SECONDS = get_env_int("FFMPEG_TIMEOUT_SECONDS", 300, 30, 1800)
 DOWNLOAD_TIMEOUT_SECONDS = get_env_int("DOWNLOAD_TIMEOUT_SECONDS", 240, 30, 1800)
 FFMPEG_THREADS = get_env_int("FFMPEG_THREADS", 2, 1, 8)
+WORKER_STALL_TIMEOUT_SECONDS = get_env_int(
+    "WORKER_STALL_TIMEOUT_SECONDS",
+    max(900, DOWNLOAD_TIMEOUT_SECONDS + 60, FFMPEG_TIMEOUT_SECONDS + 60),
+    300,
+    7200,
+)
+WORKER_WATCHDOG_INTERVAL_SECONDS = get_env_int(
+    "WORKER_WATCHDOG_INTERVAL_SECONDS", 30, 10, 300
+)
 VIDEO_CRF = get_env_int("VIDEO_CRF", 27, 18, 35)
 AUDIO_BITRATE = os.environ.get("AUDIO_BITRATE", "80k").strip() or "80k"
 MEDIA_CACHE_DAYS = get_env_int("MEDIA_CACHE_DAYS", 180, 1, 365)
@@ -179,6 +188,18 @@ BOT_STATE = "starting"
 BOT_LAST_UPDATE_AT = None
 DOWNLOAD_WORKER_STATE_LOCK = Lock()
 DOWNLOAD_WORKER_RUNNING = False
+DOWNLOAD_WORKER_STATE = {
+    "busy": False,
+    "phase": "starting",
+    "heartbeat_monotonic": None,
+    "job_started_monotonic": None,
+    "last_progress_at": None,
+    "job_started_at": None,
+    "last_completed_at": None,
+    "completed_jobs": 0,
+    "stall_alert_active": False,
+    "stall_alerted_at": None,
+}
 PLATFORM_MONITOR_LOCK = Lock()
 PLATFORM_MONITOR_STATE = {
     plataforma: {
@@ -709,16 +730,28 @@ def cleanup_download_dir_old_files(max_age_hours=6):
 
 def cleanup_download_dir_periodicamente(interval_minutes=60, max_age_hours=6):
     intervalo_segundos = max(300, int(interval_minutes * 60))
+    proxima_limpeza = time.monotonic() + intervalo_segundos
     logger.info(
-        f"[CLEANUP_LOOP] iniciado interval_minutes={interval_minutes} max_age_hours={max_age_hours}"
+        f"[MAINTENANCE_LOOP] iniciado cleanup_minutes={interval_minutes} "
+        f"max_age_hours={max_age_hours} "
+        f"watchdog_seconds={WORKER_WATCHDOG_INTERVAL_SECONDS}"
     )
 
     while True:
         try:
-            cleanup_download_dir_old_files(max_age_hours=max_age_hours)
+            verificar_travamento_worker()
         except Exception as e:
-            logger.warning(f"[CLEANUP_LOOP] erro={e}")
-        time.sleep(intervalo_segundos)
+            logger.warning(f"[WORKER_WATCHDOG] erro={sanitizar_erro_log(e)}")
+
+        agora_monotonic = time.monotonic()
+        if agora_monotonic >= proxima_limpeza:
+            try:
+                cleanup_download_dir_old_files(max_age_hours=max_age_hours)
+            except Exception as e:
+                logger.warning(f"[CLEANUP_LOOP] erro={e}")
+            proxima_limpeza = agora_monotonic + intervalo_segundos
+
+        time.sleep(WORKER_WATCHDOG_INTERVAL_SECONDS)
 
 
 def encontrar_arquivo_baixado(prefix):
@@ -754,6 +787,7 @@ def parse_fps(valor):
 
 
 def obter_info_midia(arquivo_entrada):
+    atualizar_heartbeat_worker("analisando_midia")
 
     cmd = [
         "ffprobe",
@@ -892,6 +926,7 @@ def permitir_hevc_por_plataforma(plataforma=None):
 
 
 def remuxar_para_mp4_faststart(arquivo_entrada):
+    atualizar_heartbeat_worker("remux_ffmpeg")
     base, _ = os.path.splitext(arquivo_entrada)
     arquivo_saida = f"{base}_remux.mp4"
 
@@ -906,6 +941,7 @@ def remuxar_para_mp4_faststart(arquivo_entrada):
     ]
 
     try:
+        atualizar_heartbeat_worker("remux_ffmpeg")
         resultado = subprocess.run(
             cmd,
             stdout=subprocess.PIPE,
@@ -959,6 +995,7 @@ def converter_para_h264_compativel(arquivo_entrada, info=None):
     Mantém resolução/fps originais quando já estão dentro do limite,
     e só reduz quando realmente necessário.
     """
+    atualizar_heartbeat_worker("convertendo_h264")
     info = info or obter_info_midia(arquivo_entrada) or {}
     base, _ = os.path.splitext(arquivo_entrada)
     arquivo_saida = f"{base}_fallback_h264.mp4"
@@ -987,6 +1024,7 @@ def converter_para_h264_compativel(arquivo_entrada, info=None):
     ]
 
     try:
+        atualizar_heartbeat_worker("convertendo_h264")
         resultado = subprocess.run(
             cmd,
             stdout=subprocess.PIPE,
@@ -1014,6 +1052,7 @@ def converter_para_720x1280_30fps(arquivo_entrada):
     Mantém a proporção original sem adicionar bordas e nunca amplia vídeos
     que já tenham resolução menor que o limite.
     """
+    atualizar_heartbeat_worker("convertendo_video")
     info = obter_info_midia(arquivo_entrada) or {}
     base, _ = os.path.splitext(arquivo_entrada)
     arquivo_saida = f"{base}_720x1280_30fps.mp4"
@@ -1044,6 +1083,7 @@ def converter_para_720x1280_30fps(arquivo_entrada):
     ]
 
     try:
+        atualizar_heartbeat_worker("convertendo_video")
         resultado = subprocess.run(
             cmd,
             stdout=subprocess.PIPE,
@@ -1066,6 +1106,7 @@ def converter_para_720x1280_30fps(arquivo_entrada):
 
 
 def preparar_arquivo_para_envio(arquivo_entrada, plataforma=None):
+    atualizar_heartbeat_worker("preparando_envio")
     info = obter_info_midia(arquivo_entrada)
     permitir_hevc = permitir_hevc_por_plataforma(plataforma)
 
@@ -1294,13 +1335,212 @@ def obter_resumo_monitoramento():
 
 def definir_estado_worker_download(ativo):
     global DOWNLOAD_WORKER_RUNNING
+    agora_monotonic = time.monotonic()
+    agora_iso = datetime.now(TZ).isoformat()
     with DOWNLOAD_WORKER_STATE_LOCK:
         DOWNLOAD_WORKER_RUNNING = bool(ativo)
+        DOWNLOAD_WORKER_STATE["phase"] = "aguardando" if ativo else "parado"
+        DOWNLOAD_WORKER_STATE["heartbeat_monotonic"] = agora_monotonic
+        DOWNLOAD_WORKER_STATE["last_progress_at"] = agora_iso
+        if not ativo:
+            DOWNLOAD_WORKER_STATE["busy"] = False
+            DOWNLOAD_WORKER_STATE["job_started_monotonic"] = None
+            DOWNLOAD_WORKER_STATE["job_started_at"] = None
+            DOWNLOAD_WORKER_STATE["stall_alert_active"] = False
 
 
 def worker_download_esta_ativo():
     with DOWNLOAD_WORKER_STATE_LOCK:
         return DOWNLOAD_WORKER_RUNNING
+
+
+def _notificar_recuperacao_worker(fase):
+    logger.info(f"[WORKER_WATCHDOG] recuperado fase={fase}")
+    safe_send_message(
+        ADMIN_ID,
+        "✅ <b>Worker de downloads recuperado</b>\n\n"
+        f"O processamento voltou a responder na etapa "
+        f"<code>{html.escape(str(fase))}</code>.\n"
+        "Nenhum segundo worker foi iniciado.",
+        parse_mode="HTML",
+    )
+
+
+def iniciar_trabalho_worker():
+    """Marca um item como ativo sem registrar URL ou identificador do usuário."""
+    agora_monotonic = time.monotonic()
+    agora_iso = datetime.now(TZ).isoformat()
+    recuperou = False
+    with DOWNLOAD_WORKER_STATE_LOCK:
+        if not DOWNLOAD_WORKER_RUNNING:
+            return
+        recuperou = bool(DOWNLOAD_WORKER_STATE["stall_alert_active"])
+        DOWNLOAD_WORKER_STATE.update({
+            "busy": True,
+            "phase": "iniciando",
+            "heartbeat_monotonic": agora_monotonic,
+            "job_started_monotonic": agora_monotonic,
+            "last_progress_at": agora_iso,
+            "job_started_at": agora_iso,
+            "stall_alert_active": False,
+        })
+    if recuperou:
+        _notificar_recuperacao_worker("iniciando")
+
+
+def atualizar_heartbeat_worker(fase):
+    """Atualiza o progresso do worker; chamadas fora de um trabalho são ignoradas."""
+    agora_monotonic = time.monotonic()
+    recuperou = False
+    with DOWNLOAD_WORKER_STATE_LOCK:
+        if not DOWNLOAD_WORKER_RUNNING or not DOWNLOAD_WORKER_STATE["busy"]:
+            return False
+
+        heartbeat_anterior = DOWNLOAD_WORKER_STATE.get("heartbeat_monotonic")
+        mesma_fase = DOWNLOAD_WORKER_STATE.get("phase") == str(fase)
+        alerta_ativo = bool(DOWNLOAD_WORKER_STATE["stall_alert_active"])
+        if (
+            mesma_fase
+            and not alerta_ativo
+            and heartbeat_anterior is not None
+            and agora_monotonic - heartbeat_anterior < 1.0
+        ):
+            return False
+
+        recuperou = alerta_ativo
+        agora_iso = datetime.now(TZ).isoformat()
+        DOWNLOAD_WORKER_STATE.update({
+            "phase": str(fase),
+            "heartbeat_monotonic": agora_monotonic,
+            "last_progress_at": agora_iso,
+            "stall_alert_active": False,
+        })
+
+    if recuperou:
+        _notificar_recuperacao_worker(fase)
+    return True
+
+
+def concluir_trabalho_worker():
+    agora_monotonic = time.monotonic()
+    agora_iso = datetime.now(TZ).isoformat()
+    recuperou = False
+    with DOWNLOAD_WORKER_STATE_LOCK:
+        recuperou = bool(DOWNLOAD_WORKER_STATE["stall_alert_active"])
+        DOWNLOAD_WORKER_STATE.update({
+            "busy": False,
+            "phase": "aguardando",
+            "heartbeat_monotonic": agora_monotonic,
+            "job_started_monotonic": None,
+            "last_progress_at": agora_iso,
+            "job_started_at": None,
+            "last_completed_at": agora_iso,
+            "completed_jobs": int(DOWNLOAD_WORKER_STATE["completed_jobs"]) + 1,
+            "stall_alert_active": False,
+        })
+    if recuperou:
+        _notificar_recuperacao_worker("trabalho_concluido")
+
+
+def obter_saude_worker():
+    agora_monotonic = time.monotonic()
+    with DOWNLOAD_WORKER_STATE_LOCK:
+        running = bool(DOWNLOAD_WORKER_RUNNING)
+        estado = dict(DOWNLOAD_WORKER_STATE)
+
+    busy = bool(estado["busy"])
+    heartbeat = estado.get("heartbeat_monotonic")
+    inicio = estado.get("job_started_monotonic")
+    sem_progresso = (
+        max(0, int(agora_monotonic - heartbeat))
+        if busy and heartbeat is not None
+        else None
+    )
+    tempo_trabalho = (
+        max(0, int(agora_monotonic - inicio))
+        if busy and inicio is not None
+        else None
+    )
+    travado = bool(
+        running
+        and busy
+        and sem_progresso is not None
+        and sem_progresso >= WORKER_STALL_TIMEOUT_SECONDS
+    )
+
+    if not running:
+        status = "stopped"
+    elif travado:
+        status = "stalled"
+    elif busy:
+        status = "processing"
+    else:
+        status = "idle"
+
+    return {
+        "status": status,
+        "running": running,
+        "busy": busy,
+        "stalled": travado,
+        "phase": estado.get("phase"),
+        "seconds_without_progress": sem_progresso,
+        "active_job_seconds": tempo_trabalho,
+        "stall_timeout_seconds": WORKER_STALL_TIMEOUT_SECONDS,
+        "queue_size": DOWNLOAD_QUEUE.qsize(),
+        "queue_capacity": DOWNLOAD_QUEUE_MAX,
+        "completed_jobs": int(estado.get("completed_jobs") or 0),
+        "last_progress_at": estado.get("last_progress_at"),
+        "job_started_at": estado.get("job_started_at"),
+        "last_completed_at": estado.get("last_completed_at"),
+        "last_alerted_at": estado.get("stall_alerted_at"),
+        "alert_active": bool(estado.get("stall_alert_active")),
+    }
+
+
+def verificar_travamento_worker():
+    """Dispara um único alerta por travamento; não mata nem duplica o worker."""
+    agora_monotonic = time.monotonic()
+    deve_alertar = False
+    fase = "desconhecida"
+    sem_progresso = 0
+
+    with DOWNLOAD_WORKER_STATE_LOCK:
+        heartbeat = DOWNLOAD_WORKER_STATE.get("heartbeat_monotonic")
+        sem_progresso = (
+            max(0, int(agora_monotonic - heartbeat))
+            if heartbeat is not None
+            else 0
+        )
+        travado = bool(
+            DOWNLOAD_WORKER_RUNNING
+            and DOWNLOAD_WORKER_STATE["busy"]
+            and heartbeat is not None
+            and sem_progresso >= WORKER_STALL_TIMEOUT_SECONDS
+        )
+        if travado and not DOWNLOAD_WORKER_STATE["stall_alert_active"]:
+            DOWNLOAD_WORKER_STATE["stall_alert_active"] = True
+            DOWNLOAD_WORKER_STATE["stall_alerted_at"] = datetime.now(TZ).isoformat()
+            fase = DOWNLOAD_WORKER_STATE.get("phase") or "desconhecida"
+            deve_alertar = True
+
+    if not deve_alertar:
+        return False
+
+    logger.error(
+        f"[WORKER_WATCHDOG] travado fase={fase} "
+        f"sem_progresso={sem_progresso}s"
+    )
+    safe_send_message(
+        ADMIN_ID,
+        "⚠️ <b>Worker de downloads sem progresso</b>\n\n"
+        f"Etapa: <code>{html.escape(str(fase))}</code>\n"
+        f"Sem progresso há: <b>{sem_progresso // 60} minuto(s)</b>\n"
+        f"Fila aguardando: <b>{DOWNLOAD_QUEUE.qsize()}/{DOWNLOAD_QUEUE_MAX}</b>\n\n"
+        "O bot não iniciou outro worker e não reiniciou automaticamente. "
+        "Consulte <code>/diagnostico</code> antes de reiniciar o serviço.",
+        parse_mode="HTML",
+    )
+    return True
 
 
 def extrair_file_id_telegram(mensagem):
@@ -1310,6 +1550,7 @@ def extrair_file_id_telegram(mensagem):
 
 
 def enviar_arquivo_com_fallback(chat_id, arquivo):
+    atualizar_heartbeat_worker("enviando_telegram")
     try:
         with open(arquivo, "rb") as f:
             mensagem = bot.send_video(
@@ -1488,6 +1729,7 @@ def salvar_file_id_cache(
 
 
 def enviar_video_cacheado(chat_id, cache_key, telegram_file_id):
+    atualizar_heartbeat_worker("enviando_cache")
     try:
         bot.send_video(
             chat_id,
@@ -2079,6 +2321,7 @@ def montar_download_opts(
     inicio_download = time.monotonic()
 
     def progress_hook_limites(dados):
+        atualizar_heartbeat_worker("baixando")
         if time.monotonic() - inicio_download > DOWNLOAD_TIMEOUT_SECONDS:
             raise RuntimeError(
                 f"DOWNLOAD_TIMEOUT limite={DOWNLOAD_TIMEOUT_SECONDS}s"
@@ -3249,16 +3492,26 @@ def montar_relatorio_diagnostico():
         linhas.append("❌ FFmpeg/FFprobe: dependência ausente")
         problemas.append("FFmpeg ou FFprobe ausente")
 
-    worker_ativo = worker_download_esta_ativo()
-    linhas.append(
-        "✅ Worker de downloads: ativo"
-        if worker_ativo
-        else "❌ Worker de downloads: inativo"
-    )
-    if not worker_ativo:
+    saude_worker = obter_saude_worker()
+    if saude_worker["stalled"]:
+        linhas.append(
+            "❌ Worker de downloads: sem progresso há "
+            f"{saude_worker['seconds_without_progress']}s "
+            f"(etapa {html.escape(str(saude_worker['phase']))})"
+        )
+        problemas.append("Worker de downloads sem progresso")
+    elif not saude_worker["running"]:
+        linhas.append("❌ Worker de downloads: inativo")
         problemas.append("Worker de downloads inativo")
+    elif saude_worker["busy"]:
+        linhas.append(
+            "✅ Worker de downloads: processando "
+            f"(etapa {html.escape(str(saude_worker['phase']))})"
+        )
+    else:
+        linhas.append("✅ Worker de downloads: ativo e aguardando")
 
-    fila_ocupada = DOWNLOAD_QUEUE.qsize()
+    fila_ocupada = saude_worker["queue_size"]
     fila_cheia = fila_ocupada >= DOWNLOAD_QUEUE_MAX
     linhas.append(
         f"{'⚠️' if fila_cheia else '✅'} Fila: "
@@ -5017,6 +5270,7 @@ def formatos_por_plataforma(is_tiktok=False, is_instagram=False, is_pinterest=Fa
 
 
 def _processar_download(message, url, status_msg):
+    atualizar_heartbeat_worker("preparando")
     user = obter_usuario(message.from_user.id)
     vip_status = is_vip_user(user)
     prefix = None
@@ -5030,6 +5284,7 @@ def _processar_download(message, url, status_msg):
                 "🔄 Processando seu vídeo...",
             )
 
+        atualizar_heartbeat_worker("resolvendo_link")
         url = resolver_url_compartilhada(url)
         is_pinterest, is_tiktok, is_instagram, is_rednote = detectar_plataforma(url)
         plataforma = nome_plataforma(is_pinterest, is_tiktok, is_instagram, is_rednote)
@@ -5074,6 +5329,7 @@ def _processar_download(message, url, status_msg):
                 return
 
             try:
+                atualizar_heartbeat_worker("consultando_metadados")
                 with yt_dlp.YoutubeDL(montar_info_opts(is_pinterest=True)) as ydl:
                     info = ydl.extract_info(url_resolvida, download=False)
 
@@ -5116,6 +5372,7 @@ def _processar_download(message, url, status_msg):
                 logger.warning(f"[PINTEREST_INFO] Falha ao ler metadados: {e}")
 
             try:
+                atualizar_heartbeat_worker("baixando")
                 arquivo_final = baixar_pinterest_capado(
                     url_resolvida,
                     prefix,
@@ -5199,6 +5456,7 @@ def _processar_download(message, url, status_msg):
 
         usar_cookies_plataforma = True
         tiktok_extractor_args_usados = None
+        atualizar_heartbeat_worker("consultando_metadados")
         if is_instagram:
             info, usar_cookies_plataforma = extrair_info_instagram_com_fallback(url)
         elif is_tiktok:
@@ -5263,6 +5521,7 @@ def _processar_download(message, url, status_msg):
             modos_cookie = [False]
 
         for usar_cookies in modos_cookie:
+            atualizar_heartbeat_worker("baixando")
             common_opts = montar_download_opts(
                 prefix,
                 is_instagram=is_instagram,
@@ -5374,6 +5633,7 @@ def loop_fila_downloads():
             _prioridade, _sequencia, trabalho = DOWNLOAD_QUEUE.get()
             message = trabalho["message"]
             user_id = str(message.from_user.id)
+            iniciar_trabalho_worker()
             try:
                 _processar_download(
                     message,
@@ -5392,10 +5652,18 @@ def loop_fila_downloads():
             finally:
                 with DOWNLOAD_PENDING_LOCK:
                     DOWNLOAD_PENDING_USERS.discard(user_id)
+                concluir_trabalho_worker()
                 DOWNLOAD_QUEUE.task_done()
     finally:
         definir_estado_worker_download(False)
         logger.error("[DOWNLOAD_QUEUE] worker encerrado inesperadamente")
+        safe_send_message(
+            ADMIN_ID,
+            "❌ <b>Worker de downloads encerrado</b>\n\n"
+            "O processo principal continua ativo, mas a fila não será "
+            "processada até o serviço ser reiniciado.",
+            parse_mode="HTML",
+        )
 
 
 @bot.message_handler(func=lambda message: message.text and "http" in message.text.lower())
@@ -5493,10 +5761,17 @@ def obter_estado_bot():
 
 def montar_payload_health():
     estado, ultima_atividade = obter_estado_bot()
+    worker = obter_saude_worker()
+    saudavel = (
+        estado == "polling"
+        and worker["running"]
+        and not worker["stalled"]
+    )
     return {
-        "status": "ok" if estado == "polling" else "degraded",
+        "status": "ok" if saudavel else "degraded",
         "service": SERVICE_NAME,
         "bot": estado,
+        "worker": worker,
         "started_at": APP_STARTED_AT,
         "last_update_at": ultima_atividade,
     }
@@ -5514,8 +5789,8 @@ class HealthRequestHandler(BaseHTTPRequestHandler):
                 montar_payload_health(), ensure_ascii=False
             ).encode("utf-8")
             content_type = "application/json; charset=utf-8"
-            # O endpoint é de vida do contêiner. Durante uma reconexão do
-            # Telegram ele continua 200, mas informa "degraded" no JSON.
+            # O endpoint é de vida do contêiner. Polling ou worker degradados
+            # aparecem no JSON sem provocar ciclos automáticos de reinício.
             status = 200
         else:
             corpo = b"NOT FOUND"
@@ -5561,6 +5836,11 @@ if __name__ == "__main__":
         f"window={MONITOR_FAILURE_WINDOW_SECONDS}s "
         f"alert_cooldown={MONITOR_ALERT_COOLDOWN_SECONDS}s "
         "downloads_automaticos=False"
+    )
+    logger.info(
+        f"[WORKER_WATCHDOG_CONFIG] stall_timeout="
+        f"{WORKER_STALL_TIMEOUT_SECONDS}s interval="
+        f"{WORKER_WATCHDOG_INTERVAL_SECONDS}s auto_restart=False"
     )
     logger.info("[PAGAMENTO_CONFIG] modo=manual_pix configurado=True")
     if TIKTOK_IMPERSONATION_DISPONIVEL:
