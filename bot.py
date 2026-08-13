@@ -10,13 +10,14 @@ import hmac
 import ipaddress
 import itertools
 import logging
+import signal
 import socket
 import shutil
 import stat
 from collections import defaultdict, deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from queue import Full, PriorityQueue
-from threading import Lock, Thread
+from queue import Empty, Full, PriorityQueue
+from threading import Event, Lock, Thread
 from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse
 from zoneinfo import ZoneInfo
@@ -155,6 +156,16 @@ MAX_DOWNLOADS_GLOBAL_HOUR = get_env_int(
     "MAX_DOWNLOADS_GLOBAL_HOUR", 300, 20, 10000
 )
 DOWNLOAD_QUEUE_MAX = get_env_int("DOWNLOAD_QUEUE_MAX", 10, 1, 50)
+RAILWAY_DRAINING_CONFIGURED = bool(
+    os.environ.get("RAILWAY_DEPLOYMENT_DRAINING_SECONDS", "").strip()
+)
+SHUTDOWN_DRAIN_SECONDS = get_env_int(
+    "RAILWAY_DEPLOYMENT_DRAINING_SECONDS", 120, 10, 1800
+)
+SHUTDOWN_SAFETY_MARGIN_SECONDS = min(
+    15,
+    max(5, SHUTDOWN_DRAIN_SECONDS // 8),
+)
 PIX_ORDER_EXPIRATION_HOURS = get_env_int(
     "PIX_ORDER_EXPIRATION_HOURS", 24, 1, 168
 )
@@ -201,7 +212,13 @@ PAYMENT_ORDER_LOCKS = [Lock() for _ in range(64)]
 DOWNLOAD_PENDING_LOCK = Lock()
 DOWNLOAD_PENDING_USERS = set()
 DOWNLOAD_QUEUE = PriorityQueue(maxsize=DOWNLOAD_QUEUE_MAX)
+DOWNLOAD_QUEUE_STATE_LOCK = Lock()
 DOWNLOAD_SEQUENCE = itertools.count()
+SHUTDOWN_EVENT = Event()
+SHUTDOWN_SIGNAL = None
+SHUTDOWN_DEADLINE_MONOTONIC = None
+HEALTH_SERVER_LOCK = Lock()
+HEALTH_SERVER = None
 TIKWM_CIRCUIT_LOCK = Lock()
 TIKWM_CIRCUIT_STATE = {"failures": 0, "open_until": 0.0}
 BOT_STATE_LOCK = Lock()
@@ -224,6 +241,7 @@ DOWNLOAD_WORKER_STATE = {
     "restart_in_progress": False,
     "restart_blocked_reason": None,
     "restart_retry_after_monotonic": 0.0,
+    "active_user_id": None,
 }
 COMPONENT_MONITOR_LOCK = Lock()
 COMPONENTES_PLATAFORMA = ("TikTok", "Instagram", "Pinterest", "RedNote")
@@ -695,7 +713,8 @@ def atualizar_estado_bot(estado, registrar_atividade=False):
 
 
 def registrar_atividade_bot(_mensagens):
-    atualizar_estado_bot("polling", registrar_atividade=True)
+    if not SHUTDOWN_EVENT.is_set():
+        atualizar_estado_bot("polling", registrar_atividade=True)
 
 
 def extrair_primeira_url(texto):
@@ -868,7 +887,7 @@ def cleanup_download_dir_periodicamente(interval_minutes=60, max_age_hours=6):
         f"watchdog_seconds={WORKER_WATCHDOG_INTERVAL_SECONDS}"
     )
 
-    while True:
+    while not SHUTDOWN_EVENT.is_set():
         try:
             verificar_travamento_worker()
         except Exception as e:
@@ -882,7 +901,7 @@ def cleanup_download_dir_periodicamente(interval_minutes=60, max_age_hours=6):
                 logger.warning(f"[CLEANUP_LOOP] erro={sanitizar_erro_log(e)}")
             proxima_limpeza = agora_monotonic + intervalo_segundos
 
-        time.sleep(WORKER_WATCHDOG_INTERVAL_SECONDS)
+        SHUTDOWN_EVENT.wait(WORKER_WATCHDOG_INTERVAL_SECONDS)
 
 
 def encontrar_arquivo_baixado(prefix):
@@ -1567,6 +1586,7 @@ def definir_estado_worker_download(ativo):
         DOWNLOAD_WORKER_STATE["last_progress_at"] = agora_iso
         if not ativo:
             DOWNLOAD_WORKER_STATE["busy"] = False
+            DOWNLOAD_WORKER_STATE["active_user_id"] = None
             DOWNLOAD_WORKER_STATE["job_started_monotonic"] = None
             DOWNLOAD_WORKER_STATE["job_started_at"] = None
             DOWNLOAD_WORKER_STATE["stall_alert_active"] = False
@@ -1593,8 +1613,8 @@ def _notificar_recuperacao_worker(fase):
     )
 
 
-def iniciar_trabalho_worker():
-    """Marca um item como ativo sem registrar URL ou identificador do usuário."""
+def iniciar_trabalho_worker(user_id=None):
+    """Marca um item como ativo sem registrar URL ou identificador nos logs."""
     agora_monotonic = time.monotonic()
     agora_iso = datetime.now(TZ).isoformat()
     recuperou = False
@@ -1604,6 +1624,7 @@ def iniciar_trabalho_worker():
         recuperou = bool(DOWNLOAD_WORKER_STATE["stall_alert_active"])
         DOWNLOAD_WORKER_STATE.update({
             "busy": True,
+            "active_user_id": str(user_id) if user_id is not None else None,
             "phase": "iniciando",
             "heartbeat_monotonic": agora_monotonic,
             "job_started_monotonic": agora_monotonic,
@@ -1664,6 +1685,7 @@ def concluir_trabalho_worker():
         recuperou = bool(DOWNLOAD_WORKER_STATE["stall_alert_active"])
         DOWNLOAD_WORKER_STATE.update({
             "busy": False,
+            "active_user_id": None,
             "phase": "aguardando",
             "heartbeat_monotonic": agora_monotonic,
             "job_started_monotonic": None,
@@ -1679,6 +1701,13 @@ def concluir_trabalho_worker():
         })
     if recuperou:
         _notificar_recuperacao_worker("trabalho_concluido")
+
+
+def obter_usuario_ativo_worker():
+    """Uso interno no desligamento; o identificador nunca entra no healthcheck."""
+    with DOWNLOAD_WORKER_STATE_LOCK:
+        user_id = DOWNLOAD_WORKER_STATE.get("active_user_id")
+        return str(user_id) if user_id is not None else None
 
 
 def obter_saude_worker():
@@ -1833,6 +1862,8 @@ def _encerrar_processo_para_reinicio():
 
 def tentar_reinicio_automatico_worker(fase, sem_progresso):
     """Autoriza no MongoDB e só então encerra o processo para a Railway subir outro."""
+    if SHUTDOWN_EVENT.is_set():
+        return False
     if not _worker_ainda_travado_para_reinicio():
         return False
 
@@ -1981,6 +2012,8 @@ def tentar_reinicio_automatico_worker(fase, sem_progresso):
 
 def verificar_travamento_worker():
     """Alerta após o limite e reinicia somente depois do período de confirmação."""
+    if SHUTDOWN_EVENT.is_set():
+        return False
     agora_monotonic = time.monotonic()
     deve_alertar = False
     deve_tentar_reinicio = False
@@ -6647,15 +6680,169 @@ def _processar_download(message, url, status_msg):
             cleanup_prefix(prefix)
 
 
+def mensagem_desligamento_para_usuario(em_processamento=False):
+    if em_processamento:
+        situacao = "O processamento do seu vídeo ainda estava ativo e precisou ser interrompido."
+    else:
+        situacao = "Seu vídeo ainda estava aguardando na fila."
+    return (
+        "🔄 O bot está concluindo uma atualização.\n\n"
+        f"{situacao} Aguarde alguns instantes e envie o link novamente. "
+        "Esta tentativa não consumiu seu limite diário de downloads."
+    )
+
+
+def cancelar_trabalho_aguardando_desligamento(trabalho):
+    """Retira um item ainda não iniciado e avisa o usuário uma única vez."""
+    message = trabalho.get("message") or None
+    status_msg = trabalho.get("status_msg")
+    user_id = str(getattr(getattr(message, "from_user", None), "id", "") or "")
+    chat_id = getattr(getattr(message, "chat", None), "id", None)
+    texto = mensagem_desligamento_para_usuario(em_processamento=False)
+    notificado = False
+
+    if chat_id is not None and status_msg is not None:
+        mensagem_editada = safe_edit_message(
+            chat_id,
+            getattr(status_msg, "message_id", None),
+            texto,
+        )
+        notificado = bool(mensagem_editada)
+    if chat_id is not None and not notificado:
+        notificado = bool(safe_send_message(chat_id, texto))
+
+    if user_id:
+        with DOWNLOAD_PENDING_LOCK:
+            DOWNLOAD_PENDING_USERS.discard(user_id)
+    return notificado
+
+
+def cancelar_fila_aguardando_desligamento():
+    """Esvazia somente trabalhos que ainda não começaram a ser processados."""
+    cancelados = 0
+    notificados = 0
+    trabalhos = []
+    with DOWNLOAD_QUEUE_STATE_LOCK:
+        while True:
+            try:
+                _prioridade, _sequencia, trabalho = DOWNLOAD_QUEUE.get_nowait()
+            except Empty:
+                break
+            trabalhos.append(trabalho)
+
+    for trabalho in trabalhos:
+        try:
+            cancelados += 1
+            if cancelar_trabalho_aguardando_desligamento(trabalho):
+                notificados += 1
+        finally:
+            DOWNLOAD_QUEUE.task_done()
+
+    logger.info(
+        f"[SHUTDOWN_FILA] cancelados={cancelados} notificados={notificados}"
+    )
+    return cancelados, notificados
+
+
+def solicitar_desligamento_gracioso(numero_sinal, _frame=None):
+    """Inicia a drenagem; o trabalho ativo recebe um prazo para terminar."""
+    global SHUTDOWN_SIGNAL, SHUTDOWN_DEADLINE_MONOTONIC
+    if SHUTDOWN_EVENT.is_set():
+        return False
+
+    SHUTDOWN_SIGNAL = int(numero_sinal) if numero_sinal is not None else None
+    SHUTDOWN_DEADLINE_MONOTONIC = (
+        time.monotonic() + SHUTDOWN_DRAIN_SECONDS
+    )
+    SHUTDOWN_EVENT.set()
+    atualizar_estado_bot("draining")
+    logger.warning(
+        f"[SHUTDOWN] solicitado sinal={SHUTDOWN_SIGNAL} "
+        f"prazo={SHUTDOWN_DRAIN_SECONDS}s"
+    )
+    try:
+        bot.stop_polling()
+    except Exception as e:
+        logger.warning(
+            f"[SHUTDOWN] falha_ao_parar_polling={sanitizar_erro_log(e)}"
+        )
+    return True
+
+
+def registrar_sinais_desligamento():
+    signal.signal(signal.SIGTERM, solicitar_desligamento_gracioso)
+    signal.signal(signal.SIGINT, solicitar_desligamento_gracioso)
+
+
+def aguardar_trabalho_ativo_no_desligamento():
+    """Espera até o limite da Railway, reservando margem para fechar o processo."""
+    prazo_final = SHUTDOWN_DEADLINE_MONOTONIC or (
+        time.monotonic() + SHUTDOWN_DRAIN_SECONDS
+    )
+    limite = max(
+        time.monotonic(),
+        prazo_final - SHUTDOWN_SAFETY_MARGIN_SECONDS,
+    )
+
+    while time.monotonic() < limite:
+        saude = obter_saude_worker()
+        if not saude["busy"]:
+            return True
+        time.sleep(0.25)
+
+    if not obter_saude_worker()["busy"]:
+        return True
+
+    user_id = obter_usuario_ativo_worker()
+    if user_id:
+        safe_send_message(
+            int(user_id),
+            mensagem_desligamento_para_usuario(em_processamento=True),
+        )
+    return False
+
+
+def executar_desligamento_gracioso():
+    """Cancela a espera, tenta concluir o ativo e libera conexões quando seguro."""
+    atualizar_estado_bot("draining")
+    cancelados, notificados = cancelar_fila_aguardando_desligamento()
+    concluido = aguardar_trabalho_ativo_no_desligamento()
+    encerrar_healthcheck()
+
+    if concluido:
+        try:
+            client.close()
+        except Exception as e:
+            logger.warning(
+                f"[SHUTDOWN] falha_ao_fechar_mongodb={sanitizar_erro_log(e)}"
+            )
+
+    atualizar_estado_bot("stopped")
+    logger.info(
+        f"[SHUTDOWN] concluido={concluido} fila_cancelada={cancelados} "
+        f"fila_notificada={notificados}"
+    )
+    return {
+        "trabalho_ativo_concluido": concluido,
+        "fila_cancelada": cancelados,
+        "fila_notificada": notificados,
+    }
+
+
 def loop_fila_downloads():
     logger.info(f"[DOWNLOAD_QUEUE] worker iniciado capacidade={DOWNLOAD_QUEUE_MAX}")
     definir_estado_worker_download(True)
     try:
-        while True:
+        while not SHUTDOWN_EVENT.is_set():
             _prioridade, _sequencia, trabalho = DOWNLOAD_QUEUE.get()
+            if SHUTDOWN_EVENT.is_set():
+                cancelar_trabalho_aguardando_desligamento(trabalho)
+                DOWNLOAD_QUEUE.task_done()
+                break
+
             message = trabalho["message"]
             user_id = str(message.from_user.id)
-            iniciar_trabalho_worker()
+            iniciar_trabalho_worker(user_id)
             try:
                 _processar_download(
                     message,
@@ -6678,20 +6865,31 @@ def loop_fila_downloads():
                 DOWNLOAD_QUEUE.task_done()
     finally:
         definir_estado_worker_download(False)
-        logger.error("[DOWNLOAD_QUEUE] worker encerrado inesperadamente")
-        safe_send_message(
-            ADMIN_ID,
-            "❌ <b>Worker de downloads encerrado</b>\n\n"
-            "O processo principal continua ativo, mas a fila não será "
-            "processada até o serviço ser reiniciado.",
-            parse_mode="HTML",
-        )
+        if SHUTDOWN_EVENT.is_set():
+            logger.info("[DOWNLOAD_QUEUE] worker encerrado durante drenagem")
+        else:
+            logger.error("[DOWNLOAD_QUEUE] worker encerrado inesperadamente")
+            safe_send_message(
+                ADMIN_ID,
+                "❌ <b>Worker de downloads encerrado</b>\n\n"
+                "O processo principal continua ativo, mas a fila não será "
+                "processada até o serviço ser reiniciado.",
+                parse_mode="HTML",
+            )
 
 
 @bot.message_handler(func=lambda message: message.text and "http" in message.text.lower())
 def handle_download(message):
     if not is_chat_privado(message):
         orientar_uso_no_privado(message)
+        return
+
+    if SHUTDOWN_EVENT.is_set():
+        safe_reply_to(
+            message,
+            "🔄 O bot está concluindo uma atualização. Aguarde alguns "
+            "instantes e envie o link novamente.",
+        )
         return
 
     user = obter_usuario(message.from_user.id)
@@ -6747,30 +6945,58 @@ def handle_download(message):
         else "⏳ Link recebido. Aguarde o processamento...",
     )
 
-    with DOWNLOAD_PENDING_LOCK:
-        if user_id in DOWNLOAD_PENDING_USERS:
-            if status_msg:
-                safe_delete_message(message.chat.id, status_msg.message_id)
-            return
-        DOWNLOAD_PENDING_USERS.add(user_id)
+    recusado_desligamento = False
+    duplicado = False
+    fila_ficou_cheia = False
+    with DOWNLOAD_QUEUE_STATE_LOCK:
+        if SHUTDOWN_EVENT.is_set():
+            recusado_desligamento = True
+        else:
+            with DOWNLOAD_PENDING_LOCK:
+                if user_id in DOWNLOAD_PENDING_USERS:
+                    duplicado = True
+                else:
+                    DOWNLOAD_PENDING_USERS.add(user_id)
 
-    try:
-        DOWNLOAD_QUEUE.put_nowait(
-            (
-                0 if vip_status else 1,
-                next(DOWNLOAD_SEQUENCE),
-                {"message": message, "url": url, "status_msg": status_msg},
-            )
-        )
-    except Full:
-        with DOWNLOAD_PENDING_LOCK:
-            DOWNLOAD_PENDING_USERS.discard(user_id)
+            if not duplicado:
+                try:
+                    DOWNLOAD_QUEUE.put_nowait(
+                        (
+                            0 if vip_status else 1,
+                            next(DOWNLOAD_SEQUENCE),
+                            {
+                                "message": message,
+                                "url": url,
+                                "status_msg": status_msg,
+                            },
+                        )
+                    )
+                except Full:
+                    fila_ficou_cheia = True
+                    with DOWNLOAD_PENDING_LOCK:
+                        DOWNLOAD_PENDING_USERS.discard(user_id)
+
+    if recusado_desligamento:
         if status_msg:
             safe_edit_message(
                 message.chat.id,
                 status_msg.message_id,
-                "⏳ A fila ficou cheia. Aguarde um pouco e tente novamente.",
+                "🔄 O bot está concluindo uma atualização. Aguarde alguns "
+                "instantes e envie o link novamente.",
             )
+        return
+
+    if duplicado:
+        if status_msg:
+            safe_delete_message(message.chat.id, status_msg.message_id)
+        return
+
+    if fila_ficou_cheia and status_msg:
+        safe_edit_message(
+            message.chat.id,
+            status_msg.message_id,
+            "⏳ A fila ficou cheia. Aguarde um pouco e tente novamente.",
+        )
 
 
 # =========================================
@@ -6784,8 +7010,10 @@ def obter_estado_bot():
 def montar_payload_health():
     estado, ultima_atividade = obter_estado_bot()
     worker = obter_saude_worker()
+    encerrando = SHUTDOWN_EVENT.is_set()
     saudavel = (
-        estado == "polling"
+        not encerrando
+        and estado == "polling"
         and worker["running"]
         and not worker["stalled"]
     )
@@ -6793,6 +7021,7 @@ def montar_payload_health():
         "status": "ok" if saudavel else "degraded",
         "service": SERVICE_NAME,
         "bot": estado,
+        "accepting_downloads": not encerrando,
         "worker": worker,
         "started_at": APP_STARTED_AT,
         "last_update_at": ultima_atividade,
@@ -6831,10 +7060,27 @@ class HealthRequestHandler(BaseHTTPRequestHandler):
 
 
 def servir_healthcheck():
+    global HEALTH_SERVER
     porta = int(os.environ.get("PORT", 8080))
     servidor = ThreadingHTTPServer(("0.0.0.0", porta), HealthRequestHandler)
+    servidor.daemon_threads = True
+    with HEALTH_SERVER_LOCK:
+        HEALTH_SERVER = servidor
     logger.info(f"[HEALTH] servidor iniciado porta={porta}")
-    servidor.serve_forever()
+    try:
+        servidor.serve_forever(poll_interval=0.25)
+    finally:
+        servidor.server_close()
+        with HEALTH_SERVER_LOCK:
+            if HEALTH_SERVER is servidor:
+                HEALTH_SERVER = None
+
+
+def encerrar_healthcheck():
+    with HEALTH_SERVER_LOCK:
+        servidor = HEALTH_SERVER
+    if servidor is not None:
+        servidor.shutdown()
 
 
 # =========================================
@@ -6866,6 +7112,27 @@ if __name__ == "__main__":
         f"restart_grace={WORKER_RESTART_GRACE_SECONDS}s "
         f"max_restarts_hour={WORKER_MAX_RESTARTS_PER_HOUR}"
     )
+    logger.info(
+        f"[SHUTDOWN_CONFIG] sigterm=True drain={SHUTDOWN_DRAIN_SECONDS}s "
+        f"safety_margin={SHUTDOWN_SAFETY_MARGIN_SECONDS}s "
+        f"railway_configurada={RAILWAY_DRAINING_CONFIGURED} "
+        "aceita_novos_durante_drenagem=False"
+    )
+    if not RAILWAY_DRAINING_CONFIGURED:
+        logger.warning(
+            "[SHUTDOWN_CONFIG] variável "
+            "RAILWAY_DEPLOYMENT_DRAINING_SECONDS ausente; a Railway pode "
+            "encerrar o processo antes da drenagem"
+        )
+        safe_send_message(
+            ADMIN_ID,
+            "⚠️ <b>Configuração necessária na Railway</b>\n\n"
+            "Adicione a variável:\n"
+            "<code>RAILWAY_DEPLOYMENT_DRAINING_SECONDS=120</code>\n\n"
+            "Sem ela, o desligamento seguro durante deploys não terá tempo "
+            "para concluir os vídeos ativos.",
+            parse_mode="HTML",
+        )
     logger.info("[PAGAMENTO_CONFIG] modo=manual_pix configurado=True")
     if TIKTOK_IMPERSONATION_DISPONIVEL:
         logger.info(f"[TIKTOK_DEPENDENCIAS] curl_cffi={CURL_CFFI_VERSION}")
@@ -6886,6 +7153,7 @@ if __name__ == "__main__":
     configurar_menu_comandos()
     recuperar_aprovacoes_pix_interrompidas()
     bot.set_update_listener(registrar_atividade_bot)
+    registrar_sinais_desligamento()
 
     Thread(
         target=cleanup_download_dir_periodicamente,
@@ -6903,12 +7171,18 @@ if __name__ == "__main__":
         daemon=True
     ).start()
 
-    while True:
+    while not SHUTDOWN_EVENT.is_set():
         try:
             atualizar_estado_bot("polling")
             logger.info("Iniciando bot.infinity_polling...")
             bot.infinity_polling(skip_pending=False, timeout=20, long_polling_timeout=20)
         except Exception as e:
+            if SHUTDOWN_EVENT.is_set():
+                break
             atualizar_estado_bot("reconnecting")
             logger.error(f"[POLLING] erro={sanitizar_erro_log(e)}")
             time.sleep(5)
+
+    if SHUTDOWN_EVENT.is_set():
+        executar_desligamento_gracioso()
+        logging.shutdown()
