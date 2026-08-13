@@ -2399,9 +2399,156 @@ def notificar_pagamento_confirmado(user_id, plano_nome, vip_ate):
             "Seu acesso já está liberado. Envie um link para começar. 🚀"
         )
 
-        safe_send_message(int(user_id), texto, parse_mode="Markdown")
+        return bool(
+            safe_send_message(int(user_id), texto, parse_mode="Markdown")
+        )
     except Exception as e:
         logger.error(f"[NOTIFICAR_PAGAMENTO] user_id={user_id} erro={e}")
+        return False
+
+
+def finalizar_aprovacao_pix_em_processamento(order_nsu):
+    """Conclui uma aprovação já autorizada pelo administrador.
+
+    O pedido precisa estar em ``approving``. A aplicação do VIP é idempotente
+    por ``order_nsu``; por isso, repetir esta função após uma reinicialização
+    não acrescenta os dias do mesmo pagamento novamente.
+    """
+    pedido = pedidos_col.find_one({"order_nsu": order_nsu})
+    if not pedido:
+        raise RuntimeError("PEDIDO_APROVACAO_NAO_ENCONTRADO")
+
+    if pedido.get("status") == "paid":
+        return {
+            "pedido": pedido,
+            "plano": PLANOS.get(pedido.get("plano_key")) or {},
+            "vip_ate": pedido.get("vip_liberado_ate"),
+            "vip_aplicado": bool(pedido.get("vip_aplicado_ao_pedido")),
+            "finalizado_agora": False,
+        }
+
+    if pedido.get("status") != "approving":
+        raise RuntimeError("PEDIDO_NAO_ESTA_EM_APROVACAO")
+
+    plano = PLANOS.get(pedido.get("plano_key")) or {}
+    if not plano:
+        raise RuntimeError("PLANO_DO_PEDIDO_INVALIDO")
+
+    vip_ate, vip_aplicado = liberar_vip_por_plano(
+        pedido["user_id"],
+        plano,
+        order_nsu=order_nsu,
+    )
+    agora = agora_tz()
+    verificado_em = (
+        pedido.get("manual_verified_at")
+        or pedido.get("approval_started_at")
+        or agora
+    )
+
+    resultado = pedidos_col.update_one(
+        {"order_nsu": order_nsu, "status": "approving"},
+        {
+            "$set": {
+                "status": "paid",
+                "paid_at": verificado_em,
+                "paid_amount": int(pedido.get("valor_centavos") or 0),
+                "capture_method": "pix_manual",
+                "payment_verification_status": "manual_verified",
+                "manual_verified_by": str(
+                    pedido.get("manual_verified_by") or ADMIN_ID
+                ),
+                "manual_verified_at": verificado_em,
+                "approval_completed_at": agora,
+                "vip_liberado_ate": vip_ate,
+                "vip_aplicado_nesta_chamada": vip_aplicado,
+                "vip_aplicado_ao_pedido": True,
+            },
+            "$unset": {"expires_at": ""},
+        },
+    )
+
+    if resultado.modified_count:
+        pedido_final = pedidos_col.find_one({"order_nsu": order_nsu}) or pedido
+        return {
+            "pedido": pedido_final,
+            "plano": plano,
+            "vip_ate": vip_ate,
+            "vip_aplicado": vip_aplicado,
+            "finalizado_agora": True,
+        }
+
+    # Outra execução pode ter concluído o mesmo pedido entre a leitura e a
+    # gravação. Aceita somente o estado final esperado.
+    pedido_atual = pedidos_col.find_one({"order_nsu": order_nsu}) or {}
+    if pedido_atual.get("status") == "paid":
+        return {
+            "pedido": pedido_atual,
+            "plano": plano,
+            "vip_ate": pedido_atual.get("vip_liberado_ate") or vip_ate,
+            "vip_aplicado": bool(pedido_atual.get("vip_aplicado_ao_pedido")),
+            "finalizado_agora": False,
+        }
+
+    raise RuntimeError("PEDIDO_APROVACAO_MUDOU_DE_ESTADO")
+
+
+def recuperar_aprovacoes_pix_interrompidas():
+    """Retoma aprovações autorizadas que foram interrompidas por reinício."""
+    recuperados = 0
+    falhas = 0
+
+    try:
+        pedidos_pendentes = list(pedidos_col.find({"status": "approving"}))
+    except Exception as e:
+        logger.error(
+            f"[PIX_RECUPERACAO_LISTAR] erro={sanitizar_erro_log(e)}"
+        )
+        return 0, 1
+
+    for pedido in pedidos_pendentes:
+        order_nsu = str(pedido.get("order_nsu") or "").strip()
+        if not order_nsu:
+            falhas += 1
+            continue
+
+        lock_pedido = obter_lock_distribuido_local(
+            order_nsu, PAYMENT_ORDER_LOCKS
+        )
+        try:
+            with lock_pedido:
+                aprovacao = finalizar_aprovacao_pix_em_processamento(order_nsu)
+
+            if aprovacao["finalizado_agora"]:
+                recuperados += 1
+                pedido_final = aprovacao["pedido"]
+                plano = aprovacao["plano"]
+                notificar_pagamento_confirmado(
+                    pedido_final["user_id"],
+                    plano.get("nome") or pedido_final.get("plano_nome") or "VIP",
+                    aprovacao["vip_ate"],
+                )
+                logger.info(
+                    f"[PIX_RECUPERACAO_OK] order_nsu={order_nsu} "
+                    f"user_id={pedido_final['user_id']}"
+                )
+        except Exception as e:
+            falhas += 1
+            logger.error(
+                f"[PIX_RECUPERACAO_FALHA] order_nsu={order_nsu} "
+                f"erro={sanitizar_erro_log(e)}"
+            )
+
+    if recuperados or falhas:
+        safe_send_message(
+            ADMIN_ID,
+            "🔄 *Recuperação de pagamentos concluída*\n\n"
+            f"✅ Aprovações recuperadas: `{recuperados}`\n"
+            f"❌ Falhas que exigem atenção: `{falhas}`",
+            parse_mode="Markdown",
+        )
+
+    return recuperados, falhas
 
 
 # =========================================
@@ -2731,8 +2878,11 @@ def consultar_docs_backup(tipo):
                     "admin_review_message_id": 1,
                     "receipt_rejected_at": 1,
                     "receipt_rejected_by": 1,
+                    "approval_started_at": 1,
+                    "approval_completed_at": 1,
                     "manual_verified_at": 1,
                     "manual_verified_by": 1,
+                    "vip_aplicado_ao_pedido": 1,
                 }
             ).sort("created_at", -1)
         )
@@ -2801,8 +2951,11 @@ def consultar_docs_backup(tipo):
                     "admin_review_message_id": 1,
                     "receipt_rejected_at": 1,
                     "receipt_rejected_by": 1,
+                    "approval_started_at": 1,
+                    "approval_completed_at": 1,
                     "manual_verified_at": 1,
                     "manual_verified_by": 1,
+                    "vip_aplicado_ao_pedido": 1,
                 }
             ).sort("created_at", -1)
         )
@@ -3377,7 +3530,7 @@ def painel_admin(message):
         downloads_vips_hoje = int(metricas_hoje.get("downloads_vips", 0) or 0)
 
         comprovantes_em_analise = pedidos_col.count_documents({
-            "status": "receipt_submitted"
+            "status": {"$in": ["receipt_submitted", "approving"]}
         })
         pedidos_pagos = pedidos_col.count_documents({"status": "paid"})
 
@@ -3504,7 +3657,9 @@ def buscar_pedido_pix_ativo(user_id):
     return pedidos_col.find_one(
         {
             "user_id": str(user_id),
-            "status": {"$in": ["awaiting_pix", "receipt_submitted"]},
+            "status": {
+                "$in": ["awaiting_pix", "receipt_submitted", "approving"]
+            },
         },
         sort=[("created_at", -1)],
     )
@@ -3556,7 +3711,10 @@ def iniciar_pagamento_pix_manual(call):
             return
 
         pedido_ativo = buscar_pedido_pix_ativo(call.from_user.id)
-        if pedido_ativo and pedido_ativo.get("status") == "receipt_submitted":
+        if pedido_ativo and pedido_ativo.get("status") in (
+            "receipt_submitted",
+            "approving",
+        ):
             safe_send_message(
                 call.message.chat.id,
                 "🧾 Seu comprovante já foi recebido e está aguardando conferência. "
@@ -3901,7 +4059,13 @@ def revisar_comprovante_pix(call):
             if pedido.get("status") == "paid":
                 safe_answer_callback(call.id, text="Pedido já aprovado.", show_alert=True)
                 return
-            if pedido.get("status") != "receipt_submitted":
+
+            estados_permitidos = (
+                ("receipt_submitted", "approving")
+                if aprovar
+                else ("receipt_submitted",)
+            )
+            if pedido.get("status") not in estados_permitidos:
                 safe_answer_callback(
                     call.id,
                     text="Este pedido não está aguardando análise.",
@@ -3915,39 +4079,51 @@ def revisar_comprovante_pix(call):
                 return
 
             if aprovar:
-                vip_ate, vip_aplicado = liberar_vip_por_plano(
-                    pedido["user_id"],
-                    plano,
-                    order_nsu=order_nsu,
-                )
-                agora = agora_tz()
-                resultado = pedidos_col.update_one(
-                    {"order_nsu": order_nsu, "status": "receipt_submitted"},
-                    {
-                        "$set": {
-                            "status": "paid",
-                            "paid_at": agora,
-                            "paid_amount": int(pedido.get("valor_centavos") or 0),
-                            "capture_method": "pix_manual",
-                            "payment_verification_status": "manual_verified",
-                            "manual_verified_by": str(ADMIN_ID),
-                            "manual_verified_at": agora,
-                            "vip_liberado_ate": vip_ate,
-                            "vip_aplicado_nesta_chamada": vip_aplicado,
+                if pedido.get("status") == "receipt_submitted":
+                    agora = agora_tz()
+                    resultado_inicio = pedidos_col.update_one(
+                        {
+                            "order_nsu": order_nsu,
+                            "status": "receipt_submitted",
                         },
-                        "$unset": {"expires_at": ""},
-                    },
-                )
-                if not resultado.modified_count:
-                    safe_answer_callback(
-                        call.id,
-                        text="O pedido mudou de estado. Atualize o painel.",
-                        show_alert=True,
+                        {
+                            "$set": {
+                                "status": "approving",
+                                "payment_verification_status": (
+                                    "manual_approval_processing"
+                                ),
+                                "approval_started_at": agora,
+                                "manual_verified_by": str(ADMIN_ID),
+                                "manual_verified_at": agora,
+                            },
+                            "$unset": {"expires_at": ""},
+                        },
                     )
-                    return
-                notificar_pagamento_confirmado(
-                    pedido["user_id"], plano["nome"], vip_ate
-                )
+                    if not resultado_inicio.modified_count:
+                        pedido_atual = pedidos_col.find_one(
+                            {"order_nsu": order_nsu}
+                        ) or {}
+                        if pedido_atual.get("status") not in (
+                            "approving",
+                            "paid",
+                        ):
+                            safe_answer_callback(
+                                call.id,
+                                text=(
+                                    "O pedido mudou de estado. Atualize o painel."
+                                ),
+                                show_alert=True,
+                            )
+                            return
+
+                aprovacao = finalizar_aprovacao_pix_em_processamento(order_nsu)
+                vip_ate = aprovacao["vip_ate"]
+                pedido_final = aprovacao["pedido"]
+
+                if aprovacao["finalizado_agora"]:
+                    notificar_pagamento_confirmado(
+                        pedido_final["user_id"], plano["nome"], vip_ate
+                    )
                 safe_edit_message(
                     call.message.chat.id,
                     call.message.message_id,
@@ -3959,11 +4135,12 @@ def revisar_comprovante_pix(call):
                 safe_answer_callback(call.id, text="VIP liberado com sucesso.")
                 logger.info(
                     f"[PIX_MANUAL_APROVADO] order_nsu={order_nsu} "
-                    f"user_id={pedido['user_id']} vip_ate={vip_ate}"
+                    f"user_id={pedido_final['user_id']} vip_ate={vip_ate} "
+                    f"recuperado={pedido.get('status') == 'approving'}"
                 )
             else:
                 agora = agora_tz()
-                pedidos_col.update_one(
+                resultado_rejeicao = pedidos_col.update_one(
                     {"order_nsu": order_nsu, "status": "receipt_submitted"},
                     {
                         "$set": {
@@ -3979,6 +4156,13 @@ def revisar_comprovante_pix(call):
                         },
                     },
                 )
+                if not resultado_rejeicao.modified_count:
+                    safe_answer_callback(
+                        call.id,
+                        text="O pedido mudou de estado. Atualize o painel.",
+                        show_alert=True,
+                    )
+                    return
                 safe_send_message(
                     int(pedido["user_id"]),
                     "❌ O comprovante não pôde ser confirmado. Confira o pagamento e "
@@ -4605,6 +4789,7 @@ if __name__ == "__main__":
     inicializar_metricas_diarias()
     cleanup_download_dir_old_files(max_age_hours=6)
     configurar_menu_comandos()
+    recuperar_aprovacoes_pix_interrompidas()
     bot.set_update_listener(registrar_atividade_bot)
 
     Thread(
