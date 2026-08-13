@@ -40,7 +40,7 @@ except ImportError:
     TIKTOK_IMPERSONATION_DISPONIVEL = False
 
 from telebot import types
-from pymongo import MongoClient
+from pymongo import MongoClient, ReturnDocument
 from requests.exceptions import RequestException, Timeout
 
 # =========================================
@@ -159,6 +159,10 @@ MAX_DOWNLOADS_GLOBAL_HOUR = get_env_int(
     "MAX_DOWNLOADS_GLOBAL_HOUR", 300, 20, 10000
 )
 DOWNLOAD_QUEUE_MAX = get_env_int("DOWNLOAD_QUEUE_MAX", 10, 1, 50)
+DOWNLOAD_RESERVATION_TTL_SECONDS = max(
+    7200,
+    DOWNLOAD_QUEUE_MAX * (DOWNLOAD_TIMEOUT_SECONDS + FFMPEG_TIMEOUT_SECONDS),
+)
 RAILWAY_DRAINING_CONFIGURED = bool(
     os.environ.get("RAILWAY_DEPLOYMENT_DRAINING_SECONDS", "").strip()
 )
@@ -254,6 +258,7 @@ DOWNLOAD_WORKER_STATE = {
     "restart_blocked_reason": None,
     "restart_retry_after_monotonic": 0.0,
     "active_user_id": None,
+    "active_has_download_reservation": False,
 }
 COMPONENT_MONITOR_LOCK = Lock()
 COMPONENTES_PLATAFORMA = ("TikTok", "Instagram", "Pinterest", "RedNote")
@@ -1733,6 +1738,7 @@ def definir_estado_worker_download(ativo):
         if not ativo:
             DOWNLOAD_WORKER_STATE["busy"] = False
             DOWNLOAD_WORKER_STATE["active_user_id"] = None
+            DOWNLOAD_WORKER_STATE["active_has_download_reservation"] = False
             DOWNLOAD_WORKER_STATE["job_started_monotonic"] = None
             DOWNLOAD_WORKER_STATE["job_started_at"] = None
             DOWNLOAD_WORKER_STATE["stall_alert_active"] = False
@@ -1759,7 +1765,7 @@ def _notificar_recuperacao_worker(fase):
     )
 
 
-def iniciar_trabalho_worker(user_id=None):
+def iniciar_trabalho_worker(user_id=None, has_download_reservation=False):
     """Marca um item como ativo sem registrar URL ou identificador nos logs."""
     agora_monotonic = time.monotonic()
     agora_iso = datetime.now(TZ).isoformat()
@@ -1771,6 +1777,9 @@ def iniciar_trabalho_worker(user_id=None):
         DOWNLOAD_WORKER_STATE.update({
             "busy": True,
             "active_user_id": str(user_id) if user_id is not None else None,
+            "active_has_download_reservation": bool(
+                has_download_reservation
+            ),
             "phase": "iniciando",
             "heartbeat_monotonic": agora_monotonic,
             "job_started_monotonic": agora_monotonic,
@@ -1832,6 +1841,7 @@ def concluir_trabalho_worker():
         DOWNLOAD_WORKER_STATE.update({
             "busy": False,
             "active_user_id": None,
+            "active_has_download_reservation": False,
             "phase": "aguardando",
             "heartbeat_monotonic": agora_monotonic,
             "job_started_monotonic": None,
@@ -1854,6 +1864,14 @@ def obter_usuario_ativo_worker():
     with DOWNLOAD_WORKER_STATE_LOCK:
         user_id = DOWNLOAD_WORKER_STATE.get("active_user_id")
         return str(user_id) if user_id is not None else None
+
+
+def trabalho_ativo_tem_reserva_download():
+    """Uso interno no desligamento; este estado não entra no healthcheck."""
+    with DOWNLOAD_WORKER_STATE_LOCK:
+        return bool(
+            DOWNLOAD_WORKER_STATE.get("active_has_download_reservation")
+        )
 
 
 def obter_saude_worker():
@@ -3581,18 +3599,186 @@ def mapear_falha_componente_download(componente, erro, plataforma="geral"):
     return mapear_erro_download(str(erro), plataforma=plataforma)
 
 
-def incrementar_download_gratis(user, chat_id, from_user_id):
+def _expressoes_reserva_download(hoje, agora_utc):
+    contagem_hoje = {
+        "$cond": [
+            {"$eq": ["$ultima_data", hoje]},
+            {"$ifNull": ["$downloads_hoje", 0]},
+            0,
+        ]
+    }
+    reserva_ativa = {
+        "$and": [
+            {
+                "$ne": [
+                    {"$ifNull": ["$download_reserva.token", None]},
+                    None,
+                ]
+            },
+            {"$eq": ["$download_reserva.data", hoje]},
+            {"$gt": ["$download_reserva.expires_at", agora_utc]},
+        ]
+    }
+    return contagem_hoje, reserva_ativa
+
+
+def reservar_download_gratis(user_id):
+    """Reserva e contabiliza uma vaga gratuita em uma única operação atômica."""
+    hoje = hoje_str()
+    agora_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+    token = uuid.uuid4().hex
+    expira_em = agora_utc + timedelta(seconds=DOWNLOAD_RESERVATION_TTL_SECONDS)
+    contagem_hoje, reserva_ativa = _expressoes_reserva_download(
+        hoje,
+        agora_utc,
+    )
+
     try:
-        usuarios_col.update_one(
-            {"_id": user["_id"]},
-            {"$inc": {"downloads_hoje": 1}}
+        usuario = usuarios_col.find_one_and_update(
+            {
+                "_id": str(user_id),
+                "$expr": {
+                    "$and": [
+                        {"$lt": [contagem_hoje, FREE_DAILY_LIMIT]},
+                        {"$not": [reserva_ativa]},
+                    ]
+                },
+            },
+            [
+                {
+                    "$set": {
+                        "downloads_hoje": {"$add": [contagem_hoje, 1]},
+                        "ultima_data": hoje,
+                        "download_reserva": {
+                            "token": token,
+                            "instance_id": APP_INSTANCE_ID,
+                            "data": hoje,
+                            "created_at": agora_utc,
+                            "expires_at": expira_em,
+                        },
+                    }
+                }
+            ],
+            return_document=ReturnDocument.AFTER,
         )
         registrar_sucesso_componente("MongoDB")
     except Exception as e:
         registrar_falha_componente("MongoDB", e)
-        raise FalhaComponenteDownload("MongoDB", e, ja_registrada=True) from e
+        logger.error(
+            f"[LIMITE_RESERVA_FALHA] user_ref={referencia_usuario_log(user_id)} "
+            f"erro={sanitizar_erro_log(e)}"
+        )
+        try:
+            usuario = usuarios_col.find_one(
+                {
+                    "_id": str(user_id),
+                    "download_reserva.token": token,
+                },
+                {"downloads_hoje": 1},
+            )
+            if usuario:
+                logger.info(
+                    "[LIMITE_RESERVA_CONFIRMADA_APOS_FALHA] "
+                    f"user_ref={referencia_usuario_log(user_id)}"
+                )
+                registrar_sucesso_componente("MongoDB")
+            else:
+                return None, "indisponivel"
+        except Exception as verificacao_erro:
+            registrar_falha_componente("MongoDB", verificacao_erro)
+            return None, "indisponivel"
 
-    novo_count = user.get("downloads_hoje", 0) + 1
+    if usuario:
+        contagem = int(usuario.get("downloads_hoje") or 0)
+        return {
+            "token": token,
+            "instance_id": APP_INSTANCE_ID,
+            "data": hoje,
+            "count": contagem,
+            "delivered": False,
+            "finalized": False,
+        }, None
+
+    try:
+        atual = usuarios_col.find_one(
+            {"_id": str(user_id)},
+            {
+                "downloads_hoje": 1,
+                "ultima_data": 1,
+                "download_reserva": 1,
+            },
+        ) or {}
+        registrar_sucesso_componente("MongoDB")
+    except Exception as e:
+        registrar_falha_componente("MongoDB", e)
+        return None, "indisponivel"
+
+    reserva_atual = atual.get("download_reserva") or {}
+    expira_atual = reserva_atual.get("expires_at")
+    reserva_em_andamento = bool(
+        reserva_atual.get("token")
+        and reserva_atual.get("data") == hoje
+        and isinstance(expira_atual, datetime)
+        and expira_atual > agora_utc
+    )
+    if reserva_em_andamento:
+        return None, "em_andamento"
+    if (
+        atual.get("ultima_data") == hoje
+        and int(atual.get("downloads_hoje") or 0) >= FREE_DAILY_LIMIT
+    ):
+        return None, "limite"
+    return None, "concorrencia"
+
+
+def _atualizar_reserva_com_retentativas(filtro, atualizacao, operacao):
+    ultimo_erro = None
+    for tentativa in range(1, 4):
+        try:
+            resultado = usuarios_col.update_one(filtro, atualizacao)
+            registrar_sucesso_componente("MongoDB")
+            return resultado
+        except Exception as e:
+            ultimo_erro = e
+            logger.warning(
+                f"[LIMITE_RESERVA_{operacao}] tentativa={tentativa}/3 "
+                f"erro={sanitizar_erro_log(e)}"
+            )
+            if tentativa < 3:
+                time.sleep(0.25 * tentativa)
+
+    registrar_falha_componente("MongoDB", ultimo_erro)
+    return None
+
+
+def confirmar_download_gratis(
+    reserva,
+    user_id,
+    chat_id,
+    from_user_id,
+):
+    """Confirma a vaga já contabilizada depois que o Telegram recebeu o vídeo."""
+    if not reserva or reserva.get("finalized"):
+        return True
+
+    reserva["delivered"] = True
+    resultado = _atualizar_reserva_com_retentativas(
+        {
+            "_id": str(user_id),
+            "download_reserva.token": reserva["token"],
+        },
+        {"$unset": {"download_reserva": ""}},
+        "CONFIRMAR",
+    )
+    if resultado is None:
+        logger.error(
+            f"[LIMITE_RESERVA_CONFIRMAR] user_ref={referencia_usuario_log(user_id)} "
+            "confirmada=False contador_preservado=True"
+        )
+        return False
+
+    reserva["finalized"] = True
+    novo_count = int(reserva.get("count") or 0)
     safe_send_message(chat_id, f"📊 Uso diário: {novo_count}/{FREE_DAILY_LIMIT}")
 
     if novo_count >= FREE_DAILY_LIMIT:
@@ -3600,16 +3786,141 @@ def incrementar_download_gratis(user, chat_id, from_user_id):
             chat_id,
             f"⚠️ *Você atingiu seu limite diário ({FREE_DAILY_LIMIT}/{FREE_DAILY_LIMIT})!*\n"
             "Para continuar baixando sem limite diário, libere um plano VIP: 👇",
-            parse_mode="Markdown"
+            parse_mode="Markdown",
         )
         mostrar_planos_chat(chat_id, from_user_id)
+    return True
+
+
+def devolver_reserva_download_gratis(reserva, user_id, motivo="falha"):
+    """Devolve uma reserva não entregue; token torna a operação idempotente."""
+    if not reserva or reserva.get("finalized") or reserva.get("delivered"):
+        return True
+
+    resultado = _atualizar_reserva_com_retentativas(
+        {
+            "_id": str(user_id),
+            "download_reserva.token": reserva["token"],
+        },
+        [
+            {
+                "$set": {
+                    "downloads_hoje": {
+                        "$cond": [
+                            {
+                                "$gt": [
+                                    {"$ifNull": ["$downloads_hoje", 0]},
+                                    0,
+                                ]
+                            },
+                            {
+                                "$subtract": [
+                                    {"$ifNull": ["$downloads_hoje", 0]},
+                                    1,
+                                ]
+                            },
+                            0,
+                        ]
+                    },
+                    "download_reserva": "$$REMOVE",
+                }
+            }
+        ],
+        "DEVOLVER",
+    )
+    if resultado is None:
+        logger.error(
+            f"[LIMITE_RESERVA_DEVOLVER] user_ref={referencia_usuario_log(user_id)} "
+            f"motivo={str(motivo)[:80]} devolvida=False"
+        )
+        return False
+
+    reserva["finalized"] = True
+    logger.info(
+        f"[LIMITE_RESERVA_DEVOLVER] user_ref={referencia_usuario_log(user_id)} "
+        f"motivo={str(motivo)[:80]} devolvida={bool(resultado.modified_count)}"
+    )
+    return True
+
+
+def devolver_reserva_por_instancia(user_id, instance_id):
+    """Recuperação idempotente de uma reserva pertencente a processo encerrado."""
+    resultado = _atualizar_reserva_com_retentativas(
+        {
+            "_id": str(user_id),
+            "download_reserva.instance_id": str(instance_id),
+        },
+        [
+            {
+                "$set": {
+                    "downloads_hoje": {
+                        "$cond": [
+                            {
+                                "$gt": [
+                                    {"$ifNull": ["$downloads_hoje", 0]},
+                                    0,
+                                ]
+                            },
+                            {
+                                "$subtract": [
+                                    {"$ifNull": ["$downloads_hoje", 0]},
+                                    1,
+                                ]
+                            },
+                            0,
+                        ]
+                    },
+                    "download_reserva": "$$REMOVE",
+                }
+            }
+        ],
+        "RECUPERAR",
+    )
+    return resultado is not None
 
 
 def somar_downloads_gratuitos_usuarios_hoje():
     hoje = hoje_str()
     pipeline = [
         {"$match": {"ultima_data": hoje}},
-        {"$group": {"_id": None, "total": {"$sum": "$downloads_hoje"}}}
+        {
+            "$project": {
+                "downloads_concluidos": {
+                    "$cond": [
+                        {
+                            "$and": [
+                                {
+                                    "$ne": [
+                                        {
+                                            "$ifNull": [
+                                                "$download_reserva.token",
+                                                None,
+                                            ]
+                                        },
+                                        None,
+                                    ]
+                                },
+                                {"$eq": ["$download_reserva.data", hoje]},
+                                {
+                                    "$gt": [
+                                        {"$ifNull": ["$downloads_hoje", 0]},
+                                        0,
+                                    ]
+                                },
+                            ]
+                        },
+                        {"$subtract": ["$downloads_hoje", 1]},
+                        {"$ifNull": ["$downloads_hoje", 0]},
+                    ]
+                }
+            }
+        },
+        {
+            "$group": {
+                "_id": None,
+                "total": {"$sum": "$downloads_concluidos"},
+            }
+        },
     ]
     resultado = list(usuarios_col.aggregate(pipeline))
     return int(resultado[0]["total"]) if resultado else 0
@@ -3966,10 +4277,14 @@ def _obter_usuario_db(user_id):
     if user.get("ultima_data") != hoje:
         usuarios_col.update_one(
             {"_id": uid},
-            {"$set": {"downloads_hoje": 0, "ultima_data": hoje}}
+            {
+                "$set": {"downloads_hoje": 0, "ultima_data": hoje},
+                "$unset": {"download_reserva": ""},
+            },
         )
         user["downloads_hoje"] = 0
         user["ultima_data"] = hoje
+        user.pop("download_reserva", None)
 
     return user
 
@@ -5079,6 +5394,9 @@ def zerar_contador(message):
                 "$set": {
                     "downloads_hoje": 0,
                     "ultima_data": hoje
+                },
+                "$unset": {
+                    "download_reserva": "",
                 },
                 "$setOnInsert": {
                     "vip_ate": None
@@ -6331,7 +6649,7 @@ def formatos_por_plataforma(is_tiktok=False, is_instagram=False, is_pinterest=Fa
     return formatos_capados_gerais()
 
 
-def _processar_download(message, url, status_msg):
+def _processar_download(message, url, status_msg, reserva_download=None):
     atualizar_heartbeat_worker("preparando")
     prefix = None
     plataforma = nome_plataforma(*detectar_plataforma(url))
@@ -6403,9 +6721,12 @@ def _processar_download(message, url, status_msg):
             )
             if tipo_cache_url:
                 registrar_download_diario(vip_status)
-                if not vip_status:
-                    incrementar_download_gratis(
-                        user, message.chat.id, message.from_user.id
+                if reserva_download:
+                    confirmar_download_gratis(
+                        reserva_download,
+                        message.from_user.id,
+                        message.chat.id,
+                        message.from_user.id,
                     )
                 if status_msg:
                     safe_delete_message(message.chat.id, status_msg.message_id)
@@ -6455,9 +6776,12 @@ def _processar_download(message, url, status_msg):
                         url_normalizada=url_normalizada,
                     )
                     registrar_download_diario(vip_status)
-                    if not vip_status:
-                        incrementar_download_gratis(
-                            user, message.chat.id, message.from_user.id
+                    if reserva_download:
+                        confirmar_download_gratis(
+                            reserva_download,
+                            message.from_user.id,
+                            message.chat.id,
+                            message.from_user.id,
                         )
                     if status_msg:
                         safe_delete_message(message.chat.id, status_msg.message_id)
@@ -6526,8 +6850,13 @@ def _processar_download(message, url, status_msg):
                 )
 
                 registrar_download_diario(vip_status)
-                if not vip_status:
-                    incrementar_download_gratis(user, message.chat.id, message.from_user.id)
+                if reserva_download:
+                    confirmar_download_gratis(
+                        reserva_download,
+                        message.from_user.id,
+                        message.chat.id,
+                        message.from_user.id,
+                    )
 
                 if status_msg:
                     safe_delete_message(message.chat.id, status_msg.message_id)
@@ -6585,8 +6914,13 @@ def _processar_download(message, url, status_msg):
         )
         if tipo_cache_url:
             registrar_download_diario(vip_status)
-            if not vip_status:
-                incrementar_download_gratis(user, message.chat.id, message.from_user.id)
+            if reserva_download:
+                confirmar_download_gratis(
+                    reserva_download,
+                    message.from_user.id,
+                    message.chat.id,
+                    message.from_user.id,
+                )
             if status_msg:
                 safe_delete_message(message.chat.id, status_msg.message_id)
             return
@@ -6650,8 +6984,13 @@ def _processar_download(message, url, status_msg):
                 url_normalizada=url_normalizada,
             )
             registrar_download_diario(vip_status)
-            if not vip_status:
-                incrementar_download_gratis(user, message.chat.id, message.from_user.id)
+            if reserva_download:
+                confirmar_download_gratis(
+                    reserva_download,
+                    message.from_user.id,
+                    message.chat.id,
+                    message.from_user.id,
+                )
             if status_msg:
                 safe_delete_message(message.chat.id, status_msg.message_id)
             return
@@ -6765,8 +7104,13 @@ def _processar_download(message, url, status_msg):
         )
 
         registrar_download_diario(vip_status)
-        if not vip_status:
-            incrementar_download_gratis(user, message.chat.id, message.from_user.id)
+        if reserva_download:
+            confirmar_download_gratis(
+                reserva_download,
+                message.from_user.id,
+                message.chat.id,
+                message.from_user.id,
+            )
 
         if status_msg:
             safe_delete_message(message.chat.id, status_msg.message_id)
@@ -6844,8 +7188,15 @@ def registrar_trabalho_fila_persistente(user_id):
     """Salva só o necessário para avisar após uma queda; nunca salva o link."""
     agora = datetime.now(timezone.utc).replace(tzinfo=None)
     try:
-        fila_recuperacao_col.update_one(
-            {"_id": str(user_id)},
+        resultado = fila_recuperacao_col.update_one(
+            {
+                "_id": str(user_id),
+                "$or": [
+                    {"instance_id": APP_INSTANCE_ID},
+                    {"instance_id": {"$exists": False}},
+                    {"expires_at": {"$lte": agora}},
+                ],
+            },
             {
                 "$set": {
                     "instance_id": APP_INSTANCE_ID,
@@ -6866,15 +7217,23 @@ def registrar_trabalho_fila_persistente(user_id):
             upsert=True,
         )
         registrar_sucesso_componente("MongoDB")
-        return True
+        if resultado.modified_count or resultado.upserted_id:
+            return True, None
+        return False, "em_andamento"
     except Exception as e:
+        if getattr(e, "code", None) == 11000:
+            logger.info(
+                "[FILA_PERSISTENTE_OCUPADA] "
+                f"user_ref={referencia_usuario_log(user_id)}"
+            )
+            return False, "em_andamento"
         registrar_falha_componente("MongoDB", e)
         logger.warning(
             "[FILA_PERSISTENTE_REGISTRO] "
             f"user_ref={referencia_usuario_log(user_id)} "
             f"erro={sanitizar_erro_log(e)}"
         )
-        return False
+        return False, "indisponivel"
 
 
 def remover_trabalho_fila_persistente(user_id, instance_id=None):
@@ -6960,7 +7319,6 @@ def recuperar_fila_interrompida():
             )
             if not resultado.modified_count:
                 continue
-            recuperados += 1
         except Exception as e:
             registrar_falha_componente("MongoDB", e)
             logger.warning(
@@ -6969,6 +7327,33 @@ def recuperar_fila_interrompida():
             continue
 
         user_id = str(documento.get("_id") or "")
+        if not devolver_reserva_por_instancia(
+            user_id,
+            documento.get("instance_id"),
+        ):
+            try:
+                fila_recuperacao_col.update_one(
+                    {
+                        "_id": user_id,
+                        "recovery_claimed_by": APP_INSTANCE_ID,
+                    },
+                    {
+                        "$set": {"status": "pending", "updated_at": agora},
+                        "$unset": {
+                            "recovery_claimed_by": "",
+                            "recovery_claimed_at": "",
+                        },
+                    },
+                )
+            except Exception as e:
+                logger.warning(
+                    "[FILA_RECUPERACAO_LIMITE] "
+                    f"erro={sanitizar_erro_log(e)}"
+                )
+            continue
+
+        recuperados += 1
+
         enviado = False
         try:
             enviado = bool(
@@ -6984,31 +7369,14 @@ def recuperar_fila_interrompida():
             logger.warning("[FILA_RECUPERACAO] identificador inválido")
 
         try:
+            fila_recuperacao_col.delete_one(
+                {
+                    "_id": user_id,
+                    "recovery_claimed_by": APP_INSTANCE_ID,
+                }
+            )
             if enviado:
-                fila_recuperacao_col.delete_one(
-                    {
-                        "_id": user_id,
-                        "recovery_claimed_by": APP_INSTANCE_ID,
-                    }
-                )
                 notificados += 1
-            else:
-                fila_recuperacao_col.update_one(
-                    {
-                        "_id": user_id,
-                        "recovery_claimed_by": APP_INSTANCE_ID,
-                    },
-                    {
-                        "$set": {
-                            "status": "pending",
-                            "updated_at": agora,
-                        },
-                        "$unset": {
-                            "recovery_claimed_by": "",
-                            "recovery_claimed_at": "",
-                        },
-                    },
-                )
             registrar_sucesso_componente("MongoDB")
         except Exception as e:
             registrar_falha_componente("MongoDB", e)
@@ -7066,6 +7434,11 @@ def cancelar_trabalho_aguardando_desligamento(trabalho):
     if user_id:
         with DOWNLOAD_PENDING_LOCK:
             DOWNLOAD_PENDING_USERS.discard(user_id)
+        devolver_reserva_download_gratis(
+            trabalho.get("download_reservation"),
+            user_id,
+            motivo="deploy_fila",
+        )
         if trabalho.get("persistent_recorded"):
             remover_trabalho_fila_persistente(user_id)
     return notificado
@@ -7148,7 +7521,7 @@ def aguardar_trabalho_ativo_no_desligamento():
         return True
 
     user_id = obter_usuario_ativo_worker()
-    if user_id:
+    if user_id and not trabalho_ativo_tem_reserva_download():
         enviado = safe_send_message(
             int(user_id),
             mensagem_desligamento_para_usuario(em_processamento=True),
@@ -7198,12 +7571,17 @@ def loop_fila_downloads():
 
             message = trabalho["message"]
             user_id = str(message.from_user.id)
-            iniciar_trabalho_worker(user_id)
+            reserva_download = trabalho.get("download_reservation")
+            iniciar_trabalho_worker(
+                user_id,
+                has_download_reservation=bool(reserva_download),
+            )
             try:
                 _processar_download(
                     message,
                     trabalho["url"],
                     trabalho.get("status_msg"),
+                    reserva_download,
                 )
             except Exception as e:
                 logger.error(
@@ -7215,6 +7593,11 @@ def loop_fila_downloads():
                     "❌ Não consegui processar esse vídeo agora. Tente novamente em instantes.",
                 )
             finally:
+                devolver_reserva_download_gratis(
+                    reserva_download,
+                    user_id,
+                    motivo="worker_finalizado_sem_entrega",
+                )
                 if trabalho.get("persistent_recorded"):
                     remover_trabalho_fila_persistente(user_id)
                 with DOWNLOAD_PENDING_LOCK:
@@ -7252,15 +7635,6 @@ def handle_download(message):
 
     user = obter_usuario(message.from_user.id)
     vip_status = is_vip_user(user)
-    if not vip_status and user.get("downloads_hoje", 0) >= FREE_DAILY_LIMIT:
-        safe_reply_to(
-            message,
-            f"⚠️ *Limite diário atingido ({FREE_DAILY_LIMIT}/{FREE_DAILY_LIMIT})!*\n"
-            "Para continuar baixando sem limite diário, libere o VIP abaixo: 👇",
-            parse_mode="Markdown",
-        )
-        mostrar_planos_chat(message.chat.id, message.from_user.id)
-        return
 
     url = extrair_primeira_url(message.text)
     if not url or not validar_url_http_publica(url, resolver_dns=False):
@@ -7332,7 +7706,63 @@ def handle_download(message):
         )
         return
 
-    registro_persistido = registrar_trabalho_fila_persistente(user_id)
+    registro_persistido, erro_registro = registrar_trabalho_fila_persistente(
+        user_id
+    )
+    if not registro_persistido:
+        with DOWNLOAD_PENDING_LOCK:
+            DOWNLOAD_PENDING_USERS.discard(user_id)
+        if erro_registro == "em_andamento":
+            safe_reply_to(
+                message,
+                "⏳ Seu vídeo anterior ainda está na fila ou em processamento. "
+                "Aguarde a conclusão antes de enviar outro link.",
+            )
+        else:
+            safe_reply_to(
+                message,
+                "⏳ O banco de dados está temporariamente indisponível. "
+                "Aguarde alguns instantes e tente novamente.",
+            )
+        return
+
+    reserva_download = None
+    if not vip_status:
+        reserva_download, erro_reserva = reservar_download_gratis(user_id)
+        if not reserva_download:
+            with DOWNLOAD_PENDING_LOCK:
+                DOWNLOAD_PENDING_USERS.discard(user_id)
+            if erro_reserva == "limite":
+                remover_trabalho_fila_persistente(user_id)
+
+            if erro_reserva == "limite":
+                safe_reply_to(
+                    message,
+                    f"⚠️ *Limite diário atingido ({FREE_DAILY_LIMIT}/{FREE_DAILY_LIMIT})!*\n"
+                    "Para continuar baixando sem limite diário, libere o VIP abaixo: 👇",
+                    parse_mode="Markdown",
+                )
+                mostrar_planos_chat(message.chat.id, message.from_user.id)
+            elif erro_reserva == "em_andamento":
+                safe_reply_to(
+                    message,
+                    "⏳ Seu vídeo anterior ainda está na fila ou em processamento. "
+                    "Aguarde a conclusão antes de enviar outro link.",
+                )
+            elif erro_reserva == "indisponivel":
+                safe_reply_to(
+                    message,
+                    "⏳ O banco de dados está temporariamente indisponível. "
+                    "Aguarde alguns instantes e tente novamente.",
+                )
+            else:
+                safe_reply_to(
+                    message,
+                    "⏳ Não consegui reservar sua tentativa agora. Aguarde alguns "
+                    "instantes e envie o link novamente.",
+                )
+            return
+
     status_msg = safe_reply_to(
         message,
         "💎 Link recebido com prioridade VIP. Aguarde o processamento..."
@@ -7356,6 +7786,7 @@ def handle_download(message):
                             "url": url,
                             "status_msg": status_msg,
                             "persistent_recorded": registro_persistido,
+                            "download_reservation": reserva_download,
                         },
                     )
                 )
@@ -7367,6 +7798,11 @@ def handle_download(message):
             DOWNLOAD_PENDING_USERS.discard(user_id)
         if registro_persistido:
             remover_trabalho_fila_persistente(user_id)
+        devolver_reserva_download_gratis(
+            reserva_download,
+            user_id,
+            motivo="fila_nao_aceita",
+        )
 
     if recusado_desligamento:
         texto = (
@@ -7499,6 +7935,12 @@ if __name__ == "__main__":
         f"[CUSTO_CONFIG] cooldown={DOWNLOAD_COOLDOWN_SECONDS}s "
         f"user_hour={MAX_DOWNLOADS_PER_USER_HOUR} "
         f"global_hour={MAX_DOWNLOADS_GLOBAL_HOUR}"
+    )
+    logger.info(
+        f"[LIMITE_GRATIS_CONFIG] atomico=True limite={FREE_DAILY_LIMIT} "
+        f"reserva_ttl={DOWNLOAD_RESERVATION_TTL_SECONDS}s "
+        "devolve_em_falha=True escrita_adicional_sucesso=1 "
+        "vip_sem_reserva=True"
     )
     logger.info(
         f"[MONITOR_CONFIG] threshold={MONITOR_FAILURE_THRESHOLD} "
