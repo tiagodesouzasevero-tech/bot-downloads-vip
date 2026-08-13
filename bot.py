@@ -2773,7 +2773,6 @@ def _registrar_evento_usuario_mongodb(
     usuario_ref,
     token,
     agora_utc,
-    upsert,
 ):
     inicio_janela = agora_utc - timedelta(
         seconds=GLOBAL_RATE_LIMIT_WINDOW_SECONDS
@@ -2831,9 +2830,44 @@ def _registrar_evento_usuario_mongodb(
                 }
             }
         ],
-        upsert=bool(upsert),
+        # O MongoDB não permite $expr no predicado de uma operação com
+        # upsert. Documentos novos são criados separadamente abaixo.
+        upsert=False,
         return_document=ReturnDocument.AFTER,
         projection={"_id": 1},
+    )
+
+
+def _criar_limite_usuario_mongodb(usuario_ref, token, agora_utc):
+    """Cria o primeiro evento sem $expr; _id resolve corridas entre réplicas."""
+    expira_em = agora_utc + timedelta(
+        hours=USER_RATE_LIMIT_DOCUMENT_TTL_HOURS
+    )
+    resultado = limites_usuarios_col.insert_one(
+        {
+            "_id": usuario_ref,
+            "events": [{"token": token, "at": agora_utc}],
+            "last_event_at": agora_utc,
+            "updated_at": agora_utc,
+            "expires_at": expira_em,
+            "window_seconds": GLOBAL_RATE_LIMIT_WINDOW_SECONDS,
+            "cooldown_seconds": DOWNLOAD_COOLDOWN_SECONDS,
+            "identifier_anonymized": True,
+            "contains_plain_user_id": False,
+            "contains_urls": False,
+            "contains_message_text": False,
+        }
+    )
+    return {"_id": resultado.inserted_id}
+
+
+def _consultar_token_limite_usuario(usuario_ref, token):
+    return limites_usuarios_col.find_one(
+        {
+            "_id": usuario_ref,
+            "events.token": token,
+        },
+        {"_id": 1},
     )
 
 
@@ -2899,63 +2933,115 @@ def autorizar_limite_usuario_persistente(user_id):
             usuario_ref,
             token,
             agora_utc,
-            upsert=True,
         )
     except Exception as e:
-        if getattr(e, "code", None) == 11000:
-            try:
-                # Corrida na criação ou documento existente que não passou
-                # no cooldown/limite. A repetição sem upsert preserva a
-                # decisão atômica e nunca cria um segundo contador.
-                documento = _registrar_evento_usuario_mongodb(
-                    usuario_ref,
-                    token,
-                    agora_utc,
-                    upsert=False,
-                )
-            except Exception as retry_error:
-                registrar_falha_componente("MongoDB", retry_error)
-                logger.warning(
-                    "[LIMITE_USUARIO_PERSISTENTE] retry_falhou=True "
-                    f"user_ref={referencia_usuario_log(user_id)} "
-                    f"erro={sanitizar_erro_log(retry_error)}"
-                )
-                return False, (
-                    "⏳ O controle de solicitações está temporariamente "
-                    "indisponível. Aguarde alguns instantes e tente novamente."
-                )
-        else:
-            try:
-                gravado = limites_usuarios_col.find_one(
-                    {
-                        "_id": usuario_ref,
-                        "events.token": token,
-                    },
-                    {"_id": 1},
-                )
-            except Exception as verificacao_erro:
-                registrar_falha_componente("MongoDB", verificacao_erro)
-                logger.warning(
-                    "[LIMITE_USUARIO_PERSISTENTE] verificacao_falhou=True "
-                    f"user_ref={referencia_usuario_log(user_id)} "
-                    f"erro={sanitizar_erro_log(verificacao_erro)}"
-                )
-                return False, (
-                    "⏳ O controle de solicitações está temporariamente "
-                    "indisponível. Aguarde alguns instantes e tente novamente."
-                )
-            if not gravado:
-                registrar_falha_componente("MongoDB", e)
-                logger.warning(
-                    "[LIMITE_USUARIO_PERSISTENTE] gravacao_falhou=True "
-                    f"user_ref={referencia_usuario_log(user_id)} "
-                    f"erro={sanitizar_erro_log(e)}"
-                )
-                return False, (
-                    "⏳ O controle de solicitações está temporariamente "
-                    "indisponível. Aguarde alguns instantes e tente novamente."
-                )
-            documento = gravado
+        try:
+            gravado = _consultar_token_limite_usuario(usuario_ref, token)
+        except Exception as verificacao_erro:
+            registrar_falha_componente("MongoDB", verificacao_erro)
+            logger.warning(
+                "[LIMITE_USUARIO_PERSISTENTE] verificacao_falhou=True "
+                f"user_ref={referencia_usuario_log(user_id)} "
+                f"erro={sanitizar_erro_log(verificacao_erro)}"
+            )
+            return False, (
+                "⏳ O controle de solicitações está temporariamente "
+                "indisponível. Aguarde alguns instantes e tente novamente."
+            )
+        if not gravado:
+            registrar_falha_componente("MongoDB", e)
+            logger.warning(
+                "[LIMITE_USUARIO_PERSISTENTE] gravacao_falhou=True "
+                f"user_ref={referencia_usuario_log(user_id)} "
+                f"erro={sanitizar_erro_log(e)}"
+            )
+            return False, (
+                "⏳ O controle de solicitações está temporariamente "
+                "indisponível. Aguarde alguns instantes e tente novamente."
+            )
+        documento = gravado
+
+    if not documento:
+        try:
+            # Se ainda não existe contador, esta inserção registra o primeiro
+            # evento em uma única escrita e sem predicado $expr.
+            documento = _criar_limite_usuario_mongodb(
+                usuario_ref,
+                token,
+                agora_utc,
+            )
+        except Exception as criacao_erro:
+            if getattr(criacao_erro, "code", None) == 11000:
+                try:
+                    # Outra instância criou o mesmo _id entre a atualização e
+                    # a inserção. Repete a decisão atômica no documento vencedor.
+                    documento = _registrar_evento_usuario_mongodb(
+                        usuario_ref,
+                        token,
+                        agora_utc,
+                    )
+                except Exception as retry_error:
+                    try:
+                        gravado = _consultar_token_limite_usuario(
+                            usuario_ref,
+                            token,
+                        )
+                    except Exception as verificacao_erro:
+                        registrar_falha_componente("MongoDB", verificacao_erro)
+                        logger.warning(
+                            "[LIMITE_USUARIO_PERSISTENTE] "
+                            "verificacao_retry_falhou=True "
+                            f"user_ref={referencia_usuario_log(user_id)} "
+                            f"erro={sanitizar_erro_log(verificacao_erro)}"
+                        )
+                        return False, (
+                            "⏳ O controle de solicitações está temporariamente "
+                            "indisponível. Aguarde alguns instantes e tente "
+                            "novamente."
+                        )
+                    if not gravado:
+                        registrar_falha_componente("MongoDB", retry_error)
+                        logger.warning(
+                            "[LIMITE_USUARIO_PERSISTENTE] retry_falhou=True "
+                            f"user_ref={referencia_usuario_log(user_id)} "
+                            f"erro={sanitizar_erro_log(retry_error)}"
+                        )
+                        return False, (
+                            "⏳ O controle de solicitações está temporariamente "
+                            "indisponível. Aguarde alguns instantes e tente "
+                            "novamente."
+                        )
+                    documento = gravado
+            else:
+                try:
+                    gravado = _consultar_token_limite_usuario(
+                        usuario_ref,
+                        token,
+                    )
+                except Exception as verificacao_erro:
+                    registrar_falha_componente("MongoDB", verificacao_erro)
+                    logger.warning(
+                        "[LIMITE_USUARIO_PERSISTENTE] "
+                        "verificacao_criacao_falhou=True "
+                        f"user_ref={referencia_usuario_log(user_id)} "
+                        f"erro={sanitizar_erro_log(verificacao_erro)}"
+                    )
+                    return False, (
+                        "⏳ O controle de solicitações está temporariamente "
+                        "indisponível. Aguarde alguns instantes e tente novamente."
+                    )
+                if not gravado:
+                    registrar_falha_componente("MongoDB", criacao_erro)
+                    logger.warning(
+                        "[LIMITE_USUARIO_PERSISTENTE] criacao_falhou=True "
+                        f"user_ref={referencia_usuario_log(user_id)} "
+                        f"erro={sanitizar_erro_log(criacao_erro)}"
+                    )
+                    return False, (
+                        "⏳ O controle de solicitações está temporariamente "
+                        "indisponível. Aguarde alguns instantes e tente novamente."
+                    )
+                documento = gravado
 
     if not documento:
         try:
@@ -8380,6 +8466,7 @@ if __name__ == "__main__":
         f"limite={MAX_DOWNLOADS_PER_USER_HOUR} "
         f"cooldown={DOWNLOAD_COOLDOWN_SECONDS}s "
         "mongo_writes_por_aceite=1 compartilhado_entre_instancias=True "
+        "expr_em_upsert=False primeira_solicitacao_ops=2 "
         "identifier_anonymized=True contains_plain_user_id=False "
         "contains_urls=False"
     )
