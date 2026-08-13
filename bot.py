@@ -2562,6 +2562,7 @@ def configurar_menu_comandos():
     comandos_admin = comandos_usuario + [
         types.BotCommand("painel", "Abrir o Painel Admin"),
         types.BotCommand("darvip", "Liberar VIP manualmente"),
+        types.BotCommand("removervip", "Remover VIP de um usuário"),
         types.BotCommand("zerar", "Zerar o limite de um usuário"),
         types.BotCommand("avisogeral", "Enviar comunicado aos usuários"),
         types.BotCommand("diagnostico", "Verificar a saúde do bot"),
@@ -3097,6 +3098,74 @@ def dar_vip_manual(message):
         safe_reply_to(
             message,
             "❌ Use: `/darvip ID DIAS` (de 1 a 3650).",
+            parse_mode="Markdown",
+        )
+
+
+@bot.message_handler(commands=["removervip"])
+def remover_vip_manual(message):
+    if not exigir_admin_privado(message):
+        return
+
+    try:
+        args = message.text.split()
+        if len(args) != 2:
+            return safe_reply_to(
+                message,
+                "❌ Use: `/removervip ID`",
+                parse_mode="Markdown",
+            )
+
+        alvo_id = str(args[1]).strip()
+        if not re.fullmatch(r"[1-9]\d{0,19}", alvo_id):
+            raise ValueError("ID inválida")
+
+        usuario = usuarios_col.find_one({"_id": alvo_id})
+        if not usuario:
+            return safe_reply_to(
+                message,
+                f"❌ Usuário `{alvo_id}` não encontrado.",
+                parse_mode="Markdown",
+            )
+
+        vip_anterior = usuario.get("vip_ate")
+        vip_estava_ativo = is_vip_user(usuario)
+
+        usuarios_col.update_one(
+            {"_id": alvo_id},
+            {"$set": {"vip_ate": None}},
+        )
+
+        logger.info(
+            f"[REMOVERVIP] admin_id={ADMIN_ID} user_id={alvo_id} "
+            f"vip_anterior={vip_anterior} ativo={vip_estava_ativo}"
+        )
+
+        if not vip_estava_ativo:
+            return safe_reply_to(
+                message,
+                f"ℹ️ O usuário `{alvo_id}` já não possuía VIP ativo.",
+                parse_mode="Markdown",
+            )
+
+        safe_reply_to(
+            message,
+            f"✅ VIP do usuário `{alvo_id}` removido com sucesso.",
+            parse_mode="Markdown",
+        )
+        safe_send_message(
+            int(alvo_id),
+            "ℹ️ *Acesso VIP removido*\n\n"
+            "Seu acesso VIP foi encerrado pelo suporte. "
+            "Sua conta agora utiliza o plano gratuito.\n\n"
+            "Se achar que houve um engano, use /suporte.",
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        logger.error(f"[REMOVERVIP] erro={sanitizar_erro_log(e)}")
+        safe_reply_to(
+            message,
+            "❌ Use: `/removervip ID`",
             parse_mode="Markdown",
         )
 
