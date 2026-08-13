@@ -11,6 +11,7 @@ import itertools
 import logging
 import socket
 import shutil
+import stat
 from collections import defaultdict, deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from queue import Full, PriorityQueue
@@ -85,6 +86,9 @@ PIX_RECEIVER_NAME = get_env_required("PIX_RECEIVER_NAME")
 PIX_RECEIVER_BANK = get_env_required("PIX_RECEIVER_BANK")
 
 DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", "downloads_temp")
+PRIVATE_DIR = os.path.join(DOWNLOAD_DIR, "private")
+PRIVATE_COOKIES_DIR = os.path.join(PRIVATE_DIR, "cookies")
+PRIVATE_BACKUPS_DIR = os.path.join(PRIVATE_DIR, "backups")
 TZ = ZoneInfo("America/Sao_Paulo")
 
 SERVICE_NAME = get_first_env(
@@ -203,6 +207,152 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
 logger = logging.getLogger("baixar_videos_hd")
+
+
+# =========================================
+# ARMAZENAMENTO PRIVADO LOCAL
+# =========================================
+def garantir_diretorio_privado(caminho):
+    """Cria e valida um diretório acessível somente pelo processo do bot."""
+    if os.path.lexists(caminho) and os.path.islink(caminho):
+        raise RuntimeError("DIRETORIO_PRIVADO_NAO_PODE_SER_LINK")
+
+    os.makedirs(caminho, mode=0o700, exist_ok=True)
+    os.chmod(caminho, 0o700)
+    estado = os.stat(caminho, follow_symlinks=False)
+    if not stat.S_ISDIR(estado.st_mode):
+        raise RuntimeError("CAMINHO_PRIVADO_NAO_E_DIRETORIO")
+    if stat.S_IMODE(estado.st_mode) != 0o700:
+        raise RuntimeError("PERMISSAO_DIRETORIO_PRIVADO_INVALIDA")
+    return caminho
+
+
+def garantir_estrutura_privada():
+    garantir_diretorio_privado(PRIVATE_DIR)
+    garantir_diretorio_privado(PRIVATE_COOKIES_DIR)
+    garantir_diretorio_privado(PRIVATE_BACKUPS_DIR)
+    return True
+
+
+def garantir_arquivo_privado(caminho):
+    """Recusa links e exige permissão 0600 em um arquivo existente."""
+    if os.path.islink(caminho):
+        raise RuntimeError("ARQUIVO_PRIVADO_NAO_PODE_SER_LINK")
+
+    estado = os.stat(caminho, follow_symlinks=False)
+    if not stat.S_ISREG(estado.st_mode):
+        raise RuntimeError("CAMINHO_PRIVADO_NAO_E_ARQUIVO")
+
+    os.chmod(caminho, 0o600)
+    estado = os.stat(caminho, follow_symlinks=False)
+    if stat.S_IMODE(estado.st_mode) != 0o600:
+        raise RuntimeError("PERMISSAO_ARQUIVO_PRIVADO_INVALIDA")
+    return caminho
+
+
+def abrir_arquivo_privado_para_escrita(caminho):
+    """Abre sem seguir links simbólicos e aplica 0600 antes de escrever."""
+    garantir_diretorio_privado(os.path.dirname(caminho))
+    if os.path.lexists(caminho) and os.path.islink(caminho):
+        raise RuntimeError("ARQUIVO_PRIVADO_NAO_PODE_SER_LINK")
+
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+
+    descritor = os.open(caminho, flags, 0o600)
+    try:
+        os.fchmod(descritor, 0o600)
+        return os.fdopen(
+            descritor,
+            "w",
+            encoding="utf-8",
+            newline="\n",
+        )
+    except Exception:
+        os.close(descritor)
+        raise
+
+
+def escrever_texto_privado(caminho, texto):
+    with abrir_arquivo_privado_para_escrita(caminho) as arquivo:
+        arquivo.write(texto)
+        arquivo.flush()
+    garantir_arquivo_privado(caminho)
+    return caminho
+
+
+def ler_texto_privado(caminho):
+    garantir_arquivo_privado(caminho)
+    with open(caminho, "r", encoding="utf-8") as arquivo:
+        return arquivo.read()
+
+
+def migrar_arquivo_privado_legado(nome_arquivo):
+    """Move cookies antigos da raiz sem manter uma cópia desprotegida."""
+    origem = os.path.join(DOWNLOAD_DIR, nome_arquivo)
+    destino = os.path.join(PRIVATE_COOKIES_DIR, nome_arquivo)
+
+    if not os.path.lexists(origem):
+        if os.path.exists(destino):
+            garantir_arquivo_privado(destino)
+        return False
+
+    if os.path.islink(origem):
+        os.unlink(origem)
+        logger.warning(
+            f"[ARMAZENAMENTO_PRIVADO] link legado removido nome={nome_arquivo}"
+        )
+        return False
+
+    estado = os.stat(origem, follow_symlinks=False)
+    if not stat.S_ISREG(estado.st_mode):
+        raise RuntimeError("ARQUIVO_LEGADO_NAO_E_REGULAR")
+
+    garantir_diretorio_privado(PRIVATE_COOKIES_DIR)
+    if os.path.lexists(destino):
+        garantir_arquivo_privado(destino)
+        os.remove(origem)
+        return False
+
+    os.replace(origem, destino)
+    garantir_arquivo_privado(destino)
+    logger.info(
+        f"[ARMAZENAMENTO_PRIVADO] arquivo legado migrado nome={nome_arquivo}"
+    )
+    return True
+
+
+def limpar_backups_privados_abandonados():
+    """Remove sobras de backups; arquivos válidos só existem durante o envio."""
+    garantir_diretorio_privado(PRIVATE_BACKUPS_DIR)
+    removidos = 0
+    for caminho in glob.glob(os.path.join(PRIVATE_BACKUPS_DIR, "*")):
+        try:
+            if os.path.islink(caminho) or os.path.isfile(caminho):
+                os.remove(caminho)
+                removidos += 1
+        except Exception as e:
+            logger.warning(
+                f"[BACKUP_PRIVADO_CLEANUP] arquivo={os.path.basename(caminho)} "
+                f"erro={sanitizar_erro_log(e)}"
+            )
+    if removidos:
+        logger.info(f"[BACKUP_PRIVADO_CLEANUP] removidos={removidos}")
+    return removidos
+
+
+def inicializar_armazenamento_privado():
+    garantir_estrutura_privada()
+    for nome in sorted(ARQUIVOS_PERSISTENTES_DOWNLOAD_DIR):
+        migrar_arquivo_privado_legado(nome)
+    limpar_backups_privados_abandonados()
+    logger.info(
+        "[ARMAZENAMENTO_PRIVADO] estrutura_segura=True "
+        "diretorios=0700 arquivos=0600"
+    )
+    return True
+
 
 # =========================================
 # DB / BOT / APP
@@ -1431,6 +1581,8 @@ def get_instagram_cookiefile():
     if not texto:
         return None
 
+    garantir_estrutura_privada()
+
     # Algumas plataformas salvam quebras de linha como os caracteres \n.
     if "\n" not in texto and "\\n" in texto:
         texto = texto.replace("\\r\\n", "\n").replace("\\n", "\n")
@@ -1441,9 +1593,8 @@ def get_instagram_cookiefile():
     if not texto.startswith("# Netscape HTTP Cookie File") and not texto.startswith("# HTTP Cookie File"):
         texto = "# Netscape HTTP Cookie File\n" + texto
 
-    cookie_path = os.path.join(DOWNLOAD_DIR, "instagram_cookies.txt")
-    with open(cookie_path, "w", encoding="utf-8", newline="\n") as f:
-        f.write(texto + "\n")
+    cookie_path = os.path.join(PRIVATE_COOKIES_DIR, "instagram_cookies.txt")
+    escrever_texto_privado(cookie_path, texto + "\n")
 
     linhas = [linha for linha in texto.splitlines() if linha and not linha.startswith("#")]
     tem_sessionid = any(
@@ -1490,7 +1641,8 @@ def get_tiktok_cookiefile():
     """Aplica cookies da Railway e preserva a sessão atualizada pelo yt-dlp."""
     global TIKTOK_COOKIES_ENV_APLICADOS
 
-    cookie_path = os.path.join(DOWNLOAD_DIR, "tiktok_cookies.txt")
+    garantir_estrutura_privada()
+    cookie_path = os.path.join(PRIVATE_COOKIES_DIR, "tiktok_cookies.txt")
     texto_env = normalizar_tiktok_cookies_text(TIKTOK_COOKIES_TEXT)
     linhas_env = linhas_validas_tiktok_cookies(texto_env)
 
@@ -1507,9 +1659,8 @@ def get_tiktok_cookiefile():
         texto_arquivo = ""
         if os.path.exists(cookie_path):
             try:
-                with open(cookie_path, "r", encoding="utf-8") as f:
-                    texto_arquivo = f.read()
-            except OSError as e:
+                texto_arquivo = ler_texto_privado(cookie_path)
+            except Exception as e:
                 logger.warning(f"[TIKTOK_COOKIES_LEITURA_FALHA] erro={e}")
 
         linhas_arquivo = linhas_validas_tiktok_cookies(texto_arquivo)
@@ -1525,8 +1676,10 @@ def get_tiktok_cookiefile():
             ):
                 texto_gravar = "# Netscape HTTP Cookie File\n" + texto_gravar
 
-            with open(cookie_path, "w", encoding="utf-8", newline="\n") as f:
-                f.write(texto_gravar.rstrip("\n") + "\n")
+            escrever_texto_privado(
+                cookie_path,
+                texto_gravar.rstrip("\n") + "\n",
+            )
 
             TIKTOK_COOKIES_ENV_APLICADOS = True
             logger.info(
@@ -1553,8 +1706,10 @@ def get_tiktok_cookiefile():
             ):
                 texto_gravar = "# Netscape HTTP Cookie File\n" + texto_gravar
 
-            with open(cookie_path, "w", encoding="utf-8", newline="\n") as f:
-                f.write(texto_gravar.rstrip("\n") + "\n")
+            escrever_texto_privado(
+                cookie_path,
+                texto_gravar.rstrip("\n") + "\n",
+            )
 
             TIKTOK_COOKIES_ENV_APLICADOS = True
             logger.info(
@@ -1565,8 +1720,10 @@ def get_tiktok_cookiefile():
 
         # Sem configuração, mantém um cookiefile válido e vazio para o yt-dlp
         # poder salvar uma sessão caso o desafio do TikTok permita.
-        with open(cookie_path, "w", encoding="utf-8", newline="\n") as f:
-            f.write("# Netscape HTTP Cookie File\n")
+        escrever_texto_privado(
+            cookie_path,
+            "# Netscape HTTP Cookie File\n",
+        )
 
         logger.info(
             "[TIKTOK_COOKIES] origem=nenhuma cookies_fornecidos=False linhas=0"
@@ -1582,7 +1739,8 @@ def validar_tiktok_device_id(valor):
 
 def get_tiktok_device_id():
     """Mantém um device_id estável entre reinícios usando o volume da Railway."""
-    device_path = os.path.join(DOWNLOAD_DIR, "tiktok_device_id.txt")
+    garantir_estrutura_privada()
+    device_path = os.path.join(PRIVATE_COOKIES_DIR, "tiktok_device_id.txt")
 
     with TIKTOK_DEVICE_LOCK:
         device_id_env = validar_tiktok_device_id(TIKTOK_DEVICE_ID_TEXT)
@@ -1594,21 +1752,21 @@ def get_tiktok_device_id():
 
         if device_id_env:
             try:
-                with open(device_path, "w", encoding="utf-8", newline="\n") as f:
-                    f.write(device_id_env + "\n")
-            except OSError as e:
+                escrever_texto_privado(device_path, device_id_env + "\n")
+            except Exception as e:
                 logger.warning(f"[TIKTOK_DEVICE_ID_GRAVACAO_FALHA] origem=variavel erro={e}")
             logger.info("[TIKTOK_DEVICE_ID] origem=variavel_railway valido=True")
             return device_id_env
 
         if os.path.exists(device_path):
             try:
-                with open(device_path, "r", encoding="utf-8") as f:
-                    device_id_arquivo = validar_tiktok_device_id(f.read())
+                device_id_arquivo = validar_tiktok_device_id(
+                    ler_texto_privado(device_path)
+                )
                 if device_id_arquivo:
                     logger.info("[TIKTOK_DEVICE_ID] origem=arquivo_persistente valido=True")
                     return device_id_arquivo
-            except OSError as e:
+            except Exception as e:
                 logger.warning(f"[TIKTOK_DEVICE_ID_LEITURA_FALHA] erro={e}")
 
         # O intervalo é o mesmo usado pelo próprio extrator do yt-dlp. Gravar
@@ -1617,10 +1775,9 @@ def get_tiktok_device_id():
         fim = 7325099899999994577
         device_id_novo = str(inicio + (uuid.uuid4().int % (fim - inicio + 1)))
         try:
-            with open(device_path, "w", encoding="utf-8", newline="\n") as f:
-                f.write(device_id_novo + "\n")
+            escrever_texto_privado(device_path, device_id_novo + "\n")
             logger.info("[TIKTOK_DEVICE_ID] origem=gerado_persistente valido=True")
-        except OSError as e:
+        except Exception as e:
             logger.warning(f"[TIKTOK_DEVICE_ID_GRAVACAO_FALHA] origem=gerado erro={e}")
         return device_id_novo
 
@@ -2802,16 +2959,27 @@ def construir_payload_backup(nome, documentos):
 
 
 def salvar_backup_json(nome_arquivo_base, payload):
-    timestamp = agora_tz().strftime("%Y%m%d_%H%M%S")
-    caminho = os.path.join(DOWNLOAD_DIR, f"{nome_arquivo_base}_{timestamp}.json")
+    if not re.fullmatch(r"[a-z0-9_]{1,80}", str(nome_arquivo_base or "")):
+        raise RuntimeError("NOME_BACKUP_INVALIDO")
 
-    with open(caminho, "w", encoding="utf-8") as f:
+    garantir_estrutura_privada()
+    timestamp = agora_tz().strftime("%Y%m%d_%H%M%S")
+    caminho = os.path.join(
+        PRIVATE_BACKUPS_DIR,
+        f"{nome_arquivo_base}_{timestamp}.json",
+    )
+
+    with abrir_arquivo_privado_para_escrita(caminho) as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
+        f.flush()
+
+    garantir_arquivo_privado(caminho)
 
     return caminho
 
 
 def enviar_documento_privado_admin(caminho_arquivo, legenda=None):
+    garantir_arquivo_privado(caminho_arquivo)
     with open(caminho_arquivo, "rb") as f:
         bot.send_document(ADMIN_ID, f, caption=legenda)
 
@@ -5401,6 +5569,13 @@ if __name__ == "__main__":
         logger.warning(
             "[TIKTOK_DEPENDENCIAS] curl_cffi ausente. No requirements.txt, "
             "use yt-dlp[default,curl-cffi] para habilitar a impersonacao."
+        )
+    try:
+        inicializar_armazenamento_privado()
+    except Exception as e:
+        logger.critical(
+            "[ARMAZENAMENTO_PRIVADO_FALHA] cookies e backups locais ficarão "
+            f"indisponíveis erro={sanitizar_erro_log(e)}"
         )
     inicializar_metricas_diarias()
     cleanup_download_dir_old_files(max_age_hours=6)
