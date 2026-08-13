@@ -214,16 +214,24 @@ DOWNLOAD_WORKER_STATE = {
     "restart_blocked_reason": None,
     "restart_retry_after_monotonic": 0.0,
 }
-PLATFORM_MONITOR_LOCK = Lock()
-PLATFORM_MONITOR_STATE = {
-    plataforma: {
+COMPONENT_MONITOR_LOCK = Lock()
+COMPONENTES_PLATAFORMA = ("TikTok", "Instagram", "Pinterest", "RedNote")
+COMPONENTES_INTERNOS = (
+    "Telegram",
+    "Processamento",
+    "MongoDB",
+    "Armazenamento",
+    "Interno",
+)
+COMPONENT_MONITOR_STATE = {
+    componente: {
         "failures": deque(),
         "alert_active": False,
         "last_alert_at": 0.0,
         "last_error": None,
         "last_success_at": None,
     }
-    for plataforma in ("TikTok", "Instagram", "Pinterest", "RedNote")
+    for componente in COMPONENTES_PLATAFORMA + COMPONENTES_INTERNOS
 }
 
 ARQUIVOS_PERSISTENTES_DOWNLOAD_DIR = {
@@ -526,6 +534,28 @@ def sanitizar_erro_log(erro, limite=1200):
     return texto[:limite]
 
 
+def sanitizar_erro_monitoramento(erro, limite=500):
+    """Remove URLs, identificadores longos e segredos antes de alertar o ADM."""
+    texto = sanitizar_erro_log(erro, limite=max(limite * 2, 500))
+    texto = re.sub(
+        r"(?i)\b(token|password|senha|secret|api[_-]?key|authorization)\s*[:=]\s*[^\s,;]+",
+        r"\1=[protegido]",
+        texto,
+    )
+    texto = re.sub(r"\b\d{7,}\b", "[id]", texto)
+    return texto[:limite]
+
+
+class FalhaComponenteDownload(RuntimeError):
+    """Transporta a origem confirmada sem misturar contadores de componentes."""
+
+    def __init__(self, componente, erro, ja_registrada=False):
+        self.componente = normalizar_componente_monitoramento(componente) or "Interno"
+        self.erro_original = erro
+        self.ja_registrada = bool(ja_registrada)
+        super().__init__(str(erro or componente))
+
+
 def validar_url_http_publica(url, resolver_dns=True):
     """Rejeita credenciais, portas incomuns e destinos de rede privada."""
     try:
@@ -774,19 +804,22 @@ def cleanup_download_dir_periodicamente(interval_minutes=60, max_age_hours=6):
 
 
 def encontrar_arquivo_baixado(prefix):
-    candidatos = []
-    for arq in glob.glob(f"{prefix}*"):
-        nome = arq.lower()
-        if nome.endswith(".part") or nome.endswith(".ytdl"):
-            continue
-        if os.path.isfile(arq):
-            candidatos.append(arq)
+    try:
+        candidatos = []
+        for arq in glob.glob(f"{prefix}*"):
+            nome = arq.lower()
+            if nome.endswith(".part") or nome.endswith(".ytdl"):
+                continue
+            if os.path.isfile(arq):
+                candidatos.append(arq)
 
-    if not candidatos:
-        return None
+        if not candidatos:
+            return None
 
-    candidatos.sort(key=lambda x: os.path.getsize(x), reverse=True)
-    return candidatos[0]
+        candidatos.sort(key=lambda x: os.path.getsize(x), reverse=True)
+        return candidatos[0]
+    except OSError as e:
+        raise FalhaComponenteDownload("Armazenamento", e) from e
 
 
 def parse_fps(valor):
@@ -825,23 +858,32 @@ def obter_info_midia(arquivo_entrada):
             text=True,
             timeout=FFPROBE_TIMEOUT_SECONDS,
         )
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as e:
         logger.warning(
             f"[FFPROBE] Tempo limite excedido arquivo={arquivo_entrada} "
             f"timeout={FFPROBE_TIMEOUT_SECONDS}s"
         )
-        return None
+        raise FalhaComponenteDownload(
+            "Processamento",
+            f"FFPROBE_TIMEOUT timeout={FFPROBE_TIMEOUT_SECONDS}s",
+        ) from e
 
     if resultado.returncode != 0:
         logger.warning(f"[FFPROBE] Falha ao analisar {arquivo_entrada}: {resultado.stderr[-500:]}")
-        return None
+        raise FalhaComponenteDownload(
+            "Processamento",
+            f"FFPROBE_FALHOU codigo={resultado.returncode}",
+        )
 
     try:
         import json
         dados = json.loads(resultado.stdout)
     except Exception as e:
         logger.warning(f"[FFPROBE] JSON inválido para {arquivo_entrada}: {e}")
-        return None
+        raise FalhaComponenteDownload(
+            "Processamento",
+            "FFPROBE_JSON_INVALIDO",
+        ) from e
 
     video_stream = None
     audio_stream = None
@@ -867,8 +909,8 @@ def obter_info_midia(arquivo_entrada):
     tamanho = None
     try:
         tamanho = os.path.getsize(arquivo_entrada)
-    except Exception:
-        tamanho = None
+    except OSError as e:
+        raise FalhaComponenteDownload("Armazenamento", e) from e
 
     return {
         "width": (video_stream or {}).get("width"),
@@ -885,9 +927,15 @@ def obter_info_midia(arquivo_entrada):
 def validar_arquivo_midia(arquivo, limite_bytes, fase="arquivo", exigir_duracao=True):
     """Impede mídia sem duração, longa demais ou grande demais."""
     if not arquivo or not os.path.isfile(arquivo):
-        raise RuntimeError(f"ARQUIVO_MIDIA_AUSENTE fase={fase}")
+        raise FalhaComponenteDownload(
+            "Armazenamento",
+            f"ARQUIVO_MIDIA_AUSENTE fase={fase}",
+        )
 
-    tamanho = os.path.getsize(arquivo)
+    try:
+        tamanho = os.path.getsize(arquivo)
+    except OSError as e:
+        raise FalhaComponenteDownload("Armazenamento", e) from e
     if tamanho <= 0:
         raise RuntimeError(f"ARQUIVO_MIDIA_VAZIO fase={fase}")
     if tamanho > limite_bytes:
@@ -899,7 +947,10 @@ def validar_arquivo_midia(arquivo, limite_bytes, fase="arquivo", exigir_duracao=
 
     info = obter_info_midia(arquivo)
     if not info:
-        raise RuntimeError(f"MIDIA_INVALIDA_OU_NAO_ANALISAVEL fase={fase}")
+        raise FalhaComponenteDownload(
+            "Processamento",
+            f"MIDIA_INVALIDA_OU_NAO_ANALISAVEL fase={fase}",
+        )
 
     duracao = info.get("duration")
     if exigir_duracao and (duracao is None or duracao <= 0):
@@ -910,6 +961,7 @@ def validar_arquivo_midia(arquivo, limite_bytes, fase="arquivo", exigir_duracao=
             f"limite={MAX_DURATION_SECONDS}"
         )
 
+    registrar_sucesso_componente("Armazenamento")
     return info
 
 
@@ -969,15 +1021,22 @@ def remuxar_para_mp4_faststart(arquivo_entrada):
             timeout=FFMPEG_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired as e:
-        raise RuntimeError(
-            f"FFMPEG_TIMEOUT remux timeout={FFMPEG_TIMEOUT_SECONDS}s"
+        raise FalhaComponenteDownload(
+            "Processamento",
+            f"FFMPEG_TIMEOUT remux timeout={FFMPEG_TIMEOUT_SECONDS}s",
         ) from e
 
     if resultado.returncode != 0:
-        raise Exception(f"Falha no remux do ffmpeg: {resultado.stderr[-1500:]}")
+        raise FalhaComponenteDownload(
+            "Processamento",
+            f"FFMPEG_REMUX_FALHOU codigo={resultado.returncode}",
+        )
 
     if not os.path.exists(arquivo_saida):
-        raise Exception("Arquivo remuxado não foi gerado.")
+        raise FalhaComponenteDownload(
+            "Processamento",
+            "FFMPEG_REMUX_NAO_GEROU_SAIDA",
+        )
 
     return arquivo_saida
 
@@ -1052,15 +1111,22 @@ def converter_para_h264_compativel(arquivo_entrada, info=None):
             timeout=FFMPEG_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired as e:
-        raise RuntimeError(
-            f"FFMPEG_TIMEOUT fallback timeout={FFMPEG_TIMEOUT_SECONDS}s"
+        raise FalhaComponenteDownload(
+            "Processamento",
+            f"FFMPEG_TIMEOUT fallback timeout={FFMPEG_TIMEOUT_SECONDS}s",
         ) from e
 
     if resultado.returncode != 0:
-        raise Exception(f"Falha no ffmpeg fallback H.264: {resultado.stderr[-1500:]}")
+        raise FalhaComponenteDownload(
+            "Processamento",
+            f"FFMPEG_FALLBACK_FALHOU codigo={resultado.returncode}",
+        )
 
     if not os.path.exists(arquivo_saida):
-        raise Exception("Arquivo fallback H.264 não foi gerado.")
+        raise FalhaComponenteDownload(
+            "Processamento",
+            "FFMPEG_FALLBACK_NAO_GEROU_SAIDA",
+        )
 
     return arquivo_saida
 
@@ -1111,15 +1177,22 @@ def converter_para_720x1280_30fps(arquivo_entrada):
             timeout=FFMPEG_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired as e:
-        raise RuntimeError(
-            f"FFMPEG_TIMEOUT conversao timeout={FFMPEG_TIMEOUT_SECONDS}s"
+        raise FalhaComponenteDownload(
+            "Processamento",
+            f"FFMPEG_TIMEOUT conversao timeout={FFMPEG_TIMEOUT_SECONDS}s",
         ) from e
 
     if resultado.returncode != 0:
-        raise Exception(f"Falha no ffmpeg: {resultado.stderr[-1500:]}")
+        raise FalhaComponenteDownload(
+            "Processamento",
+            f"FFMPEG_CONVERSAO_FALHOU codigo={resultado.returncode}",
+        )
 
     if not os.path.exists(arquivo_saida):
-        raise Exception("Arquivo convertido não foi gerado.")
+        raise FalhaComponenteDownload(
+            "Processamento",
+            "FFMPEG_CONVERSAO_NAO_GEROU_SAIDA",
+        )
 
     return arquivo_saida
 
@@ -1215,6 +1288,24 @@ def normalizar_plataforma_monitoramento(plataforma):
     return mapa.get(str(plataforma or "").strip().lower())
 
 
+def normalizar_componente_monitoramento(componente):
+    plataforma = normalizar_plataforma_monitoramento(componente)
+    if plataforma:
+        return plataforma
+    mapa = {
+        "telegram": "Telegram",
+        "processamento": "Processamento",
+        "ffmpeg": "Processamento",
+        "ffprobe": "Processamento",
+        "mongodb": "MongoDB",
+        "mongo": "MongoDB",
+        "armazenamento": "Armazenamento",
+        "disco": "Armazenamento",
+        "interno": "Interno",
+    }
+    return mapa.get(str(componente or "").strip().lower())
+
+
 def falha_tecnica_monitoravel(erro):
     """Separa falhas do serviço de limitações próprias do conteúdo enviado."""
     texto = str(erro or "").lower()
@@ -1251,20 +1342,20 @@ def falha_tecnica_monitoravel(erro):
     )
 
 
-def registrar_falha_plataforma(plataforma, erro):
-    """Alerta o administrador apenas após falhas técnicas repetidas."""
-    plataforma = normalizar_plataforma_monitoramento(plataforma)
-    if not plataforma or not falha_tecnica_monitoravel(erro):
+def registrar_falha_componente(componente, erro):
+    """Conta a falha somente na origem confirmada e alerta sem dados sensíveis."""
+    componente = normalizar_componente_monitoramento(componente)
+    if not componente or not falha_tecnica_monitoravel(erro):
         return False
 
     agora_monotonic = time.monotonic()
     inicio_janela = agora_monotonic - MONITOR_FAILURE_WINDOW_SECONDS
-    erro_limpo = sanitizar_erro_log(erro, limite=500)
+    erro_limpo = sanitizar_erro_monitoramento(erro, limite=500)
     deve_alertar = False
     total_falhas = 0
 
-    with PLATFORM_MONITOR_LOCK:
-        estado = PLATFORM_MONITOR_STATE[plataforma]
+    with COMPONENT_MONITOR_LOCK:
+        estado = COMPONENT_MONITOR_STATE[componente]
         falhas = estado["failures"]
         while falhas and falhas[0] < inicio_janela:
             falhas.popleft()
@@ -1284,7 +1375,7 @@ def registrar_falha_plataforma(plataforma, erro):
             deve_alertar = True
 
     logger.warning(
-        f"[MONITOR_FALHA] plataforma={plataforma} "
+        f"[MONITOR_FALHA] componente={componente} "
         f"falhas_janela={total_falhas} alerta={deve_alertar} erro={erro_limpo}"
     )
 
@@ -1293,26 +1384,26 @@ def registrar_falha_plataforma(plataforma, erro):
         safe_send_message(
             ADMIN_ID,
             "⚠️ <b>Alerta automático de funcionamento</b>\n\n"
-            f"Plataforma: <b>{html.escape(plataforma)}</b>\n"
+            f"Componente: <b>{html.escape(componente)}</b>\n"
             f"Falhas técnicas: <b>{total_falhas}</b> nos últimos "
             f"{janela_minutos} minutos\n"
             f"Última falha: <code>{html.escape(erro_limpo)}</code>\n\n"
             "O bot continuará tentando normalmente. Você será avisado quando "
-            "um download real voltar a funcionar.",
+            "esse componente voltar a funcionar.",
             parse_mode="HTML",
         )
     return deve_alertar
 
 
-def registrar_sucesso_plataforma(plataforma):
-    """Limpa as falhas e avisa quando um serviço em alerta se recupera."""
-    plataforma = normalizar_plataforma_monitoramento(plataforma)
-    if not plataforma:
+def registrar_sucesso_componente(componente):
+    """Limpa apenas o contador do componente que comprovadamente respondeu."""
+    componente = normalizar_componente_monitoramento(componente)
+    if not componente:
         return False
 
     recuperou = False
-    with PLATFORM_MONITOR_LOCK:
-        estado = PLATFORM_MONITOR_STATE[plataforma]
+    with COMPONENT_MONITOR_LOCK:
+        estado = COMPONENT_MONITOR_STATE[componente]
         recuperou = bool(estado["alert_active"])
         estado["failures"].clear()
         estado["alert_active"] = False
@@ -1320,17 +1411,24 @@ def registrar_sucesso_plataforma(plataforma):
         estado["last_success_at"] = agora_tz().isoformat()
 
     logger.info(
-        f"[MONITOR_SUCESSO] plataforma={plataforma} recuperacao={recuperou}"
+        f"[MONITOR_SUCESSO] componente={componente} recuperacao={recuperou}"
     )
     if recuperou:
         safe_send_message(
             ADMIN_ID,
-            "✅ <b>Serviço normalizado</b>\n\n"
-            f"A plataforma <b>{html.escape(plataforma)}</b> voltou a concluir "
-            "downloads reais normalmente.",
+            "✅ <b>Componente normalizado</b>\n\n"
+            f"<b>{html.escape(componente)}</b> voltou a funcionar normalmente.",
             parse_mode="HTML",
         )
     return recuperou
+
+
+def registrar_falha_plataforma(plataforma, erro):
+    return registrar_falha_componente(plataforma, erro)
+
+
+def registrar_sucesso_plataforma(plataforma):
+    return registrar_sucesso_componente(plataforma)
 
 
 def obter_resumo_monitoramento():
@@ -1338,12 +1436,12 @@ def obter_resumo_monitoramento():
     inicio_janela = agora_monotonic - MONITOR_FAILURE_WINDOW_SECONDS
     resumo = {}
 
-    with PLATFORM_MONITOR_LOCK:
-        for plataforma, estado in PLATFORM_MONITOR_STATE.items():
+    with COMPONENT_MONITOR_LOCK:
+        for componente, estado in COMPONENT_MONITOR_STATE.items():
             falhas = estado["failures"]
             while falhas and falhas[0] < inicio_janela:
                 falhas.popleft()
-            resumo[plataforma] = {
+            resumo[componente] = {
                 "falhas_recentes": len(falhas),
                 "alerta_ativo": bool(estado["alert_active"]),
                 "ultimo_erro": estado.get("last_error"),
@@ -1864,8 +1962,11 @@ def enviar_arquivo_com_fallback(chat_id, arquivo):
                 caption="👉 Download concluído! Aqui está seu vídeo 👊",
             )
         telegram_file_id, telegram_media_type = extrair_dados_midia_telegram(mensagem)
+        registrar_sucesso_componente("Telegram")
         return True, telegram_file_id, telegram_media_type
     except Exception as e_video:
+        if isinstance(e_video, OSError):
+            raise FalhaComponenteDownload("Armazenamento", e_video) from e_video
         logger.warning(f"[SEND_VIDEO] Falhou no envio como vídeo. arquivo={arquivo} erro={e_video}")
 
     info = obter_info_midia(arquivo)
@@ -1894,6 +1995,8 @@ def enviar_arquivo_com_fallback(chat_id, arquivo):
 
             logger.info(f"[SEND_VIDEO] Fallback H.264 enviado com sucesso | arquivo={arquivo_fallback}")
             telegram_file_id, telegram_media_type = extrair_dados_midia_telegram(mensagem)
+            registrar_sucesso_componente("Telegram")
+            registrar_sucesso_componente("Processamento")
             return True, telegram_file_id, telegram_media_type
         except Exception as e_h264:
             logger.warning(f"[SEND_VIDEO] Fallback H.264 também falhou. erro={e_h264}")
@@ -1908,10 +2011,13 @@ def enviar_arquivo_com_fallback(chat_id, arquivo):
                 caption="👉 Download concluído! Aqui está seu arquivo 👊",
             )
         telegram_file_id, telegram_media_type = extrair_dados_midia_telegram(mensagem)
+        registrar_sucesso_componente("Telegram")
         return True, telegram_file_id, telegram_media_type
     except Exception as e_doc:
         logger.error(f"[SEND_DOCUMENT] Também falhou. erro={e_doc}")
-        return False, None, None
+        if isinstance(e_doc, OSError):
+            raise FalhaComponenteDownload("Armazenamento", e_doc) from e_doc
+        raise FalhaComponenteDownload("Telegram", e_doc) from e_doc
 
 
 def montar_chave_cache_midia(plataforma, info, url):
@@ -1975,24 +2081,29 @@ def obter_entrada_cache(cache_key):
     try:
         doc = midia_cache_col.find_one({"_id": cache_key})
         if not doc:
+            registrar_sucesso_componente("MongoDB")
             return None
         expires_at = doc.get("expires_at")
         agora_utc_naive = datetime.now(timezone.utc).replace(tzinfo=None)
         if expires_at and expires_at < agora_utc_naive:
             midia_cache_col.delete_one({"_id": cache_key})
+            registrar_sucesso_componente("MongoDB")
             return None
         telegram_file_id = doc.get("telegram_file_id")
         if not telegram_file_id:
+            registrar_sucesso_componente("MongoDB")
             return None
         telegram_media_type = doc.get("telegram_media_type")
         if telegram_media_type not in ("video", "document"):
             telegram_media_type = None
+        registrar_sucesso_componente("MongoDB")
         return {
             "telegram_file_id": telegram_file_id,
             "telegram_media_type": telegram_media_type,
         }
     except Exception as e:
         logger.warning(f"[CACHE_MIDIA_LEITURA] key={cache_key[:12]} erro={e}")
+        registrar_falha_componente("MongoDB", e)
         return None
 
 
@@ -2049,8 +2160,10 @@ def salvar_file_id_cache(
                 },
                 upsert=True,
             )
+        registrar_sucesso_componente("MongoDB")
     except Exception as e:
         logger.warning(f"[CACHE_MIDIA_GRAVACAO] key={cache_key[:12]} erro={e}")
+        registrar_falha_componente("MongoDB", e)
 
 
 class CacheTelegramTemporariamenteIndisponivel(RuntimeError):
@@ -2181,11 +2294,14 @@ def enviar_midia_cacheada(chat_id, cache_key, entrada_cache):
                                 }
                             },
                         )
+                        registrar_sucesso_componente("MongoDB")
                     except Exception as e:
                         logger.warning(
                             f"[CACHE_MIDIA_MIGRACAO] key={cache_key[:12]} "
                             f"erro={sanitizar_erro_log(e)}"
                         )
+                        registrar_falha_componente("MongoDB", e)
+                registrar_sucesso_componente("Telegram")
                 return telegram_media_type
             except Exception as e:
                 classificacao = classificar_erro_envio_cache(e)
@@ -2201,6 +2317,8 @@ def enviar_midia_cacheada(chat_id, cache_key, entrada_cache):
                 if classificacao == "file_id_invalido":
                     erros_permanentes += 1
                     break
+                if classificacao == "temporario":
+                    registrar_falha_componente("Telegram", e)
                 raise CacheTelegramTemporariamenteIndisponivel(
                     "CACHE_TELEGRAM_TEMPORARIAMENTE_INDISPONIVEL"
                 ) from e
@@ -2211,11 +2329,13 @@ def enviar_midia_cacheada(chat_id, cache_key, entrada_cache):
                 "_id": cache_key,
                 "telegram_file_id": telegram_file_id,
             })
+            registrar_sucesso_componente("MongoDB")
         except Exception as e:
             logger.warning(
                 f"[CACHE_MIDIA_REMOCAO] key={cache_key[:12]} "
                 f"erro={sanitizar_erro_log(e)}"
             )
+            registrar_falha_componente("MongoDB", e)
         logger.warning(
             f"[CACHE_MIDIA_INVALIDO] key={cache_key[:12]} "
             "confirmado_em_video_e_documento=True"
@@ -2875,6 +2995,8 @@ def extrair_info_instagram_com_fallback(url):
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=False)
             return info, usar_cookies
+        except FalhaComponenteDownload:
+            raise
         except Exception as e:
             ultimo_erro = e
             logger.warning(
@@ -2918,6 +3040,8 @@ def extrair_info_tiktok_com_fallback(url):
             f"url_ref={referencia_url_log(url)}"
         )
         return extrair_info_tiktok_hd_sem_marca(url), False, None
+    except FalhaComponenteDownload:
+        raise
     except Exception as e:
         logger.warning(
             f"[TIKTOK_HD_FALHA] url_ref={referencia_url_log(url)} "
@@ -2984,6 +3108,8 @@ def extrair_info_tiktok_com_fallback(url):
                 with yt_dlp.YoutubeDL(opts) as ydl:
                     info = ydl.extract_info(url, download=False)
                 return info, usar_cookies, extractor_args
+            except FalhaComponenteDownload:
+                raise
             except Exception as e:
                 ultimo_erro = e
                 logger.warning(
@@ -3104,11 +3230,51 @@ def mapear_erro_download(err_text, plataforma="geral"):
     return texto_erro
 
 
+def mapear_falha_componente_download(componente, erro, plataforma="geral"):
+    componente = normalizar_componente_monitoramento(componente) or "Interno"
+    if componente == "Telegram":
+        return (
+            "⏳ O Telegram não conseguiu receber o arquivo agora. Aguarde alguns "
+            "instantes e envie o link novamente. Esta tentativa não consumiu "
+            "seu limite diário."
+        )
+    if componente == "MongoDB":
+        return (
+            "⏳ O banco de dados está temporariamente indisponível. Aguarde "
+            "alguns instantes e tente novamente."
+        )
+    if componente == "Armazenamento":
+        return (
+            "❌ O servidor não conseguiu acessar o arquivo temporário do vídeo. "
+            "Tente novamente em alguns instantes."
+        )
+    if componente == "Processamento":
+        texto = str(erro or "").lower()
+        if "ffprobe" in texto or "midia_invalida" in texto:
+            return (
+                "❌ O servidor não conseguiu analisar o arquivo de vídeo. "
+                "Tente novamente em alguns instantes."
+            )
+        if "ffmpeg" in texto:
+            return (
+                "❌ O servidor não conseguiu preparar o vídeo para envio. "
+                "Tente novamente em alguns instantes."
+            )
+    if componente == "Interno":
+        return "❌ O bot encontrou um erro interno. Tente novamente em instantes."
+    return mapear_erro_download(str(erro), plataforma=plataforma)
+
+
 def incrementar_download_gratis(user, chat_id, from_user_id):
-    usuarios_col.update_one(
-        {"_id": user["_id"]},
-        {"$inc": {"downloads_hoje": 1}}
-    )
+    try:
+        usuarios_col.update_one(
+            {"_id": user["_id"]},
+            {"$inc": {"downloads_hoje": 1}}
+        )
+        registrar_sucesso_componente("MongoDB")
+    except Exception as e:
+        registrar_falha_componente("MongoDB", e)
+        raise FalhaComponenteDownload("MongoDB", e, ja_registrada=True) from e
 
     novo_count = user.get("downloads_hoje", 0) + 1
     safe_send_message(chat_id, f"📊 Uso diário: {novo_count}/{FREE_DAILY_LIMIT}")
@@ -3189,8 +3355,10 @@ def registrar_download_diario(vip_status):
             },
             upsert=True,
         )
+        registrar_sucesso_componente("MongoDB")
     except Exception as e:
         logger.error(f"[METRICAS_DOWNLOAD] vip={vip_status} erro={e}")
+        registrar_falha_componente("MongoDB", e)
 
 
 def gerar_order_nsu(user_id):
@@ -3439,7 +3607,7 @@ def recuperar_aprovacoes_pix_interrompidas():
 # =========================================
 # USUÁRIO / VIP
 # =========================================
-def obter_usuario(user_id):
+def _obter_usuario_db(user_id):
     uid = str(user_id)
     user = usuarios_col.find_one({"_id": uid})
     hoje = hoje_str()
@@ -3479,6 +3647,16 @@ def obter_usuario(user_id):
         user["ultima_data"] = hoje
 
     return user
+
+
+def obter_usuario(user_id):
+    try:
+        user = _obter_usuario_db(user_id)
+        registrar_sucesso_componente("MongoDB")
+        return user
+    except Exception as e:
+        registrar_falha_componente("MongoDB", e)
+        raise
 
 
 def is_vip_user(user):
@@ -3570,6 +3748,8 @@ def baixar_pinterest_capado(url, prefix, info=None):
                 )
                 return arquivo
 
+        except FalhaComponenteDownload:
+            raise
         except Exception as e:
             ultimo_erro = str(e)
             logger.warning(
@@ -3953,8 +4133,13 @@ def montar_relatorio_diagnostico():
 
     estado_bot, ultima_atividade = obter_estado_bot()
     if estado_bot == "polling":
+        registrar_sucesso_componente("Telegram")
         linhas.append("✅ Telegram: polling ativo")
     else:
+        registrar_falha_componente(
+            "Telegram",
+            f"POLLING_FORA_DO_ESTADO_ATIVO estado={estado_bot}",
+        )
         linhas.append(
             f"⚠️ Telegram: estado {html.escape(str(estado_bot))}"
         )
@@ -3962,16 +4147,23 @@ def montar_relatorio_diagnostico():
 
     try:
         client.admin.command("ping")
+        registrar_sucesso_componente("MongoDB")
         linhas.append("✅ MongoDB: conectado")
     except Exception as e:
+        registrar_falha_componente("MongoDB", e)
         linhas.append("❌ MongoDB: falha de conexão")
         problemas.append(f"MongoDB: {sanitizar_erro_log(e, limite=180)}")
 
     ffmpeg_ok = bool(shutil.which("ffmpeg"))
     ffprobe_ok = bool(shutil.which("ffprobe"))
     if ffmpeg_ok and ffprobe_ok:
+        registrar_sucesso_componente("Processamento")
         linhas.append("✅ FFmpeg e FFprobe: disponíveis")
     else:
+        registrar_falha_componente(
+            "Processamento",
+            "FFMPEG_OU_FFPROBE_AUSENTE",
+        )
         linhas.append("❌ FFmpeg/FFprobe: dependência ausente")
         problemas.append("FFmpeg ou FFprobe ausente")
 
@@ -4029,7 +4221,9 @@ def montar_relatorio_diagnostico():
         )
         if livre_percentual < 10:
             problemas.append("Pouco espaço livre em disco")
+        registrar_sucesso_componente("Armazenamento")
     except Exception as e:
+        registrar_falha_componente("Armazenamento", e)
         linhas.append("⚠️ Disco: não foi possível consultar")
         problemas.append(f"Disco: {sanitizar_erro_log(e, limite=180)}")
 
@@ -4058,18 +4252,30 @@ def montar_relatorio_diagnostico():
 
     resumo_monitor = obter_resumo_monitoramento()
     alertas_ativos = [
-        plataforma
-        for plataforma, estado in resumo_monitor.items()
+        componente
+        for componente, estado in resumo_monitor.items()
         if estado["alerta_ativo"]
     ]
     falhas_recentes = sum(
         estado["falhas_recentes"] for estado in resumo_monitor.values()
     )
     if alertas_ativos:
-        linhas.append(
-            "⚠️ Monitoramento: alerta em "
-            + html.escape(", ".join(alertas_ativos))
-        )
+        alertas_plataformas = [
+            item for item in alertas_ativos if item in COMPONENTES_PLATAFORMA
+        ]
+        alertas_internos = [
+            item for item in alertas_ativos if item in COMPONENTES_INTERNOS
+        ]
+        if alertas_plataformas:
+            linhas.append(
+                "⚠️ Plataformas em alerta: "
+                + html.escape(", ".join(alertas_plataformas))
+            )
+        if alertas_internos:
+            linhas.append(
+                "⚠️ Componentes internos em alerta: "
+                + html.escape(", ".join(alertas_internos))
+            )
         problemas.append("Há alerta automático ativo")
     else:
         linhas.append(
@@ -5767,12 +5973,20 @@ def formatos_por_plataforma(is_tiktok=False, is_instagram=False, is_pinterest=Fa
 
 def _processar_download(message, url, status_msg):
     atualizar_heartbeat_worker("preparando")
-    user = obter_usuario(message.from_user.id)
-    vip_status = is_vip_user(user)
     prefix = None
     plataforma = nome_plataforma(*detectar_plataforma(url))
 
     try:
+        try:
+            user = obter_usuario(message.from_user.id)
+        except Exception as e:
+            raise FalhaComponenteDownload(
+                "MongoDB",
+                e,
+                ja_registrada=True,
+            ) from e
+        vip_status = is_vip_user(user)
+
         if status_msg:
             safe_edit_message(
                 message.chat.id,
@@ -5781,7 +5995,10 @@ def _processar_download(message, url, status_msg):
             )
 
         atualizar_heartbeat_worker("resolvendo_link")
-        url = resolver_url_compartilhada(url)
+        try:
+            url = resolver_url_compartilhada(url)
+        except Exception as e:
+            raise FalhaComponenteDownload(plataforma, e) from e
         is_pinterest, is_tiktok, is_instagram, is_rednote = detectar_plataforma(url)
         plataforma = nome_plataforma(is_pinterest, is_tiktok, is_instagram, is_rednote)
 
@@ -5803,7 +6020,10 @@ def _processar_download(message, url, status_msg):
 
         if is_pinterest:
             prefix = os.path.join(DOWNLOAD_DIR, f"v_{message.from_user.id}_{uuid.uuid4().hex}")
-            url_resolvida = resolver_link_pinterest(url)
+            try:
+                url_resolvida = resolver_link_pinterest(url)
+            except Exception as e:
+                raise FalhaComponenteDownload(plataforma, e) from e
             info = None
             cache_key = None
             cache_source_id = None
@@ -5886,11 +6106,17 @@ def _processar_download(message, url, status_msg):
 
             try:
                 atualizar_heartbeat_worker("baixando")
-                arquivo_final = baixar_pinterest_capado(
-                    url_resolvida,
-                    prefix,
-                    info=info,
-                )
+                try:
+                    arquivo_final = baixar_pinterest_capado(
+                        url_resolvida,
+                        prefix,
+                        info=info,
+                    )
+                except FalhaComponenteDownload:
+                    raise
+                except Exception as e:
+                    raise FalhaComponenteDownload(plataforma, e) from e
+                registrar_sucesso_plataforma(plataforma)
                 validar_arquivo_midia(
                     arquivo_final,
                     MAX_SOURCE_FILE_BYTES,
@@ -5905,6 +6131,7 @@ def _processar_download(message, url, status_msg):
                     MAX_OUTPUT_FILE_BYTES,
                     fase="envio_pinterest",
                 )
+                registrar_sucesso_componente("Processamento")
 
                 enviado, telegram_file_id, telegram_media_type = enviar_arquivo_com_fallback(
                     message.chat.id, arquivo_envio
@@ -5927,8 +6154,6 @@ def _processar_download(message, url, status_msg):
                 )
 
                 registrar_download_diario(vip_status)
-                registrar_sucesso_plataforma(plataforma)
-
                 if not vip_status:
                     incrementar_download_gratis(user, message.chat.id, message.from_user.id)
 
@@ -5937,19 +6162,40 @@ def _processar_download(message, url, status_msg):
 
                 return
 
-            except Exception as e:
-                registrar_falha_plataforma(plataforma, e)
+            except FalhaComponenteDownload as e:
+                if not e.ja_registrada:
+                    registrar_falha_componente(e.componente, e.erro_original)
                 logger.error(
                     f"[ERRO_PINTEREST] user_id={message.from_user.id} "
-                    f"url_ref={referencia_url_log(url)} erro={sanitizar_erro_log(e)}"
+                    f"origem={e.componente} url_ref={referencia_url_log(url)} "
+                    f"erro={sanitizar_erro_log(e.erro_original)}"
                 )
-                texto_erro = mapear_erro_download(str(e), plataforma="pinterest")
+                texto_erro = mapear_falha_componente_download(
+                    e.componente,
+                    e.erro_original,
+                    plataforma="pinterest",
+                )
 
                 if status_msg:
                     safe_edit_message(message.chat.id, status_msg.message_id, texto_erro)
                 else:
                     safe_send_message(message.chat.id, texto_erro)
 
+                if prefix:
+                    cleanup_prefix(prefix)
+                return
+            except Exception as e:
+                registrar_falha_componente("Interno", e)
+                logger.error(
+                    f"[ERRO_PINTEREST] user_id={message.from_user.id} "
+                    f"origem=Interno url_ref={referencia_url_log(url)} "
+                    f"erro={sanitizar_erro_log(e)}"
+                )
+                texto_erro = mapear_erro_download(str(e), plataforma="pinterest")
+                if status_msg:
+                    safe_edit_message(message.chat.id, status_msg.message_id, texto_erro)
+                else:
+                    safe_send_message(message.chat.id, texto_erro)
                 if prefix:
                     cleanup_prefix(prefix)
                 return
@@ -5978,17 +6224,22 @@ def _processar_download(message, url, status_msg):
         usar_cookies_plataforma = True
         tiktok_extractor_args_usados = None
         atualizar_heartbeat_worker("consultando_metadados")
-        if is_instagram:
-            info, usar_cookies_plataforma = extrair_info_instagram_com_fallback(url)
-        elif is_tiktok:
-            (
-                info,
-                usar_cookies_plataforma,
-                tiktok_extractor_args_usados,
-            ) = extrair_info_tiktok_com_fallback(url)
-        else:
-            with yt_dlp.YoutubeDL(montar_info_opts()) as ydl:
-                info = ydl.extract_info(url, download=False)
+        try:
+            if is_instagram:
+                info, usar_cookies_plataforma = extrair_info_instagram_com_fallback(url)
+            elif is_tiktok:
+                (
+                    info,
+                    usar_cookies_plataforma,
+                    tiktok_extractor_args_usados,
+                ) = extrair_info_tiktok_com_fallback(url)
+            else:
+                with yt_dlp.YoutubeDL(montar_info_opts()) as ydl:
+                    info = ydl.extract_info(url, download=False)
+        except FalhaComponenteDownload:
+            raise
+        except Exception as e:
+            raise FalhaComponenteDownload(plataforma, e) from e
 
         duracao = info.get("duration")
         logger.info(f"[META] plataforma={plataforma} user_id={message.from_user.id} duration={duracao}")
@@ -6075,6 +6326,8 @@ def _processar_download(message, url, status_msg):
                         baixou = True
                         break
 
+                except FalhaComponenteDownload:
+                    raise
                 except Exception as e:
                     ultimo_erro = str(e)
                     logger.warning(
@@ -6087,11 +6340,19 @@ def _processar_download(message, url, status_msg):
                 break
 
         if not baixou:
-            raise Exception(ultimo_erro or "Falha ao baixar dentro do limite 720x1280 30fps")
+            raise FalhaComponenteDownload(
+                plataforma,
+                ultimo_erro or "Falha ao baixar dentro do limite 720x1280 30fps",
+            )
+
+        registrar_sucesso_plataforma(plataforma)
 
         arquivo_final = encontrar_arquivo_baixado(prefix)
         if not arquivo_final or not os.path.exists(arquivo_final):
-            raise Exception("Arquivo final não encontrado após o download")
+            raise FalhaComponenteDownload(
+                "Armazenamento",
+                "Arquivo final não encontrado após o download",
+            )
 
         validar_arquivo_midia(
             arquivo_final,
@@ -6104,6 +6365,7 @@ def _processar_download(message, url, status_msg):
             MAX_OUTPUT_FILE_BYTES,
             fase="envio",
         )
+        registrar_sucesso_componente("Processamento")
 
         enviado, telegram_file_id, telegram_media_type = enviar_arquivo_com_fallback(
             message.chat.id, arquivo_envio
@@ -6122,13 +6384,12 @@ def _processar_download(message, url, status_msg):
         )
 
         registrar_download_diario(vip_status)
-        registrar_sucesso_plataforma(plataforma)
-
         if not vip_status:
             incrementar_download_gratis(user, message.chat.id, message.from_user.id)
 
         if status_msg:
             safe_delete_message(message.chat.id, status_msg.message_id)
+        registrar_sucesso_componente("Interno")
 
     except CacheTelegramTemporariamenteIndisponivel as e:
         logger.warning(
@@ -6148,11 +6409,36 @@ def _processar_download(message, url, status_msg):
             )
         else:
             safe_send_message(message.chat.id, texto_cache_temporario)
-    except Exception as e:
-        registrar_falha_plataforma(plataforma, e)
+    except FalhaComponenteDownload as e:
+        if not e.ja_registrada:
+            registrar_falha_componente(e.componente, e.erro_original)
         logger.error(
             f"[ERRO_DOWNLOAD] user_id={message.from_user.id} "
-            f"url_ref={referencia_url_log(url)} erro={sanitizar_erro_log(e)}"
+            f"origem={e.componente} url_ref={referencia_url_log(url)} "
+            f"erro={sanitizar_erro_log(e.erro_original)}"
+        )
+        url_erro = (url or "").lower()
+        if "instagram.com" in url_erro or "instagr.am" in url_erro:
+            plataforma_erro = "instagram"
+        elif "tiktok.com" in url_erro:
+            plataforma_erro = "tiktok"
+        else:
+            plataforma_erro = "geral"
+        texto_erro = mapear_falha_componente_download(
+            e.componente,
+            e.erro_original,
+            plataforma=plataforma_erro,
+        )
+        if status_msg:
+            safe_edit_message(message.chat.id, status_msg.message_id, texto_erro)
+        else:
+            safe_send_message(message.chat.id, texto_erro)
+    except Exception as e:
+        registrar_falha_componente("Interno", e)
+        logger.error(
+            f"[ERRO_DOWNLOAD] user_id={message.from_user.id} "
+            f"origem=Interno url_ref={referencia_url_log(url)} "
+            f"erro={sanitizar_erro_log(e)}"
         )
         url_erro = (url or "").lower()
         if "instagram.com" in url_erro or "instagr.am" in url_erro:
