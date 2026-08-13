@@ -124,6 +124,7 @@ DOWNLOAD_QUEUE_MAX = get_env_int("DOWNLOAD_QUEUE_MAX", 10, 1, 50)
 PIX_ORDER_EXPIRATION_HOURS = get_env_int(
     "PIX_ORDER_EXPIRATION_HOURS", 24, 1, 168
 )
+PIX_PENDING_PAGE_SIZE = 8
 TIKWM_REQUEST_TIMEOUT_SECONDS = get_env_int(
     "TIKWM_REQUEST_TIMEOUT_SECONDS", 12, 5, 30
 )
@@ -2708,6 +2709,7 @@ def configurar_menu_comandos():
 
     comandos_admin = comandos_usuario + [
         types.BotCommand("painel", "Abrir o Painel Admin"),
+        types.BotCommand("pendentes", "Reabrir comprovantes pendentes"),
         types.BotCommand("darvip", "Liberar VIP manualmente"),
         types.BotCommand("removervip", "Remover VIP de um usuário"),
         types.BotCommand("zerar", "Zerar o limite de um usuário"),
@@ -2880,6 +2882,9 @@ def consultar_docs_backup(tipo):
                     "receipt_rejected_by": 1,
                     "approval_started_at": 1,
                     "approval_completed_at": 1,
+                    "last_reopened_at": 1,
+                    "last_reopened_by": 1,
+                    "receipt_reopen_count": 1,
                     "manual_verified_at": 1,
                     "manual_verified_by": 1,
                     "vip_aplicado_ao_pedido": 1,
@@ -2953,6 +2958,9 @@ def consultar_docs_backup(tipo):
                     "receipt_rejected_by": 1,
                     "approval_started_at": 1,
                     "approval_completed_at": 1,
+                    "last_reopened_at": 1,
+                    "last_reopened_by": 1,
+                    "receipt_reopen_count": 1,
                     "manual_verified_at": 1,
                     "manual_verified_by": 1,
                     "vip_aplicado_ao_pedido": 1,
@@ -3694,6 +3702,323 @@ def enviar_instrucoes_pix(chat_id, pedido, plano):
         parse_mode="HTML",
         reply_markup=markup,
     )
+
+
+def montar_painel_comprovantes_pendentes(offset=0):
+    """Monta uma página compacta sem carregar os arquivos dos comprovantes."""
+    filtro = {"status": {"$in": ["receipt_submitted", "approving"]}}
+    total = pedidos_col.count_documents(filtro)
+    offset = max(0, int(offset or 0))
+
+    if total and offset >= total:
+        offset = ((total - 1) // PIX_PENDING_PAGE_SIZE) * PIX_PENDING_PAGE_SIZE
+
+    pedidos = list(
+        pedidos_col.find(
+            filtro,
+            {
+                "_id": 0,
+                "order_nsu": 1,
+                "user_id": 1,
+                "plano_key": 1,
+                "plano_nome": 1,
+                "valor_centavos": 1,
+                "status": 1,
+                "created_at": 1,
+                "receipt_submitted_at": 1,
+                "approval_started_at": 1,
+            },
+        )
+        .sort("created_at", -1)
+        .skip(offset)
+        .limit(PIX_PENDING_PAGE_SIZE)
+    )
+
+    if not pedidos:
+        return (
+            "🧾 <b>Comprovantes pendentes</b>\n\n"
+            "✅ Não há comprovantes aguardando análise.",
+            types.InlineKeyboardMarkup(),
+            0,
+        )
+
+    pagina_atual = (offset // PIX_PENDING_PAGE_SIZE) + 1
+    total_paginas = (total + PIX_PENDING_PAGE_SIZE - 1) // PIX_PENDING_PAGE_SIZE
+    linhas = [
+        "🧾 <b>Comprovantes pendentes</b>",
+        "",
+        f"Total: <b>{total}</b> | Página: <b>{pagina_atual}/{total_paginas}</b>",
+        "",
+    ]
+    markup = types.InlineKeyboardMarkup(row_width=1)
+
+    for indice, pedido in enumerate(pedidos, start=offset + 1):
+        order_nsu = str(pedido.get("order_nsu") or "").strip()
+        user_id = str(pedido.get("user_id") or "desconhecido")
+        plano = PLANOS.get(pedido.get("plano_key")) or {}
+        plano_nome = plano.get("nome") or pedido.get("plano_nome") or "Desconhecido"
+        valor = int(pedido.get("valor_centavos") or 0) / 100
+        estado = pedido.get("status")
+        estado_texto = (
+            "aprovação interrompida"
+            if estado == "approving"
+            else "aguardando análise"
+        )
+        enviado_em = normalizar_datetime_tz(
+            pedido.get("receipt_submitted_at") or pedido.get("created_at")
+        )
+        enviado_texto = (
+            enviado_em.strftime("%d/%m/%Y %H:%M")
+            if enviado_em
+            else "data indisponível"
+        )
+
+        linhas.append(
+            f"<b>{indice}.</b> Usuário <code>{html.escape(user_id)}</code>\n"
+            f"{html.escape(str(plano_nome))} — R$ {valor:.2f}\n"
+            f"{html.escape(estado_texto)} — {enviado_texto}"
+        )
+        linhas.append("")
+
+        if order_nsu:
+            markup.add(
+                types.InlineKeyboardButton(
+                    f"🧾 Reabrir #{indice} — usuário {user_id}",
+                    callback_data=f"pix_reopen_{order_nsu}",
+                )
+            )
+
+    navegacao = []
+    if offset > 0:
+        anterior = max(0, offset - PIX_PENDING_PAGE_SIZE)
+        navegacao.append(
+            types.InlineKeyboardButton(
+                "⬅️ Anterior",
+                callback_data=f"pix_pending_page_{anterior}",
+            )
+        )
+    if offset + PIX_PENDING_PAGE_SIZE < total:
+        proxima = offset + PIX_PENDING_PAGE_SIZE
+        navegacao.append(
+            types.InlineKeyboardButton(
+                "Próxima ➡️",
+                callback_data=f"pix_pending_page_{proxima}",
+            )
+        )
+    if navegacao:
+        markup.row(*navegacao)
+
+    linhas.append("Toque em um pedido para reenviar o comprovante no seu privado.")
+    return "\n".join(linhas), markup, total
+
+
+def enviar_painel_comprovantes_pendentes(chat_id, offset=0, message_id=None):
+    texto, markup, total = montar_painel_comprovantes_pendentes(offset)
+    if message_id:
+        mensagem = safe_edit_message(
+            chat_id,
+            message_id,
+            texto,
+            parse_mode="HTML",
+            reply_markup=markup,
+        )
+    else:
+        mensagem = safe_send_message(
+            chat_id,
+            texto,
+            parse_mode="HTML",
+            reply_markup=markup,
+        )
+    return mensagem, total
+
+
+@bot.message_handler(commands=["pendentes"])
+def comprovantes_pendentes_admin(message):
+    if not exigir_admin_privado(message):
+        return
+
+    try:
+        enviar_painel_comprovantes_pendentes(message.chat.id)
+    except Exception as e:
+        logger.error(f"[PIX_PENDENTES] erro={sanitizar_erro_log(e)}")
+        safe_reply_to(
+            message,
+            "❌ Não foi possível consultar os comprovantes pendentes agora.",
+        )
+
+
+@bot.callback_query_handler(
+    func=lambda call: call.data.startswith("pix_pending_page_")
+)
+def navegar_comprovantes_pendentes(call):
+    if (
+        call.from_user.id != ADMIN_ID
+        or not is_chat_privado(call.message)
+        or call.message.chat.id != ADMIN_ID
+    ):
+        safe_answer_callback(
+            call.id,
+            text="Acesso restrito ao administrador.",
+            show_alert=True,
+        )
+        return
+
+    try:
+        offset_texto = call.data[len("pix_pending_page_"):].strip()
+        if not re.fullmatch(r"\d{1,9}", offset_texto):
+            raise ValueError("página inválida")
+        enviar_painel_comprovantes_pendentes(
+            call.message.chat.id,
+            offset=int(offset_texto),
+            message_id=call.message.message_id,
+        )
+        safe_answer_callback(call.id)
+    except Exception as e:
+        logger.error(f"[PIX_PENDENTES_PAGINA] erro={sanitizar_erro_log(e)}")
+        safe_answer_callback(
+            call.id,
+            text="Não foi possível abrir essa página.",
+            show_alert=True,
+        )
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("pix_reopen_"))
+def reabrir_comprovante_pix(call):
+    if (
+        call.from_user.id != ADMIN_ID
+        or not is_chat_privado(call.message)
+        or call.message.chat.id != ADMIN_ID
+    ):
+        safe_answer_callback(
+            call.id,
+            text="Acesso restrito ao administrador.",
+            show_alert=True,
+        )
+        return
+
+    order_nsu = call.data[len("pix_reopen_"):].strip()
+    if not order_nsu or len(order_nsu) > 50:
+        safe_answer_callback(call.id, text="Pedido inválido.", show_alert=True)
+        return
+
+    lock_pedido = obter_lock_distribuido_local(order_nsu, PAYMENT_ORDER_LOCKS)
+    nova_mensagem = None
+    try:
+        with lock_pedido:
+            pedido = pedidos_col.find_one({"order_nsu": order_nsu})
+            if not pedido or pedido.get("status") not in (
+                "receipt_submitted",
+                "approving",
+            ):
+                safe_answer_callback(
+                    call.id,
+                    text="Este pedido não está mais pendente.",
+                    show_alert=True,
+                )
+                return
+
+            file_id = str(pedido.get("receipt_telegram_file_id") or "").strip()
+            tipo = str(pedido.get("receipt_telegram_type") or "").strip()
+            if not file_id or tipo not in ("photo", "document"):
+                safe_answer_callback(
+                    call.id,
+                    text="O arquivo desse comprovante não está disponível.",
+                    show_alert=True,
+                )
+                return
+
+            plano = PLANOS.get(pedido.get("plano_key")) or {}
+            plano_nome = plano.get("nome") or pedido.get("plano_nome") or "Desconhecido"
+            valor = int(pedido.get("valor_centavos") or 0) / 100
+            em_aprovacao = pedido.get("status") == "approving"
+            estado_texto = (
+                "⚠️ Aprovação anteriormente iniciada; use o botão abaixo para retomar."
+                if em_aprovacao
+                else "⚠️ Confira a entrada do Pix antes de aprovar."
+            )
+            legenda = (
+                "💠 <b>Comprovante Pix reaberto</b>\n\n"
+                f"Pedido: <code>{html.escape(order_nsu)}</code>\n"
+                f"Usuário: <code>{html.escape(str(pedido.get('user_id')))}</code>\n"
+                f"Plano: <b>{html.escape(str(plano_nome))}</b>\n"
+                f"Valor esperado: <b>R$ {valor:.2f}</b>\n\n"
+                f"{estado_texto}"
+            )
+
+            markup = types.InlineKeyboardMarkup(row_width=1)
+            if em_aprovacao:
+                markup.add(
+                    types.InlineKeyboardButton(
+                        "🔄 Retomar aprovação interrompida",
+                        callback_data=f"pix_ok_{order_nsu}",
+                    )
+                )
+            else:
+                markup.add(
+                    types.InlineKeyboardButton(
+                        "✅ Aprovar — confirmei o Pix na conta",
+                        callback_data=f"pix_ok_{order_nsu}",
+                    ),
+                    types.InlineKeyboardButton(
+                        "❌ Rejeitar comprovante",
+                        callback_data=f"pix_no_{order_nsu}",
+                    ),
+                )
+
+            if tipo == "photo":
+                nova_mensagem = bot.send_photo(
+                    ADMIN_ID,
+                    file_id,
+                    caption=legenda,
+                    parse_mode="HTML",
+                    reply_markup=markup,
+                )
+            else:
+                nova_mensagem = bot.send_document(
+                    ADMIN_ID,
+                    file_id,
+                    caption=legenda,
+                    parse_mode="HTML",
+                    reply_markup=markup,
+                )
+
+            resultado = pedidos_col.update_one(
+                {"order_nsu": order_nsu, "status": pedido["status"]},
+                {
+                    "$set": {
+                        "admin_review_message_id": nova_mensagem.message_id,
+                        "last_reopened_at": agora_tz(),
+                        "last_reopened_by": str(ADMIN_ID),
+                    },
+                    "$inc": {"receipt_reopen_count": 1},
+                },
+            )
+            if not resultado.modified_count:
+                safe_delete_message(ADMIN_ID, nova_mensagem.message_id)
+                safe_answer_callback(
+                    call.id,
+                    text="O pedido mudou de estado. Atualize /pendentes.",
+                    show_alert=True,
+                )
+                return
+
+        safe_answer_callback(call.id, text="Comprovante reaberto abaixo.")
+        logger.info(
+            f"[PIX_COMPROVANTE_REABERTO] order_nsu={order_nsu} "
+            f"status={pedido['status']}"
+        )
+    except Exception as e:
+        logger.error(
+            f"[PIX_COMPROVANTE_REABRIR] order_nsu={order_nsu} "
+            f"erro={sanitizar_erro_log(e)}"
+        )
+        if nova_mensagem:
+            safe_delete_message(ADMIN_ID, nova_mensagem.message_id)
+        safe_answer_callback(
+            call.id,
+            text="Não foi possível reabrir o comprovante.",
+            show_alert=True,
+        )
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("pay_"))
