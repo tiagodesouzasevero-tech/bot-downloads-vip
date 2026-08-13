@@ -121,6 +121,16 @@ WORKER_STALL_TIMEOUT_SECONDS = get_env_int(
 WORKER_WATCHDOG_INTERVAL_SECONDS = get_env_int(
     "WORKER_WATCHDOG_INTERVAL_SECONDS", 30, 10, 300
 )
+WORKER_RESTART_GRACE_SECONDS = get_env_int(
+    "WORKER_RESTART_GRACE_SECONDS", 300, 60, 1800
+)
+WORKER_MAX_RESTARTS_PER_HOUR = get_env_int(
+    "WORKER_MAX_RESTARTS_PER_HOUR", 2, 1, 10
+)
+WORKER_RESTART_RETRY_SECONDS = get_env_int(
+    "WORKER_RESTART_RETRY_SECONDS", 300, 60, 1800
+)
+WORKER_RESTART_EXIT_CODE = 70
 VIDEO_CRF = get_env_int("VIDEO_CRF", 27, 18, 35)
 AUDIO_BITRATE = os.environ.get("AUDIO_BITRATE", "80k").strip() or "80k"
 MEDIA_CACHE_DAYS = get_env_int("MEDIA_CACHE_DAYS", 180, 1, 365)
@@ -199,6 +209,10 @@ DOWNLOAD_WORKER_STATE = {
     "completed_jobs": 0,
     "stall_alert_active": False,
     "stall_alerted_at": None,
+    "stall_detected_monotonic": None,
+    "restart_in_progress": False,
+    "restart_blocked_reason": None,
+    "restart_retry_after_monotonic": 0.0,
 }
 PLATFORM_MONITOR_LOCK = Lock()
 PLATFORM_MONITOR_STATE = {
@@ -392,6 +406,7 @@ pedidos_col = db["pedidos"]
 metricas_col = db["metricas_diarias"]
 midia_cache_col = db["midia_cache"]
 auditoria_admin_col = db["auditoria_admin"]
+auditoria_sistema_col = db["auditoria_sistema"]
 
 try:
     usuarios_col.create_index("vip_ate")
@@ -408,6 +423,10 @@ try:
     )
     auditoria_admin_col.create_index(
         [("action", 1), ("status", 1), ("created_at", -1)]
+    )
+    auditoria_sistema_col.create_index("created_at")
+    auditoria_sistema_col.create_index(
+        [("event_type", 1), ("status", 1), ("created_at", -1)]
     )
 except Exception as e:
     logger.warning(f"[MONGO_INDEX] Não foi possível garantir índices agora: {e}")
@@ -1347,6 +1366,10 @@ def definir_estado_worker_download(ativo):
             DOWNLOAD_WORKER_STATE["job_started_monotonic"] = None
             DOWNLOAD_WORKER_STATE["job_started_at"] = None
             DOWNLOAD_WORKER_STATE["stall_alert_active"] = False
+            DOWNLOAD_WORKER_STATE["stall_detected_monotonic"] = None
+            DOWNLOAD_WORKER_STATE["restart_in_progress"] = False
+            DOWNLOAD_WORKER_STATE["restart_blocked_reason"] = None
+            DOWNLOAD_WORKER_STATE["restart_retry_after_monotonic"] = 0.0
 
 
 def worker_download_esta_ativo():
@@ -1383,6 +1406,10 @@ def iniciar_trabalho_worker():
             "last_progress_at": agora_iso,
             "job_started_at": agora_iso,
             "stall_alert_active": False,
+            "stall_detected_monotonic": None,
+            "restart_in_progress": False,
+            "restart_blocked_reason": None,
+            "restart_retry_after_monotonic": 0.0,
         })
     if recuperou:
         _notificar_recuperacao_worker("iniciando")
@@ -1414,6 +1441,10 @@ def atualizar_heartbeat_worker(fase):
             "heartbeat_monotonic": agora_monotonic,
             "last_progress_at": agora_iso,
             "stall_alert_active": False,
+            "stall_detected_monotonic": None,
+            "restart_in_progress": False,
+            "restart_blocked_reason": None,
+            "restart_retry_after_monotonic": 0.0,
         })
 
     if recuperou:
@@ -1437,6 +1468,10 @@ def concluir_trabalho_worker():
             "last_completed_at": agora_iso,
             "completed_jobs": int(DOWNLOAD_WORKER_STATE["completed_jobs"]) + 1,
             "stall_alert_active": False,
+            "stall_detected_monotonic": None,
+            "restart_in_progress": False,
+            "restart_blocked_reason": None,
+            "restart_retry_after_monotonic": 0.0,
         })
     if recuperou:
         _notificar_recuperacao_worker("trabalho_concluido")
@@ -1467,6 +1502,16 @@ def obter_saude_worker():
         and sem_progresso is not None
         and sem_progresso >= WORKER_STALL_TIMEOUT_SECONDS
     )
+    detectado_em = estado.get("stall_detected_monotonic")
+    reinicio_em = None
+    if travado and detectado_em is not None:
+        reinicio_em = max(
+            0,
+            int(
+                WORKER_RESTART_GRACE_SECONDS
+                - (agora_monotonic - detectado_em)
+            ),
+        )
 
     if not running:
         status = "stopped"
@@ -1486,6 +1531,14 @@ def obter_saude_worker():
         "seconds_without_progress": sem_progresso,
         "active_job_seconds": tempo_trabalho,
         "stall_timeout_seconds": WORKER_STALL_TIMEOUT_SECONDS,
+        "auto_restart": {
+            "enabled": True,
+            "grace_seconds": WORKER_RESTART_GRACE_SECONDS,
+            "restart_due_in_seconds": reinicio_em,
+            "in_progress": bool(estado.get("restart_in_progress")),
+            "blocked_reason": estado.get("restart_blocked_reason"),
+            "max_restarts_per_hour": WORKER_MAX_RESTARTS_PER_HOUR,
+        },
         "queue_size": DOWNLOAD_QUEUE.qsize(),
         "queue_capacity": DOWNLOAD_QUEUE_MAX,
         "completed_jobs": int(estado.get("completed_jobs") or 0),
@@ -1497,10 +1550,235 @@ def obter_saude_worker():
     }
 
 
-def verificar_travamento_worker():
-    """Dispara um único alerta por travamento; não mata nem duplica o worker."""
+def _worker_ainda_travado_para_reinicio():
+    agora_monotonic = time.monotonic()
+    with DOWNLOAD_WORKER_STATE_LOCK:
+        heartbeat = DOWNLOAD_WORKER_STATE.get("heartbeat_monotonic")
+        return bool(
+            DOWNLOAD_WORKER_RUNNING
+            and DOWNLOAD_WORKER_STATE["busy"]
+            and DOWNLOAD_WORKER_STATE["stall_alert_active"]
+            and DOWNLOAD_WORKER_STATE["restart_in_progress"]
+            and heartbeat is not None
+            and agora_monotonic - heartbeat >= WORKER_STALL_TIMEOUT_SECONDS
+        )
+
+
+def _registrar_bloqueio_reinicio_worker(motivo, detalhe=None, retry_seconds=None):
+    """Adia uma nova tentativa e evita repetir o mesmo alerta ao administrador."""
+    retry_seconds = int(retry_seconds or WORKER_RESTART_RETRY_SECONDS)
     agora_monotonic = time.monotonic()
     deve_alertar = False
+    with DOWNLOAD_WORKER_STATE_LOCK:
+        motivo_anterior = DOWNLOAD_WORKER_STATE.get("restart_blocked_reason")
+        DOWNLOAD_WORKER_STATE["restart_in_progress"] = False
+        DOWNLOAD_WORKER_STATE["restart_blocked_reason"] = str(motivo)
+        DOWNLOAD_WORKER_STATE["restart_retry_after_monotonic"] = (
+            agora_monotonic + max(60, retry_seconds)
+        )
+        deve_alertar = motivo_anterior != str(motivo)
+
+    logger.error(
+        f"[WORKER_AUTO_RESTART_BLOQUEADO] motivo={motivo} "
+        f"detalhe={sanitizar_erro_log(detalhe, limite=300) if detalhe else 'n/a'}"
+    )
+    if deve_alertar:
+        mensagem_detalhe = (
+            f"\nDetalhe: <code>{html.escape(sanitizar_erro_log(detalhe, limite=180))}</code>"
+            if detalhe
+            else ""
+        )
+        safe_send_message(
+            ADMIN_ID,
+            "⛔ <b>Reinício automático bloqueado</b>\n\n"
+            f"Motivo: <code>{html.escape(str(motivo))}</code>"
+            f"{mensagem_detalhe}\n\n"
+            "O processo não foi encerrado. O bot tentará verificar novamente "
+            f"em aproximadamente {max(1, retry_seconds // 60)} minuto(s).",
+            parse_mode="HTML",
+        )
+
+
+def _notificar_usuarios_reinicio_worker():
+    """Avisa apenas os usuários da fila atual, sem persistir IDs ou URLs."""
+    with DOWNLOAD_PENDING_LOCK:
+        usuarios_afetados = sorted(DOWNLOAD_PENDING_USERS)
+
+    notificados = 0
+    for user_id in usuarios_afetados:
+        try:
+            enviado = safe_send_message(
+                int(user_id),
+                "⚠️ O processamento do seu vídeo foi interrompido por uma "
+                "recuperação técnica do bot.\n\n"
+                "Aguarde alguns instantes e envie o link novamente. Esta "
+                "tentativa não consumiu seu limite diário de downloads.",
+            )
+            if enviado:
+                notificados += 1
+        except (TypeError, ValueError):
+            logger.warning("[WORKER_AUTO_RESTART] user_id pendente inválido")
+    return len(usuarios_afetados), notificados
+
+
+def _encerrar_processo_para_reinicio():
+    """Encerra todo o processo; SystemExit em uma thread não seria suficiente."""
+    logging.shutdown()
+    os._exit(WORKER_RESTART_EXIT_CODE)
+
+
+def tentar_reinicio_automatico_worker(fase, sem_progresso):
+    """Autoriza no MongoDB e só então encerra o processo para a Railway subir outro."""
+    if not _worker_ainda_travado_para_reinicio():
+        return False
+
+    agora_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+    inicio_janela = agora_utc - timedelta(hours=1)
+    evento_id = None
+
+    try:
+        client.admin.command("ping")
+        reinicios_recentes = auditoria_sistema_col.count_documents({
+            "event_type": "worker_auto_restart",
+            "status": "restart_triggered",
+            "created_at": {"$gte": inicio_janela},
+        })
+        if reinicios_recentes >= WORKER_MAX_RESTARTS_PER_HOUR:
+            mais_antigo = auditoria_sistema_col.find_one(
+                {
+                    "event_type": "worker_auto_restart",
+                    "status": "restart_triggered",
+                    "created_at": {"$gte": inicio_janela},
+                },
+                sort=[("created_at", 1)],
+            )
+            retry_seconds = WORKER_RESTART_RETRY_SECONDS
+            criado_em = (mais_antigo or {}).get("created_at")
+            if isinstance(criado_em, datetime):
+                if criado_em.tzinfo is not None:
+                    criado_em = criado_em.astimezone(timezone.utc).replace(tzinfo=None)
+                retry_seconds = max(
+                    60,
+                    int((criado_em + timedelta(hours=1) - agora_utc).total_seconds()) + 5,
+                )
+            _registrar_bloqueio_reinicio_worker(
+                "limite_horario_atingido",
+                detalhe=(
+                    f"{reinicios_recentes}/{WORKER_MAX_RESTARTS_PER_HOUR} "
+                    "reinicios na ultima hora"
+                ),
+                retry_seconds=retry_seconds,
+            )
+            return False
+
+        saude = obter_saude_worker()
+        documento = {
+            "event_type": "worker_auto_restart",
+            "status": "preparing",
+            "service": SERVICE_NAME,
+            "environment": ENVIRONMENT_NAME,
+            "phase": str(fase),
+            "seconds_without_progress": int(sem_progresso),
+            "active_job_seconds": saude.get("active_job_seconds"),
+            "queue_size": int(saude.get("queue_size") or 0),
+            "affected_users_count": 0,
+            "notified_users_count": 0,
+            "stall_timeout_seconds": WORKER_STALL_TIMEOUT_SECONDS,
+            "restart_grace_seconds": WORKER_RESTART_GRACE_SECONDS,
+            "max_restarts_per_hour": WORKER_MAX_RESTARTS_PER_HOUR,
+            "exit_code": WORKER_RESTART_EXIT_CODE,
+            "contains_urls": False,
+            "contains_user_ids": False,
+            "created_at": agora_utc,
+            "updated_at": agora_utc,
+        }
+        resultado = auditoria_sistema_col.insert_one(documento)
+        evento_id = getattr(resultado, "inserted_id", None)
+        if evento_id is None:
+            raise RuntimeError("evento de reinicio sem identificador")
+    except Exception as e:
+        _registrar_bloqueio_reinicio_worker(
+            "mongodb_indisponivel",
+            detalhe=e,
+        )
+        return False
+
+    if not _worker_ainda_travado_para_reinicio():
+        try:
+            auditoria_sistema_col.update_one(
+                {"_id": evento_id, "status": "preparing"},
+                {
+                    "$set": {
+                        "status": "cancelled_worker_recovered",
+                        "updated_at": datetime.now(timezone.utc).replace(tzinfo=None),
+                    }
+                },
+            )
+        except Exception as e:
+            logger.warning(
+                f"[WORKER_AUTO_RESTART_CANCELAMENTO] erro={sanitizar_erro_log(e)}"
+            )
+        return False
+
+    total_afetados, total_notificados = _notificar_usuarios_reinicio_worker()
+
+    if not _worker_ainda_travado_para_reinicio():
+        try:
+            auditoria_sistema_col.update_one(
+                {"_id": evento_id, "status": "preparing"},
+                {
+                    "$set": {
+                        "status": "cancelled_worker_recovered",
+                        "affected_users_count": total_afetados,
+                        "notified_users_count": total_notificados,
+                        "updated_at": datetime.now(timezone.utc).replace(tzinfo=None),
+                    }
+                },
+            )
+        except Exception as e:
+            logger.warning(
+                f"[WORKER_AUTO_RESTART_CANCELAMENTO] erro={sanitizar_erro_log(e)}"
+            )
+        return False
+
+    try:
+        client.admin.command("ping")
+        agora_final = datetime.now(timezone.utc).replace(tzinfo=None)
+        resultado = auditoria_sistema_col.update_one(
+            {"_id": evento_id, "status": "preparing"},
+            {
+                "$set": {
+                    "status": "restart_triggered",
+                    "affected_users_count": total_afetados,
+                    "notified_users_count": total_notificados,
+                    "triggered_at": agora_final,
+                    "updated_at": agora_final,
+                }
+            },
+        )
+        if getattr(resultado, "modified_count", 0) != 1:
+            raise RuntimeError("evento de reinicio não foi confirmado")
+    except Exception as e:
+        _registrar_bloqueio_reinicio_worker(
+            "mongodb_indisponivel_na_confirmacao",
+            detalhe=e,
+        )
+        return False
+
+    logger.critical(
+        f"[WORKER_AUTO_RESTART] evento_id={evento_id} fase={fase} "
+        f"sem_progresso={sem_progresso}s afetados={total_afetados} "
+        f"notificados={total_notificados} exit_code={WORKER_RESTART_EXIT_CODE}"
+    )
+    _encerrar_processo_para_reinicio()
+    return True
+
+
+def verificar_travamento_worker():
+    """Alerta após o limite e reinicia somente depois do período de confirmação."""
+    agora_monotonic = time.monotonic()
+    deve_alertar = False
+    deve_tentar_reinicio = False
     fase = "desconhecida"
     sem_progresso = 0
 
@@ -1517,30 +1795,51 @@ def verificar_travamento_worker():
             and heartbeat is not None
             and sem_progresso >= WORKER_STALL_TIMEOUT_SECONDS
         )
+        fase = DOWNLOAD_WORKER_STATE.get("phase") or "desconhecida"
         if travado and not DOWNLOAD_WORKER_STATE["stall_alert_active"]:
             DOWNLOAD_WORKER_STATE["stall_alert_active"] = True
             DOWNLOAD_WORKER_STATE["stall_alerted_at"] = datetime.now(TZ).isoformat()
-            fase = DOWNLOAD_WORKER_STATE.get("phase") or "desconhecida"
+            DOWNLOAD_WORKER_STATE["stall_detected_monotonic"] = agora_monotonic
+            DOWNLOAD_WORKER_STATE["restart_blocked_reason"] = None
+            DOWNLOAD_WORKER_STATE["restart_retry_after_monotonic"] = 0.0
             deve_alertar = True
 
-    if not deve_alertar:
-        return False
+        detectado_em = DOWNLOAD_WORKER_STATE.get("stall_detected_monotonic")
+        retry_after = float(
+            DOWNLOAD_WORKER_STATE.get("restart_retry_after_monotonic") or 0.0
+        )
+        if (
+            travado
+            and detectado_em is not None
+            and agora_monotonic - detectado_em >= WORKER_RESTART_GRACE_SECONDS
+            and agora_monotonic >= retry_after
+            and not DOWNLOAD_WORKER_STATE["restart_in_progress"]
+        ):
+            DOWNLOAD_WORKER_STATE["restart_in_progress"] = True
+            DOWNLOAD_WORKER_STATE["restart_blocked_reason"] = None
+            deve_tentar_reinicio = True
 
-    logger.error(
-        f"[WORKER_WATCHDOG] travado fase={fase} "
-        f"sem_progresso={sem_progresso}s"
-    )
-    safe_send_message(
-        ADMIN_ID,
-        "⚠️ <b>Worker de downloads sem progresso</b>\n\n"
-        f"Etapa: <code>{html.escape(str(fase))}</code>\n"
-        f"Sem progresso há: <b>{sem_progresso // 60} minuto(s)</b>\n"
-        f"Fila aguardando: <b>{DOWNLOAD_QUEUE.qsize()}/{DOWNLOAD_QUEUE_MAX}</b>\n\n"
-        "O bot não iniciou outro worker e não reiniciou automaticamente. "
-        "Consulte <code>/diagnostico</code> antes de reiniciar o serviço.",
-        parse_mode="HTML",
-    )
-    return True
+    if deve_alertar:
+        logger.error(
+            f"[WORKER_WATCHDOG] travado fase={fase} "
+            f"sem_progresso={sem_progresso}s"
+        )
+        safe_send_message(
+            ADMIN_ID,
+            "⚠️ <b>Worker de downloads sem progresso</b>\n\n"
+            f"Etapa: <code>{html.escape(str(fase))}</code>\n"
+            f"Sem progresso há: <b>{sem_progresso // 60} minuto(s)</b>\n"
+            f"Fila aguardando: <b>{DOWNLOAD_QUEUE.qsize()}/{DOWNLOAD_QUEUE_MAX}</b>\n\n"
+            f"Se continuar travado por mais {max(1, WORKER_RESTART_GRACE_SECONDS // 60)} "
+            "minuto(s), o processo será encerrado para a Railway reiniciá-lo. "
+            "Nenhum segundo worker será criado.",
+            parse_mode="HTML",
+        )
+
+    if deve_tentar_reinicio:
+        tentar_reinicio_automatico_worker(fase, sem_progresso)
+
+    return deve_alertar or deve_tentar_reinicio
 
 
 def extrair_file_id_telegram(mensagem):
@@ -3392,6 +3691,9 @@ def consultar_docs_backup(tipo):
         auditoria_admin_docs = list(
             auditoria_admin_col.find({}).sort("created_at", -1)
         )
+        auditoria_sistema_docs = list(
+            auditoria_sistema_col.find({}).sort("created_at", -1)
+        )
         payload = {
             "generated_at": agora_tz().isoformat(),
             "service": SERVICE_NAME,
@@ -3402,12 +3704,16 @@ def consultar_docs_backup(tipo):
             "pedidos_count": len(pedidos_docs),
             "metricas_diarias_count": len(metricas_docs),
             "auditoria_admin_count": len(auditoria_admin_docs),
+            "auditoria_sistema_count": len(auditoria_sistema_docs),
             "usuarios": [serializar_para_json(doc) for doc in usuarios_docs],
             "vips_ativos": [serializar_para_json(doc) for doc in vips_docs],
             "pedidos": [serializar_para_json(doc) for doc in pedidos_docs],
             "metricas_diarias": [serializar_para_json(doc) for doc in metricas_docs],
             "auditoria_admin": [
                 serializar_para_json(doc) for doc in auditoria_admin_docs
+            ],
+            "auditoria_sistema": [
+                serializar_para_json(doc) for doc in auditoria_sistema_docs
             ],
         }
         return payload, "backup_geral", "🗂 Backup geral gerado"
@@ -3499,6 +3805,19 @@ def montar_relatorio_diagnostico():
             f"{saude_worker['seconds_without_progress']}s "
             f"(etapa {html.escape(str(saude_worker['phase']))})"
         )
+        reinicio = saude_worker["auto_restart"]
+        if reinicio["blocked_reason"]:
+            linhas.append(
+                "⛔ Reinício automático: bloqueado por "
+                f"{html.escape(str(reinicio['blocked_reason']))}"
+            )
+        elif reinicio["in_progress"]:
+            linhas.append("⚠️ Reinício automático: sendo preparado")
+        elif reinicio["restart_due_in_seconds"] is not None:
+            linhas.append(
+                "ℹ️ Reinício automático em aproximadamente "
+                f"{reinicio['restart_due_in_seconds']}s se não houver recuperação"
+            )
         problemas.append("Worker de downloads sem progresso")
     elif not saude_worker["running"]:
         linhas.append("❌ Worker de downloads: inativo")
@@ -5840,7 +6159,9 @@ if __name__ == "__main__":
     logger.info(
         f"[WORKER_WATCHDOG_CONFIG] stall_timeout="
         f"{WORKER_STALL_TIMEOUT_SECONDS}s interval="
-        f"{WORKER_WATCHDOG_INTERVAL_SECONDS}s auto_restart=False"
+        f"{WORKER_WATCHDOG_INTERVAL_SECONDS}s auto_restart=True "
+        f"restart_grace={WORKER_RESTART_GRACE_SECONDS}s "
+        f"max_restarts_hour={WORKER_MAX_RESTARTS_PER_HOUR}"
     )
     logger.info("[PAGAMENTO_CONFIG] modo=manual_pix configurado=True")
     if TIKTOK_IMPERSONATION_DISPONIVEL:
