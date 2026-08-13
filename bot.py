@@ -6,6 +6,7 @@ import time
 import copy
 import html
 import hashlib
+import hmac
 import ipaddress
 import itertools
 import logging
@@ -77,6 +78,12 @@ TOKEN_TELEGRAM = get_env_required("TOKEN_TELEGRAM")
 MONGO_URI = get_env_required("MONGO_URI")
 MONGO_DB_NAME = get_env_required("MONGO_DB_NAME")
 ADMIN_ID = int(get_env_required("ADMIN_ID"))
+
+# Chave local e estável para referências anônimas nos logs. Ela não é gravada
+# nem exibida e não exige uma nova variável na Railway.
+LOG_ANONYMIZATION_KEY = hashlib.sha256(
+    f"baixar-videos-hd:logs:v1:{TOKEN_TELEGRAM}".encode("utf-8")
+).digest()
 
 # Contato público oficial. Mantê-lo no código evita que uma variável antiga
 # da Railway continue enviando usuários para o suporte anterior.
@@ -441,7 +448,15 @@ try:
         [("event_type", 1), ("status", 1), ("created_at", -1)]
     )
 except Exception as e:
-    logger.warning(f"[MONGO_INDEX] Não foi possível garantir índices agora: {e}")
+    erro_inicio = re.sub(
+        r"(?i)(mongodb(?:\+srv)?|https?)://[^\s]+",
+        "[url]",
+        str(e),
+    )
+    logger.warning(
+        "[MONGO_INDEX] Não foi possível garantir índices agora: "
+        f"{erro_inicio[:500]}"
+    )
 
 bot = telebot.TeleBot(TOKEN_TELEGRAM, threaded=False)
 
@@ -521,6 +536,37 @@ def orientar_uso_no_privado(message):
     )
 
 
+def referencia_privada_log(tipo, valor, tamanho=12):
+    """Cria uma referência estável sem permitir recuperar o valor original."""
+    material = str(valor if valor is not None else "ausente").encode(
+        "utf-8", errors="ignore"
+    )
+    digest = hmac.new(
+        LOG_ANONYMIZATION_KEY,
+        material,
+        hashlib.sha256,
+    ).hexdigest()[:tamanho]
+    rotulo = re.sub(r"[^a-z0-9_-]", "", str(tipo or "ref").lower()) or "ref"
+    return f"{rotulo}#{digest}"
+
+
+def referencia_usuario_log(user_id):
+    return referencia_privada_log("usr", user_id)
+
+
+def referencia_chat_log(chat_id):
+    return referencia_privada_log("chat", chat_id)
+
+
+def referencia_pedido_log(order_nsu):
+    return referencia_privada_log("pix", order_nsu)
+
+
+def referencia_arquivo_log(caminho):
+    extensao = os.path.splitext(str(caminho or ""))[1].lower().lstrip(".")
+    return referencia_privada_log(extensao or "arquivo", caminho)
+
+
 def referencia_url_log(url):
     """Identifica uma URL nos logs sem gravar caminho, consulta ou tokens."""
     texto = str(url or "").strip()
@@ -528,25 +574,42 @@ def referencia_url_log(url):
         host = (urlparse(texto).hostname or "desconhecido").lower()
     except Exception:
         host = "desconhecido"
-    digest = hashlib.sha256(texto.encode("utf-8", errors="ignore")).hexdigest()[:12]
-    return f"{host}#{digest}"
+    return f"{host}:{referencia_privada_log('url', texto)}"
 
 
 def sanitizar_erro_log(erro, limite=1200):
+    """Remove segredos, URLs e identificadores antes de qualquer log."""
     texto = str(erro or "")
     texto = re.sub(r"https?://[^\s]+", "[url]", texto, flags=re.IGNORECASE)
+    texto = re.sub(
+        r"\b\d{6,12}:[A-Za-z0-9_-]{20,}\b",
+        "[token_telegram]",
+        texto,
+    )
+    texto = re.sub(
+        r"(?i)\b(token|password|senha|secret|api[_-]?key|authorization|"
+        r"cookie|sessionid|file[_-]?id)\s*[:=]\s*[^\s,;]+",
+        r"\1=[protegido]",
+        texto,
+    )
+    texto = re.sub(
+        r"(?i)\b(user[_-]?id|chat[_-]?id|admin[_-]?id|target[_-]?user[_-]?id|"
+        r"message[_-]?id|auditoria[_-]?id|order[_-]?nsu)\s*[:=]\s*[^\s,;]+",
+        r"\1=[protegido]",
+        texto,
+    )
+    texto = re.sub(
+        r"\b\d{7,}_\d{7,}_[0-9a-fA-F]{6,}\b",
+        "[pedido]",
+        texto,
+    )
+    texto = re.sub(r"(?<!\d)\d{7,}(?!\d)", "[id]", texto)
     return texto[:limite]
 
 
 def sanitizar_erro_monitoramento(erro, limite=500):
     """Remove URLs, identificadores longos e segredos antes de alertar o ADM."""
     texto = sanitizar_erro_log(erro, limite=max(limite * 2, 500))
-    texto = re.sub(
-        r"(?i)\b(token|password|senha|secret|api[_-]?key|authorization)\s*[:=]\s*[^\s,;]+",
-        r"\1=[protegido]",
-        texto,
-    )
-    texto = re.sub(r"\b\d{7,}\b", "[id]", texto)
     return texto[:limite]
 
 
@@ -755,9 +818,15 @@ def cleanup_prefix(prefix):
             try:
                 os.remove(arq)
             except Exception as e:
-                logger.warning(f"[CLEANUP] Falha ao remover {arq}: {e}")
+                logger.warning(
+                    f"[CLEANUP] arquivo_ref={referencia_arquivo_log(arq)} "
+                    f"erro={sanitizar_erro_log(e)}"
+                )
     except Exception as e:
-        logger.warning(f"[CLEANUP] Falha geral no prefixo {prefix}: {e}")
+        logger.warning(
+            f"[CLEANUP] prefixo_ref={referencia_arquivo_log(prefix)} "
+            f"erro={sanitizar_erro_log(e)}"
+        )
 
 
 def cleanup_download_dir_old_files(max_age_hours=6):
@@ -774,11 +843,20 @@ def cleanup_download_dir_old_files(max_age_hours=6):
                 idade = agora - os.path.getmtime(arq)
                 if idade > max_age_seconds:
                     os.remove(arq)
-                    logger.info(f"[CLEANUP_OLD] Removido arquivo antigo: {arq}")
+                    logger.info(
+                        "[CLEANUP_OLD] removido=True "
+                        f"arquivo_ref={referencia_arquivo_log(arq)}"
+                    )
             except Exception as e:
-                logger.warning(f"[CLEANUP_OLD] Falha ao remover {arq}: {e}")
+                logger.warning(
+                    f"[CLEANUP_OLD] arquivo_ref={referencia_arquivo_log(arq)} "
+                    f"erro={sanitizar_erro_log(e)}"
+                )
     except Exception as e:
-        logger.warning(f"[CLEANUP_OLD] Falha geral no diretório {DOWNLOAD_DIR}: {e}")
+        logger.warning(
+            f"[CLEANUP_OLD] diretorio_ref={referencia_arquivo_log(DOWNLOAD_DIR)} "
+            f"erro={sanitizar_erro_log(e)}"
+        )
 
 
 def cleanup_download_dir_periodicamente(interval_minutes=60, max_age_hours=6):
@@ -801,7 +879,7 @@ def cleanup_download_dir_periodicamente(interval_minutes=60, max_age_hours=6):
             try:
                 cleanup_download_dir_old_files(max_age_hours=max_age_hours)
             except Exception as e:
-                logger.warning(f"[CLEANUP_LOOP] erro={e}")
+                logger.warning(f"[CLEANUP_LOOP] erro={sanitizar_erro_log(e)}")
             proxima_limpeza = agora_monotonic + intervalo_segundos
 
         time.sleep(WORKER_WATCHDOG_INTERVAL_SECONDS)
@@ -864,7 +942,8 @@ def obter_info_midia(arquivo_entrada):
         )
     except subprocess.TimeoutExpired as e:
         logger.warning(
-            f"[FFPROBE] Tempo limite excedido arquivo={arquivo_entrada} "
+            f"[FFPROBE] arquivo_ref={referencia_arquivo_log(arquivo_entrada)} "
+            "tempo_limite=True "
             f"timeout={FFPROBE_TIMEOUT_SECONDS}s"
         )
         raise FalhaComponenteDownload(
@@ -873,7 +952,10 @@ def obter_info_midia(arquivo_entrada):
         ) from e
 
     if resultado.returncode != 0:
-        logger.warning(f"[FFPROBE] Falha ao analisar {arquivo_entrada}: {resultado.stderr[-500:]}")
+        logger.warning(
+            f"[FFPROBE] arquivo_ref={referencia_arquivo_log(arquivo_entrada)} "
+            f"erro={sanitizar_erro_log(resultado.stderr[-500:])}"
+        )
         raise FalhaComponenteDownload(
             "Processamento",
             f"FFPROBE_FALHOU codigo={resultado.returncode}",
@@ -883,7 +965,10 @@ def obter_info_midia(arquivo_entrada):
         import json
         dados = json.loads(resultado.stdout)
     except Exception as e:
-        logger.warning(f"[FFPROBE] JSON inválido para {arquivo_entrada}: {e}")
+        logger.warning(
+            f"[FFPROBE] arquivo_ref={referencia_arquivo_log(arquivo_entrada)} "
+            f"json_invalido=True erro={sanitizar_erro_log(e)}"
+        )
         raise FalhaComponenteDownload(
             "Processamento",
             "FFPROBE_JSON_INVALIDO",
@@ -1208,7 +1293,8 @@ def preparar_arquivo_para_envio(arquivo_entrada, plataforma=None):
 
     if arquivo_ja_otimizado_para_envio(arquivo_entrada, info, permitir_hevc=permitir_hevc):
         logger.info(
-            f"[MIDIA] Enviando original sem reconversão | plataforma={plataforma} arquivo={arquivo_entrada} "
+            f"[MIDIA] Enviando original sem reconversão | plataforma={plataforma} "
+            f"arquivo_ref={referencia_arquivo_log(arquivo_entrada)} "
             f"width={info.get('width')} height={info.get('height')} fps={info.get('fps')} "
             f"vcodec={info.get('vcodec')} acodec={info.get('acodec')} permitir_hevc={permitir_hevc}"
         )
@@ -1231,7 +1317,8 @@ def preparar_arquivo_para_envio(arquivo_entrada, plataforma=None):
             and (vcodec in ("h264", "avc1") or (permitir_hevc and vcodec in ("hevc", "h265", "hev1", "hvc1")))
         ):
             logger.info(
-                f"[MIDIA] Fazendo apenas remux para MP4 | plataforma={plataforma} arquivo={arquivo_entrada} "
+                f"[MIDIA] Fazendo apenas remux para MP4 | plataforma={plataforma} "
+                f"arquivo_ref={referencia_arquivo_log(arquivo_entrada)} "
                 f"width={width} height={height} fps={fps} "
                 f"vcodec={info.get('vcodec')} acodec={info.get('acodec')} permitir_hevc={permitir_hevc}"
             )
@@ -1239,7 +1326,8 @@ def preparar_arquivo_para_envio(arquivo_entrada, plataforma=None):
 
     logger.info(
         f"[MIDIA] Convertendo arquivo para padrão 720x1280 30fps | plataforma={plataforma} "
-        f"arquivo={arquivo_entrada} info={info} permitir_hevc={permitir_hevc}"
+        f"arquivo_ref={referencia_arquivo_log(arquivo_entrada)} "
+        f"info={info} permitir_hevc={permitir_hevc}"
     )
     return converter_para_720x1280_30fps(arquivo_entrada)
 
@@ -1248,7 +1336,10 @@ def safe_send_message(chat_id, texto, **kwargs):
     try:
         return bot.send_message(chat_id, texto, **kwargs)
     except Exception as e:
-        logger.error(f"[SEND_MESSAGE] chat_id={chat_id} erro={e}")
+        logger.error(
+            f"[SEND_MESSAGE] chat_ref={referencia_chat_log(chat_id)} "
+            f"erro={sanitizar_erro_log(e)}"
+        )
         return None
 
 
@@ -1256,7 +1347,10 @@ def safe_reply_to(message, texto, **kwargs):
     try:
         return bot.reply_to(message, texto, **kwargs)
     except Exception as e:
-        logger.error(f"[REPLY_TO] chat_id={message.chat.id} erro={e}")
+        logger.error(
+            f"[REPLY_TO] chat_ref={referencia_chat_log(message.chat.id)} "
+            f"erro={sanitizar_erro_log(e)}"
+        )
         return None
 
 
@@ -1264,7 +1358,11 @@ def safe_edit_message(chat_id, message_id, texto, **kwargs):
     try:
         return bot.edit_message_text(texto, chat_id, message_id, **kwargs)
     except Exception as e:
-        logger.warning(f"[EDIT_MESSAGE] chat_id={chat_id} message_id={message_id} erro={e}")
+        logger.warning(
+            f"[EDIT_MESSAGE] chat_ref={referencia_chat_log(chat_id)} "
+            f"mensagem_ref={referencia_privada_log('msg', message_id)} "
+            f"erro={sanitizar_erro_log(e)}"
+        )
         return None
 
 
@@ -1272,14 +1370,18 @@ def safe_delete_message(chat_id, message_id):
     try:
         bot.delete_message(chat_id, message_id)
     except Exception as e:
-        logger.warning(f"[DELETE_MESSAGE] chat_id={chat_id} message_id={message_id} erro={e}")
+        logger.warning(
+            f"[DELETE_MESSAGE] chat_ref={referencia_chat_log(chat_id)} "
+            f"mensagem_ref={referencia_privada_log('msg', message_id)} "
+            f"erro={sanitizar_erro_log(e)}"
+        )
 
 
 def safe_answer_callback(call_id, **kwargs):
     try:
         bot.answer_callback_query(call_id, **kwargs)
     except Exception as e:
-        logger.warning(f"[CALLBACK_ANSWER] erro={e}")
+        logger.warning(f"[CALLBACK_ANSWER] erro={sanitizar_erro_log(e)}")
 
 
 def normalizar_plataforma_monitoramento(plataforma):
@@ -1868,7 +1970,8 @@ def tentar_reinicio_automatico_worker(fase, sem_progresso):
         return False
 
     logger.critical(
-        f"[WORKER_AUTO_RESTART] evento_id={evento_id} fase={fase} "
+        f"[WORKER_AUTO_RESTART] evento_ref={referencia_privada_log('evento', evento_id)} "
+        f"fase={fase} "
         f"sem_progresso={sem_progresso}s afetados={total_afetados} "
         f"notificados={total_notificados} exit_code={WORKER_RESTART_EXIT_CODE}"
     )
@@ -1971,7 +2074,10 @@ def enviar_arquivo_com_fallback(chat_id, arquivo):
     except Exception as e_video:
         if isinstance(e_video, OSError):
             raise FalhaComponenteDownload("Armazenamento", e_video) from e_video
-        logger.warning(f"[SEND_VIDEO] Falhou no envio como vídeo. arquivo={arquivo} erro={e_video}")
+        logger.warning(
+            f"[SEND_VIDEO] arquivo_ref={referencia_arquivo_log(arquivo)} "
+            f"erro={sanitizar_erro_log(e_video)}"
+        )
 
     info = obter_info_midia(arquivo)
     arquivo_fallback = None
@@ -1979,7 +2085,8 @@ def enviar_arquivo_com_fallback(chat_id, arquivo):
     if arquivo_tem_codec_hevc(arquivo, info):
         try:
             logger.info(
-                f"[SEND_VIDEO] Tentando fallback automático HEVC -> H.264 | arquivo={arquivo} "
+                "[SEND_VIDEO] Tentando fallback automático HEVC -> H.264 | "
+                f"arquivo_ref={referencia_arquivo_log(arquivo)} "
                 f"width={(info or {}).get('width')} height={(info or {}).get('height')} "
                 f"fps={(info or {}).get('fps')} vcodec={(info or {}).get('vcodec')}"
             )
@@ -1997,13 +2104,19 @@ def enviar_arquivo_com_fallback(chat_id, arquivo):
                     caption="👉 Download concluído! Aqui está seu vídeo 👊",
                 )
 
-            logger.info(f"[SEND_VIDEO] Fallback H.264 enviado com sucesso | arquivo={arquivo_fallback}")
+            logger.info(
+                "[SEND_VIDEO] Fallback H.264 enviado com sucesso | "
+                f"arquivo_ref={referencia_arquivo_log(arquivo_fallback)}"
+            )
             telegram_file_id, telegram_media_type = extrair_dados_midia_telegram(mensagem)
             registrar_sucesso_componente("Telegram")
             registrar_sucesso_componente("Processamento")
             return True, telegram_file_id, telegram_media_type
         except Exception as e_h264:
-            logger.warning(f"[SEND_VIDEO] Fallback H.264 também falhou. erro={e_h264}")
+            logger.warning(
+                "[SEND_VIDEO] Fallback H.264 também falhou. "
+                f"erro={sanitizar_erro_log(e_h264)}"
+            )
 
     alvo_documento = arquivo_fallback if arquivo_fallback and os.path.exists(arquivo_fallback) else arquivo
 
@@ -2018,7 +2131,9 @@ def enviar_arquivo_com_fallback(chat_id, arquivo):
         registrar_sucesso_componente("Telegram")
         return True, telegram_file_id, telegram_media_type
     except Exception as e_doc:
-        logger.error(f"[SEND_DOCUMENT] Também falhou. erro={e_doc}")
+        logger.error(
+            f"[SEND_DOCUMENT] Também falhou. erro={sanitizar_erro_log(e_doc)}"
+        )
         if isinstance(e_doc, OSError):
             raise FalhaComponenteDownload("Armazenamento", e_doc) from e_doc
         raise FalhaComponenteDownload("Telegram", e_doc) from e_doc
@@ -2106,7 +2221,10 @@ def obter_entrada_cache(cache_key):
             "telegram_media_type": telegram_media_type,
         }
     except Exception as e:
-        logger.warning(f"[CACHE_MIDIA_LEITURA] key={cache_key[:12]} erro={e}")
+        logger.warning(
+            f"[CACHE_MIDIA_LEITURA] key={cache_key[:12]} "
+            f"erro={sanitizar_erro_log(e)}"
+        )
         registrar_falha_componente("MongoDB", e)
         return None
 
@@ -2166,7 +2284,10 @@ def salvar_file_id_cache(
             )
         registrar_sucesso_componente("MongoDB")
     except Exception as e:
-        logger.warning(f"[CACHE_MIDIA_GRAVACAO] key={cache_key[:12]} erro={e}")
+        logger.warning(
+            f"[CACHE_MIDIA_GRAVACAO] key={cache_key[:12]} "
+            f"erro={sanitizar_erro_log(e)}"
+        )
         registrar_falha_componente("MongoDB", e)
 
 
@@ -2503,7 +2624,9 @@ def get_tiktok_cookiefile():
             try:
                 texto_arquivo = ler_texto_privado(cookie_path)
             except Exception as e:
-                logger.warning(f"[TIKTOK_COOKIES_LEITURA_FALHA] erro={e}")
+                logger.warning(
+                    f"[TIKTOK_COOKIES_LEITURA_FALHA] erro={sanitizar_erro_log(e)}"
+                )
 
         linhas_arquivo = linhas_validas_tiktok_cookies(texto_arquivo)
 
@@ -2596,7 +2719,10 @@ def get_tiktok_device_id():
             try:
                 escrever_texto_privado(device_path, device_id_env + "\n")
             except Exception as e:
-                logger.warning(f"[TIKTOK_DEVICE_ID_GRAVACAO_FALHA] origem=variavel erro={e}")
+                logger.warning(
+                    "[TIKTOK_DEVICE_ID_GRAVACAO_FALHA] origem=variavel "
+                    f"erro={sanitizar_erro_log(e)}"
+                )
             logger.info("[TIKTOK_DEVICE_ID] origem=variavel_railway valido=True")
             return device_id_env
 
@@ -2609,7 +2735,9 @@ def get_tiktok_device_id():
                     logger.info("[TIKTOK_DEVICE_ID] origem=arquivo_persistente valido=True")
                     return device_id_arquivo
             except Exception as e:
-                logger.warning(f"[TIKTOK_DEVICE_ID_LEITURA_FALHA] erro={e}")
+                logger.warning(
+                    f"[TIKTOK_DEVICE_ID_LEITURA_FALHA] erro={sanitizar_erro_log(e)}"
+                )
 
         # O intervalo é o mesmo usado pelo próprio extrator do yt-dlp. Gravar
         # no volume evita apresentar um aparelho diferente a cada tentativa.
@@ -2620,7 +2748,10 @@ def get_tiktok_device_id():
             escrever_texto_privado(device_path, device_id_novo + "\n")
             logger.info("[TIKTOK_DEVICE_ID] origem=gerado_persistente valido=True")
         except Exception as e:
-            logger.warning(f"[TIKTOK_DEVICE_ID_GRAVACAO_FALHA] origem=gerado erro={e}")
+            logger.warning(
+                "[TIKTOK_DEVICE_ID_GRAVACAO_FALHA] origem=gerado "
+                f"erro={sanitizar_erro_log(e)}"
+            )
         return device_id_novo
 
 
@@ -2825,7 +2956,9 @@ def extrair_info_tiktok_hd_sem_marca(url):
                 video_id = str(dados.get("id") or extrair_tiktok_video_id(url))
                 tamanho = dados.get("hd_size") if usou_hd else dados.get("size")
                 logger.info(
-                    f"[TIKTOK_HD_OK] video_id={video_id} sem_marca=True "
+                    "[TIKTOK_HD_OK] "
+                    f"video_ref={referencia_privada_log('video', video_id)} "
+                    "sem_marca=True "
                     f"hd={usou_hd} metodo={metodo} duration={dados.get('duration')} "
                     f"tamanho={tamanho}"
                 )
@@ -3332,7 +3465,7 @@ def inicializar_metricas_diarias():
             f"[METRICAS_INIT] data={hoje} gratuitos_base={gratuitos_existentes}"
         )
     except Exception as e:
-        logger.error(f"[METRICAS_INIT] erro={e}")
+        logger.error(f"[METRICAS_INIT] erro={sanitizar_erro_log(e)}")
 
 
 def registrar_download_diario(vip_status):
@@ -3361,12 +3494,18 @@ def registrar_download_diario(vip_status):
         )
         registrar_sucesso_componente("MongoDB")
     except Exception as e:
-        logger.error(f"[METRICAS_DOWNLOAD] vip={vip_status} erro={e}")
+        logger.error(
+            f"[METRICAS_DOWNLOAD] vip={vip_status} "
+            f"erro={sanitizar_erro_log(e)}"
+        )
         registrar_falha_componente("MongoDB", e)
 
 
 def gerar_order_nsu(user_id):
-    return f"{user_id}_{int(time.time())}_{uuid.uuid4().hex[:10]}"
+    # O argumento é mantido para compatibilidade com as chamadas atuais, mas
+    # novos códigos não carregam mais o ID do Telegram.
+    _ = user_id
+    return f"pix_{uuid.uuid4().hex}"
 
 
 def obter_plano_por_callback(valor_str):
@@ -3460,7 +3599,10 @@ def notificar_pagamento_confirmado(user_id, plano_nome, vip_ate):
             safe_send_message(int(user_id), texto, parse_mode="Markdown")
         )
     except Exception as e:
-        logger.error(f"[NOTIFICAR_PAGAMENTO] user_id={user_id} erro={e}")
+        logger.error(
+            f"[NOTIFICAR_PAGAMENTO] user_ref={referencia_usuario_log(user_id)} "
+            f"erro={sanitizar_erro_log(e)}"
+        )
         return False
 
 
@@ -3586,13 +3728,13 @@ def recuperar_aprovacoes_pix_interrompidas():
                     aprovacao["vip_ate"],
                 )
                 logger.info(
-                    f"[PIX_RECUPERACAO_OK] order_nsu={order_nsu} "
-                    f"user_id={pedido_final['user_id']}"
+                    f"[PIX_RECUPERACAO_OK] pedido_ref={referencia_pedido_log(order_nsu)} "
+                    f"user_ref={referencia_usuario_log(pedido_final['user_id'])}"
                 )
         except Exception as e:
             falhas += 1
             logger.error(
-                f"[PIX_RECUPERACAO_FALHA] order_nsu={order_nsu} "
+                f"[PIX_RECUPERACAO_FALHA] pedido_ref={referencia_pedido_log(order_nsu)} "
                 f"erro={sanitizar_erro_log(e)}"
             )
 
@@ -3675,7 +3817,9 @@ def is_vip_user(user):
     try:
         return agora_tz().date() <= datetime.strptime(v_ate, "%Y-%m-%d").date()
     except Exception as e:
-        logger.warning(f"[IS_VIP_USER] vip_ate={v_ate} erro={e}")
+        logger.warning(
+            f"[IS_VIP_USER] validade_invalida=True erro={sanitizar_erro_log(e)}"
+        )
         return False
 
 
@@ -3804,7 +3948,10 @@ def configurar_menu_comandos():
         )
         return True
     except Exception as e:
-        logger.warning(f"[TELEGRAM_MENU] não foi possível configurar: {e}")
+        logger.warning(
+            "[TELEGRAM_MENU] não foi possível configurar: "
+            f"{sanitizar_erro_log(e)}"
+        )
         return False
 
 
@@ -4117,7 +4264,9 @@ def processar_backup_admin(tipo, origem_chat_id=None):
         if origem_chat_id and origem_chat_id != ADMIN_ID:
             safe_send_message(origem_chat_id, "✅ Backup gerado e enviado no privado do ADM.")
     except Exception as e:
-        logger.error(f"[BACKUP_ADMIN] tipo={tipo} erro={e}")
+        logger.error(
+            f"[BACKUP_ADMIN] tipo={tipo} erro={sanitizar_erro_log(e)}"
+        )
         safe_send_message(ADMIN_ID, f"❌ Erro ao gerar backup `{tipo}`.", parse_mode="Markdown")
         if origem_chat_id and origem_chat_id != ADMIN_ID:
             safe_send_message(origem_chat_id, "❌ Erro ao gerar backup do ADM.")
@@ -4126,7 +4275,11 @@ def processar_backup_admin(tipo, origem_chat_id=None):
             try:
                 os.remove(caminho_arquivo)
             except Exception as e:
-                logger.warning(f"[BACKUP_ADMIN_CLEANUP] arquivo={caminho_arquivo} erro={e}")
+                logger.warning(
+                    "[BACKUP_ADMIN_CLEANUP] "
+                    f"arquivo_ref={referencia_arquivo_log(caminho_arquivo)} "
+                    f"erro={sanitizar_erro_log(e)}"
+                )
         BACKUP_ADMIN_LOCK.release()
 
 
@@ -4369,7 +4522,8 @@ def iniciar_auditoria_admin(
     except Exception as e:
         logger.critical(
             f"[AUDITORIA_ADMIN_INICIO_FALHA] action={action} "
-            f"target_user_id={target_user_id} erro={sanitizar_erro_log(e)}"
+            f"user_ref={referencia_usuario_log(target_user_id)} "
+            f"erro={sanitizar_erro_log(e)}"
         )
         raise AuditoriaAdminIndisponivel(
             "AUDITORIA_ADMIN_INDISPONIVEL"
@@ -4403,7 +4557,8 @@ def finalizar_auditoria_admin(
         return True
     except Exception as e:
         logger.critical(
-            f"[AUDITORIA_ADMIN_FINAL_FALHA] auditoria_id={auditoria_id} "
+            "[AUDITORIA_ADMIN_FINAL_FALHA] "
+            f"auditoria_ref={referencia_privada_log('auditoria', auditoria_id)} "
             f"erro={sanitizar_erro_log(e)}"
         )
         safe_send_message(
@@ -4437,7 +4592,8 @@ def falhar_auditoria_admin(auditoria_id, erro):
     except Exception as audit_error:
         logger.critical(
             f"[AUDITORIA_ADMIN_FALHA_NAO_REGISTRADA] "
-            f"auditoria_id={auditoria_id} erro={sanitizar_erro_log(audit_error)}"
+            f"auditoria_ref={referencia_privada_log('auditoria', auditoria_id)} "
+            f"erro={sanitizar_erro_log(audit_error)}"
         )
 
 
@@ -4630,7 +4786,8 @@ def remover_vip_manual(message):
         )
 
         logger.info(
-            f"[REMOVERVIP] admin_id={ADMIN_ID} user_id={alvo_id} "
+            f"[REMOVERVIP] admin_ref={referencia_usuario_log(ADMIN_ID)} "
+            f"user_ref={referencia_usuario_log(alvo_id)} "
             f"vip_anterior={vip_anterior} ativo={vip_estava_ativo}"
         )
 
@@ -4798,10 +4955,15 @@ def enviar_aviso_geral_usuario(user_id, msg_texto):
         erro_lower = erro_texto.lower()
 
         if "error code: 403" in erro_lower and "bot was blocked by the user" in erro_lower:
-            logger.info(f"[AVISOGERAL_BLOQUEADO] chat_id={user_id}")
+            logger.info(
+                f"[AVISOGERAL_BLOQUEADO] user_ref={referencia_usuario_log(user_id)}"
+            )
             return "bloqueado"
 
-        logger.error(f"[AVISOGERAL_FALHA] chat_id={user_id} erro={e}")
+        logger.error(
+            f"[AVISOGERAL_FALHA] user_ref={referencia_usuario_log(user_id)} "
+            f"erro={sanitizar_erro_log(e)}"
+        )
         return "falha"
 
 
@@ -4849,7 +5011,7 @@ def processar_aviso_geral(admin_chat_id, msg_texto):
             f"enviados={enviados} bloqueados={bloqueados} falhas={falhas}"
         )
     except Exception as e:
-        logger.error(f"[AVISOGERAL_LOOP] erro={e}")
+        logger.error(f"[AVISOGERAL_LOOP] erro={sanitizar_erro_log(e)}")
         safe_send_message(admin_chat_id, "❌ Erro ao enviar aviso geral.")
     finally:
         AVISO_GERAL_LOCK.release()
@@ -4873,7 +5035,7 @@ def aviso_geral(message):
 
         safe_reply_to(message, "📢 Envio do aviso geral iniciado em segundo plano.")
     except Exception as e:
-        logger.error(f"[AVISOGERAL] erro={e}")
+        logger.error(f"[AVISOGERAL] erro={sanitizar_erro_log(e)}")
         safe_reply_to(message, "❌ Erro ao iniciar aviso geral.")
 
 
@@ -4973,7 +5135,7 @@ def painel_admin(message):
 
         safe_send_message(message.chat.id, resumo_admin, parse_mode="Markdown")
     except Exception as e:
-        logger.error(f"[PAINEL_ADMIN] erro={e}")
+        logger.error(f"[PAINEL_ADMIN] erro={sanitizar_erro_log(e)}")
         safe_send_message(message.chat.id, "❌ Erro ao abrir painel admin.")
 
 
@@ -5058,7 +5220,7 @@ def suporte(message):
             reply_markup=markup
         )
     except Exception as e:
-        logger.error(f"[SUPORTE] erro={e}")
+        logger.error(f"[SUPORTE] erro={sanitizar_erro_log(e)}")
         safe_send_message(
             message.chat.id,
             f"Suporte oficial: {SUPORTE_USERNAME}\n{LINK_SUPORTE}",
@@ -5426,12 +5588,12 @@ def reabrir_comprovante_pix(call):
 
         safe_answer_callback(call.id, text="Comprovante reaberto abaixo.")
         logger.info(
-            f"[PIX_COMPROVANTE_REABERTO] order_nsu={order_nsu} "
+            f"[PIX_COMPROVANTE_REABERTO] pedido_ref={referencia_pedido_log(order_nsu)} "
             f"status={pedido['status']}"
         )
     except Exception as e:
         logger.error(
-            f"[PIX_COMPROVANTE_REABRIR] order_nsu={order_nsu} "
+            f"[PIX_COMPROVANTE_REABRIR] pedido_ref={referencia_pedido_log(order_nsu)} "
             f"erro={sanitizar_erro_log(e)}"
         )
         if nova_mensagem:
@@ -5517,7 +5679,7 @@ def iniciar_pagamento_pix_manual(call):
             raise RuntimeError("falha ao entregar instruções Pix")
 
     except Exception as e:
-        logger.error(f"[PIX_MANUAL_INICIO] erro={e}")
+        logger.error(f"[PIX_MANUAL_INICIO] erro={sanitizar_erro_log(e)}")
         safe_send_message(
             call.message.chat.id,
             "❌ Não consegui iniciar seu pagamento Pix agora.\n"
@@ -5630,7 +5792,9 @@ def solicitar_comprovante_pix(call):
         )
         safe_answer_callback(call.id, text="Envie o comprovante no chat.")
     except Exception as e:
-        logger.error(f"[PIX_SOLICITAR_COMPROVANTE] erro={e}")
+        logger.error(
+            f"[PIX_SOLICITAR_COMPROVANTE] erro={sanitizar_erro_log(e)}"
+        )
         safe_answer_callback(call.id, text="Erro ao abrir o envio do comprovante.", show_alert=True)
 
 
@@ -5683,7 +5847,7 @@ def receber_comprovante_pix(message):
             comprovante_entregue = True
         except Exception as e:
             logger.warning(
-                f"[PIX_FORWARD_RECEIPT] order_nsu={order_nsu} "
+                f"[PIX_FORWARD_RECEIPT] pedido_ref={referencia_pedido_log(order_nsu)} "
                 f"erro={sanitizar_erro_log(e)}"
             )
             try:
@@ -5694,7 +5858,7 @@ def receber_comprovante_pix(message):
                 comprovante_entregue = True
             except Exception as envio_erro:
                 logger.error(
-                    f"[PIX_SEND_RECEIPT] order_nsu={order_nsu} "
+                    f"[PIX_SEND_RECEIPT] pedido_ref={referencia_pedido_log(order_nsu)} "
                     f"erro={sanitizar_erro_log(envio_erro)}"
                 )
 
@@ -5776,7 +5940,8 @@ def receber_comprovante_pix(message):
         )
     except Exception as e:
         logger.error(
-            f"[PIX_RECEBER_COMPROVANTE] user_id={message.from_user.id} "
+            "[PIX_RECEBER_COMPROVANTE] "
+            f"user_ref={referencia_usuario_log(message.from_user.id)} "
             f"erro={sanitizar_erro_log(e)}"
         )
         safe_send_message(message.chat.id, "❌ Não consegui registrar o comprovante. Tente novamente.")
@@ -5881,8 +6046,9 @@ def revisar_comprovante_pix(call):
                 )
                 safe_answer_callback(call.id, text="VIP liberado com sucesso.")
                 logger.info(
-                    f"[PIX_MANUAL_APROVADO] order_nsu={order_nsu} "
-                    f"user_id={pedido_final['user_id']} vip_ate={vip_ate} "
+                    f"[PIX_MANUAL_APROVADO] pedido_ref={referencia_pedido_log(order_nsu)} "
+                    f"user_ref={referencia_usuario_log(pedido_final['user_id'])} "
+                    f"vip_ate={vip_ate} "
                     f"recuperado={pedido.get('status') == 'approving'}"
                 )
             else:
@@ -5924,10 +6090,13 @@ def revisar_comprovante_pix(call):
                     parse_mode="Markdown",
                 )
                 safe_answer_callback(call.id, text="Comprovante rejeitado.")
-                logger.info(f"[PIX_MANUAL_REJEITADO] order_nsu={order_nsu}")
+                logger.info(
+                    "[PIX_MANUAL_REJEITADO] "
+                    f"pedido_ref={referencia_pedido_log(order_nsu)}"
+                )
     except Exception as e:
         logger.error(
-            f"[PIX_MANUAL_REVISAO] order_nsu={order_nsu} "
+            f"[PIX_MANUAL_REVISAO] pedido_ref={referencia_pedido_log(order_nsu)} "
             f"erro={sanitizar_erro_log(e)}"
         )
         safe_answer_callback(call.id, text="Erro ao revisar o pagamento.", show_alert=True)
@@ -6014,7 +6183,7 @@ def _processar_download(message, url, status_msg):
             url = normalizar_url_instagram(url)
 
         logger.info(
-            f"[DOWNLOAD_INICIO] user_id={message.from_user.id} "
+            f"[DOWNLOAD_INICIO] user_ref={referencia_usuario_log(message.from_user.id)} "
             f"plataforma={plataforma} url_ref={referencia_url_log(url)}"
         )
 
@@ -6027,7 +6196,7 @@ def _processar_download(message, url, status_msg):
             return
 
         if is_pinterest:
-            prefix = os.path.join(DOWNLOAD_DIR, f"v_{message.from_user.id}_{uuid.uuid4().hex}")
+            prefix = os.path.join(DOWNLOAD_DIR, f"v_{uuid.uuid4().hex}")
             try:
                 url_resolvida = resolver_link_pinterest(url)
             except Exception as e:
@@ -6065,7 +6234,11 @@ def _processar_download(message, url, status_msg):
                     info = ydl.extract_info(url_resolvida, download=False)
 
                 duracao = info.get("duration")
-                logger.info(f"[META] plataforma=Pinterest user_id={message.from_user.id} duration={duracao}")
+                logger.info(
+                    "[META] plataforma=Pinterest "
+                    f"user_ref={referencia_usuario_log(message.from_user.id)} "
+                    f"duration={duracao}"
+                )
 
                 if duracao and duracao > MAX_DURATION_SECONDS:
                     texto = f"⚠️ Vídeo muito longo. O limite é de {MAX_DURATION_SECONDS} segundos."
@@ -6110,7 +6283,10 @@ def _processar_download(message, url, status_msg):
             except CacheTelegramTemporariamenteIndisponivel:
                 raise
             except Exception as e:
-                logger.warning(f"[PINTEREST_INFO] Falha ao ler metadados: {e}")
+                logger.warning(
+                    "[PINTEREST_INFO] Falha ao ler metadados: "
+                    f"{sanitizar_erro_log(e)}"
+                )
 
             try:
                 atualizar_heartbeat_worker("baixando")
@@ -6174,7 +6350,7 @@ def _processar_download(message, url, status_msg):
                 if not e.ja_registrada:
                     registrar_falha_componente(e.componente, e.erro_original)
                 logger.error(
-                    f"[ERRO_PINTEREST] user_id={message.from_user.id} "
+                    f"[ERRO_PINTEREST] user_ref={referencia_usuario_log(message.from_user.id)} "
                     f"origem={e.componente} url_ref={referencia_url_log(url)} "
                     f"erro={sanitizar_erro_log(e.erro_original)}"
                 )
@@ -6195,7 +6371,7 @@ def _processar_download(message, url, status_msg):
             except Exception as e:
                 registrar_falha_componente("Interno", e)
                 logger.error(
-                    f"[ERRO_PINTEREST] user_id={message.from_user.id} "
+                    f"[ERRO_PINTEREST] user_ref={referencia_usuario_log(message.from_user.id)} "
                     f"origem=Interno url_ref={referencia_url_log(url)} "
                     f"erro={sanitizar_erro_log(e)}"
                 )
@@ -6227,7 +6403,7 @@ def _processar_download(message, url, status_msg):
                 safe_delete_message(message.chat.id, status_msg.message_id)
             return
 
-        prefix = os.path.join(DOWNLOAD_DIR, f"v_{message.from_user.id}_{uuid.uuid4().hex}")
+        prefix = os.path.join(DOWNLOAD_DIR, f"v_{uuid.uuid4().hex}")
 
         usar_cookies_plataforma = True
         tiktok_extractor_args_usados = None
@@ -6250,7 +6426,11 @@ def _processar_download(message, url, status_msg):
             raise FalhaComponenteDownload(plataforma, e) from e
 
         duracao = info.get("duration")
-        logger.info(f"[META] plataforma={plataforma} user_id={message.from_user.id} duration={duracao}")
+        logger.info(
+            f"[META] plataforma={plataforma} "
+            f"user_ref={referencia_usuario_log(message.from_user.id)} "
+            f"duration={duracao}"
+        )
 
         if duracao and duracao > MAX_DURATION_SECONDS:
             texto = f"⚠️ Vídeo muito longo. O limite é de {MAX_DURATION_SECONDS} segundos."
@@ -6401,7 +6581,7 @@ def _processar_download(message, url, status_msg):
 
     except CacheTelegramTemporariamenteIndisponivel as e:
         logger.warning(
-            f"[CACHE_MIDIA_TEMPORARIO] user_id={message.from_user.id} "
+            f"[CACHE_MIDIA_TEMPORARIO] user_ref={referencia_usuario_log(message.from_user.id)} "
             f"url_ref={referencia_url_log(url)} erro={sanitizar_erro_log(e)}"
         )
         texto_cache_temporario = (
@@ -6421,7 +6601,7 @@ def _processar_download(message, url, status_msg):
         if not e.ja_registrada:
             registrar_falha_componente(e.componente, e.erro_original)
         logger.error(
-            f"[ERRO_DOWNLOAD] user_id={message.from_user.id} "
+            f"[ERRO_DOWNLOAD] user_ref={referencia_usuario_log(message.from_user.id)} "
             f"origem={e.componente} url_ref={referencia_url_log(url)} "
             f"erro={sanitizar_erro_log(e.erro_original)}"
         )
@@ -6444,7 +6624,7 @@ def _processar_download(message, url, status_msg):
     except Exception as e:
         registrar_falha_componente("Interno", e)
         logger.error(
-            f"[ERRO_DOWNLOAD] user_id={message.from_user.id} "
+            f"[ERRO_DOWNLOAD] user_ref={referencia_usuario_log(message.from_user.id)} "
             f"origem=Interno url_ref={referencia_url_log(url)} "
             f"erro={sanitizar_erro_log(e)}"
         )
@@ -6484,7 +6664,7 @@ def loop_fila_downloads():
                 )
             except Exception as e:
                 logger.error(
-                    f"[DOWNLOAD_WORKER] user_id={user_id} "
+                    f"[DOWNLOAD_WORKER] user_ref={referencia_usuario_log(user_id)} "
                     f"erro={sanitizar_erro_log(e)}"
                 )
                 safe_send_message(
