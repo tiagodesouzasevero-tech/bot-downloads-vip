@@ -207,6 +207,7 @@ MONITOR_FAILURE_WINDOW_SECONDS = get_env_int(
 MONITOR_ALERT_COOLDOWN_SECONDS = get_env_int(
     "MONITOR_ALERT_COOLDOWN_SECONDS", 3600, 300, 86400
 )
+MONITOR_SUCCESS_LOG_INTERVAL_SECONDS = 900
 MEDIA_PROFILE_VERSION = (
     f"720x1280_30fps_h264_crf{VIDEO_CRF}_audio{AUDIO_BITRATE}_sem_marca_v2"
 )
@@ -280,6 +281,7 @@ COMPONENT_MONITOR_STATE = {
         "last_alert_at": 0.0,
         "last_error": None,
         "last_success_at": None,
+        "last_success_log_monotonic": None,
     }
     for componente in COMPONENTES_PLATAFORMA + COMPONENTES_INTERNOS
 }
@@ -1680,31 +1682,46 @@ def registrar_falha_componente(componente, erro):
 
 
 def registrar_sucesso_componente(componente):
-    """Limpa apenas o contador do componente que comprovadamente respondeu."""
+    """Atualiza sempre a saúde e reduz somente os logs repetitivos."""
     componente = normalizar_componente_monitoramento(componente)
     if not componente:
         return False
 
-    recuperou = False
+    agora_monotonic = time.monotonic()
+    recuperou_alerta = False
+    deve_logar = False
     with COMPONENT_MONITOR_LOCK:
         estado = COMPONENT_MONITOR_STATE[componente]
-        recuperou = bool(estado["alert_active"])
+        recuperou_alerta = bool(estado["alert_active"])
+        teve_falha_recente = bool(estado["failures"])
         estado["failures"].clear()
         estado["alert_active"] = False
         estado["last_error"] = None
         estado["last_success_at"] = agora_tz().isoformat()
+        ultimo_log = estado.get("last_success_log_monotonic")
+        deve_logar = (
+            recuperou_alerta
+            or teve_falha_recente
+            or ultimo_log is None
+            or agora_monotonic - float(ultimo_log)
+            >= MONITOR_SUCCESS_LOG_INTERVAL_SECONDS
+        )
+        if deve_logar:
+            estado["last_success_log_monotonic"] = agora_monotonic
 
-    logger.info(
-        f"[MONITOR_SUCESSO] componente={componente} recuperacao={recuperou}"
-    )
-    if recuperou:
+    if deve_logar:
+        logger.info(
+            f"[MONITOR_SUCESSO] componente={componente} "
+            f"recuperacao={recuperou_alerta}"
+        )
+    if recuperou_alerta:
         safe_send_message(
             ADMIN_ID,
             "✅ <b>Componente normalizado</b>\n\n"
             f"<b>{html.escape(componente)}</b> voltou a funcionar normalmente.",
             parse_mode="HTML",
         )
-    return recuperou
+    return recuperou_alerta
 
 
 def registrar_falha_plataforma(plataforma, erro):
@@ -8550,7 +8567,8 @@ if __name__ == "__main__":
         f"[MONITOR_CONFIG] threshold={MONITOR_FAILURE_THRESHOLD} "
         f"window={MONITOR_FAILURE_WINDOW_SECONDS}s "
         f"alert_cooldown={MONITOR_ALERT_COOLDOWN_SECONDS}s "
-        "downloads_automaticos=False"
+        f"success_log_interval={MONITOR_SUCCESS_LOG_INTERVAL_SECONDS}s "
+        "downloads_automaticos=False logs_sucesso_repetitivos=False"
     )
     logger.info(
         f"[WORKER_WATCHDOG_CONFIG] stall_timeout="
