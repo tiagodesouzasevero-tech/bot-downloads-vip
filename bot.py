@@ -220,6 +220,7 @@ usuarios_col = db["usuarios"]
 pedidos_col = db["pedidos"]
 metricas_col = db["metricas_diarias"]
 midia_cache_col = db["midia_cache"]
+auditoria_admin_col = db["auditoria_admin"]
 
 try:
     usuarios_col.create_index("vip_ate")
@@ -230,6 +231,13 @@ try:
     pedidos_col.create_index([("user_id", 1), ("status", 1), ("created_at", -1)])
     pedidos_col.create_index("expires_at", expireAfterSeconds=0)
     midia_cache_col.create_index("expires_at", expireAfterSeconds=0)
+    auditoria_admin_col.create_index("created_at")
+    auditoria_admin_col.create_index(
+        [("target_user_id", 1), ("created_at", -1)]
+    )
+    auditoria_admin_col.create_index(
+        [("action", 1), ("status", 1), ("created_at", -1)]
+    )
 except Exception as e:
     logger.warning(f"[MONGO_INDEX] Não foi possível garantir índices agora: {e}")
 
@@ -2970,6 +2978,9 @@ def consultar_docs_backup(tipo):
         metricas_docs = list(
             metricas_col.find({}).sort("_id", -1)
         )
+        auditoria_admin_docs = list(
+            auditoria_admin_col.find({}).sort("created_at", -1)
+        )
         payload = {
             "generated_at": agora_tz().isoformat(),
             "service": SERVICE_NAME,
@@ -2979,10 +2990,14 @@ def consultar_docs_backup(tipo):
             "vips_ativos_count": len(vips_docs),
             "pedidos_count": len(pedidos_docs),
             "metricas_diarias_count": len(metricas_docs),
+            "auditoria_admin_count": len(auditoria_admin_docs),
             "usuarios": [serializar_para_json(doc) for doc in usuarios_docs],
             "vips_ativos": [serializar_para_json(doc) for doc in vips_docs],
             "pedidos": [serializar_para_json(doc) for doc in pedidos_docs],
             "metricas_diarias": [serializar_para_json(doc) for doc in metricas_docs],
+            "auditoria_admin": [
+                serializar_para_json(doc) for doc in auditoria_admin_docs
+            ],
         }
         return payload, "backup_geral", "🗂 Backup geral gerado"
 
@@ -3008,6 +3023,7 @@ def processar_backup_admin(tipo, origem_chat_id=None):
                 + int(payload.get("vips_ativos_count", 0))
                 + int(payload.get("pedidos_count", 0))
                 + int(payload.get("metricas_diarias_count", 0))
+                + int(payload.get("auditoria_admin_count", 0))
             )
         else:
             documentos = resultado
@@ -3190,6 +3206,124 @@ def processar_diagnostico_admin(chat_id, status_message_id=None):
 # =========================================
 # COMANDOS ADMIN
 # =========================================
+class AuditoriaAdminIndisponivel(RuntimeError):
+    pass
+
+
+def iniciar_auditoria_admin(
+    message,
+    action,
+    target_user_id,
+    before,
+    after,
+    details=None,
+):
+    """Registra a intenção antes de qualquer alteração administrativa."""
+    agora = agora_tz()
+    documento = {
+        "action": str(action),
+        "status": "pending",
+        "admin_id": str(ADMIN_ID),
+        "target_user_id": str(target_user_id),
+        "before": before or {},
+        "after": after or {},
+        "details": details or {},
+        "telegram_chat_id": int(getattr(message.chat, "id", 0) or 0),
+        "telegram_message_id": int(getattr(message, "message_id", 0) or 0),
+        "created_at": agora,
+        "updated_at": agora,
+    }
+
+    try:
+        resultado = auditoria_admin_col.insert_one(documento)
+        if not getattr(resultado, "inserted_id", None):
+            raise RuntimeError("registro sem identificador")
+        return resultado.inserted_id
+    except Exception as e:
+        logger.critical(
+            f"[AUDITORIA_ADMIN_INICIO_FALHA] action={action} "
+            f"target_user_id={target_user_id} erro={sanitizar_erro_log(e)}"
+        )
+        raise AuditoriaAdminIndisponivel(
+            "AUDITORIA_ADMIN_INDISPONIVEL"
+        ) from e
+
+
+def finalizar_auditoria_admin(
+    auditoria_id,
+    user_notified,
+    admin_notified,
+    change_applied=True,
+):
+    """Finaliza a auditoria; uma falha aqui não desfaz a alteração já feita."""
+    agora = agora_tz()
+    try:
+        resultado = auditoria_admin_col.update_one(
+            {"_id": auditoria_id, "status": "pending"},
+            {
+                "$set": {
+                    "status": "completed",
+                    "change_applied": bool(change_applied),
+                    "user_notified": bool(user_notified),
+                    "admin_notified": bool(admin_notified),
+                    "completed_at": agora,
+                    "updated_at": agora,
+                }
+            },
+        )
+        if not resultado.modified_count:
+            raise RuntimeError("registro de auditoria não foi finalizado")
+        return True
+    except Exception as e:
+        logger.critical(
+            f"[AUDITORIA_ADMIN_FINAL_FALHA] auditoria_id={auditoria_id} "
+            f"erro={sanitizar_erro_log(e)}"
+        )
+        safe_send_message(
+            ADMIN_ID,
+            "⚠️ *Atenção: auditoria administrativa pendente*\n\n"
+            "A alteração foi executada, mas o registro não pôde ser finalizado. "
+            f"Identificador: `{auditoria_id}`",
+            parse_mode="Markdown",
+        )
+        return False
+
+
+def falhar_auditoria_admin(auditoria_id, erro):
+    """Registra uma ação que começou, mas não conseguiu alterar o usuário."""
+    agora = agora_tz()
+    erro_limpo = sanitizar_erro_log(erro, limite=500)
+    try:
+        auditoria_admin_col.update_one(
+            {"_id": auditoria_id, "status": "pending"},
+            {
+                "$set": {
+                    "status": "failed",
+                    "error": erro_limpo,
+                    "failed_at": agora,
+                    "updated_at": agora,
+                    "change_applied": False,
+                    "user_notified": False,
+                }
+            },
+        )
+    except Exception as audit_error:
+        logger.critical(
+            f"[AUDITORIA_ADMIN_FALHA_NAO_REGISTRADA] "
+            f"auditoria_id={auditoria_id} erro={sanitizar_erro_log(audit_error)}"
+        )
+
+
+def responder_falha_comando_admin(message, comando, erro):
+    if isinstance(erro, AuditoriaAdminIndisponivel):
+        return safe_reply_to(
+            message,
+            "🛑 A auditoria está indisponível. Por segurança, nenhuma alteração "
+            "foi realizada. Tente novamente em instantes.",
+        )
+    return safe_reply_to(message, comando, parse_mode="Markdown")
+
+
 @bot.message_handler(commands=["diagnostico"])
 def diagnostico_admin(message):
     if not exigir_admin_privado(message):
@@ -3211,9 +3345,10 @@ def dar_vip_manual(message):
     if not exigir_admin_privado(message):
         return
 
+    auditoria_id = None
     try:
         args = message.text.split()
-        if len(args) < 3:
+        if len(args) != 3:
             return safe_reply_to(message, "❌ Use: `/darvip ID DIAS`", parse_mode="Markdown")
 
         alvo_id = str(args[1]).strip()
@@ -3223,12 +3358,34 @@ def dar_vip_manual(message):
         if dias < 1 or dias > 3650:
             raise ValueError("dias fora do intervalo")
 
+        usuario_anterior = usuarios_col.find_one({"_id": alvo_id})
         nova_data = (
             "Vitalício" if dias == 3650
-            else calcular_nova_data_vip(obter_usuario(alvo_id), dias)
+            else calcular_nova_data_vip(
+                usuario_anterior or {"vip_ate": None},
+                dias,
+            )
+        )
+        antes = {
+            "user_exists": bool(usuario_anterior),
+            "vip_ate": (
+                usuario_anterior.get("vip_ate") if usuario_anterior else None
+            ),
+        }
+        depois = {
+            "user_exists": True,
+            "vip_ate": nova_data,
+        }
+        auditoria_id = iniciar_auditoria_admin(
+            message,
+            "grant_vip",
+            alvo_id,
+            antes,
+            depois,
+            details={"days": dias, "lifetime": dias == 3650},
         )
 
-        usuarios_col.update_one(
+        resultado = usuarios_col.update_one(
             {"_id": str(alvo_id)},
             {
                 "$set": {
@@ -3243,24 +3400,46 @@ def dar_vip_manual(message):
         )
 
         validade = formatar_validade_vip(nova_data)
-        safe_reply_to(
-            message,
-            f"✅ VIP liberado para `{alvo_id}` até *{validade}*.",
-            parse_mode="Markdown",
+        usuario_notificado = bool(
+            safe_send_message(
+                int(alvo_id),
+                "💎 *Acesso VIP liberado*\n\n"
+                f"Seu acesso está ativo até *{validade}*.",
+                parse_mode="Markdown"
+            )
         )
-        safe_send_message(
-            int(alvo_id),
-            "💎 *Acesso VIP liberado*\n\n"
-            f"Seu acesso está ativo até *{validade}*.",
-            parse_mode="Markdown"
+        admin_notificado = bool(
+            safe_reply_to(
+                message,
+                f"✅ VIP liberado para `{alvo_id}` até *{validade}*.",
+                parse_mode="Markdown",
+            )
+        )
+        finalizar_auditoria_admin(
+            auditoria_id,
+            user_notified=usuario_notificado,
+            admin_notified=admin_notificado,
+            change_applied=bool(
+                resultado.modified_count or resultado.upserted_id
+            ),
         )
     except Exception as e:
+        if auditoria_id is not None:
+            falhar_auditoria_admin(auditoria_id, e)
         logger.error(f"[DARVIP] erro={sanitizar_erro_log(e)}")
-        safe_reply_to(
-            message,
-            "❌ Use: `/darvip ID DIAS` (de 1 a 3650).",
-            parse_mode="Markdown",
-        )
+        if auditoria_id is not None:
+            safe_reply_to(
+                message,
+                "❌ Não foi possível confirmar a alteração. A tentativa foi "
+                "registrada como falha na auditoria; verifique o usuário antes "
+                "de tentar novamente.",
+            )
+        else:
+            responder_falha_comando_admin(
+                message,
+                "❌ Use: `/darvip ID DIAS` (de 1 a 3650).",
+                e,
+            )
 
 
 @bot.message_handler(commands=["removervip"])
@@ -3268,6 +3447,7 @@ def remover_vip_manual(message):
     if not exigir_admin_privado(message):
         return
 
+    auditoria_id = None
     try:
         args = message.text.split()
         if len(args) != 2:
@@ -3283,16 +3463,41 @@ def remover_vip_manual(message):
 
         usuario = usuarios_col.find_one({"_id": alvo_id})
         if not usuario:
-            return safe_reply_to(
+            auditoria_id = iniciar_auditoria_admin(
                 message,
-                f"❌ Usuário `{alvo_id}` não encontrado.",
-                parse_mode="Markdown",
+                "remove_vip",
+                alvo_id,
+                {"user_exists": False, "vip_ate": None},
+                {"user_exists": False, "vip_ate": None},
+                details={"result": "user_not_found"},
             )
+            admin_notificado = bool(
+                safe_reply_to(
+                    message,
+                    f"❌ Usuário `{alvo_id}` não encontrado.",
+                    parse_mode="Markdown",
+                )
+            )
+            finalizar_auditoria_admin(
+                auditoria_id,
+                user_notified=False,
+                admin_notified=admin_notificado,
+                change_applied=False,
+            )
+            return
 
         vip_anterior = usuario.get("vip_ate")
         vip_estava_ativo = is_vip_user(usuario)
+        auditoria_id = iniciar_auditoria_admin(
+            message,
+            "remove_vip",
+            alvo_id,
+            {"user_exists": True, "vip_ate": vip_anterior},
+            {"user_exists": True, "vip_ate": None},
+            details={"vip_was_active": vip_estava_ativo},
+        )
 
-        usuarios_col.update_one(
+        resultado = usuarios_col.update_one(
             {"_id": alvo_id},
             {"$set": {"vip_ate": None}},
         )
@@ -3303,32 +3508,61 @@ def remover_vip_manual(message):
         )
 
         if not vip_estava_ativo:
-            return safe_reply_to(
-                message,
-                f"ℹ️ O usuário `{alvo_id}` já não possuía VIP ativo.",
+            admin_notificado = bool(
+                safe_reply_to(
+                    message,
+                    f"ℹ️ O usuário `{alvo_id}` já não possuía VIP ativo.",
+                    parse_mode="Markdown",
+                )
+            )
+            finalizar_auditoria_admin(
+                auditoria_id,
+                user_notified=False,
+                admin_notified=admin_notificado,
+                change_applied=bool(resultado.modified_count),
+            )
+            return
+
+        usuario_notificado = bool(
+            safe_send_message(
+                int(alvo_id),
+                "ℹ️ *Acesso VIP removido*\n\n"
+                "Seu acesso VIP foi encerrado pelo suporte. "
+                "Sua conta agora utiliza o plano gratuito.\n\n"
+                "Se achar que houve um engano, use /suporte.",
                 parse_mode="Markdown",
             )
-
-        safe_reply_to(
-            message,
-            f"✅ VIP do usuário `{alvo_id}` removido com sucesso.",
-            parse_mode="Markdown",
         )
-        safe_send_message(
-            int(alvo_id),
-            "ℹ️ *Acesso VIP removido*\n\n"
-            "Seu acesso VIP foi encerrado pelo suporte. "
-            "Sua conta agora utiliza o plano gratuito.\n\n"
-            "Se achar que houve um engano, use /suporte.",
-            parse_mode="Markdown",
+        admin_notificado = bool(
+            safe_reply_to(
+                message,
+                f"✅ VIP do usuário `{alvo_id}` removido com sucesso.",
+                parse_mode="Markdown",
+            )
+        )
+        finalizar_auditoria_admin(
+            auditoria_id,
+            user_notified=usuario_notificado,
+            admin_notified=admin_notificado,
+            change_applied=bool(resultado.modified_count),
         )
     except Exception as e:
+        if auditoria_id is not None:
+            falhar_auditoria_admin(auditoria_id, e)
         logger.error(f"[REMOVERVIP] erro={sanitizar_erro_log(e)}")
-        safe_reply_to(
-            message,
-            "❌ Use: `/removervip ID`",
-            parse_mode="Markdown",
-        )
+        if auditoria_id is not None:
+            safe_reply_to(
+                message,
+                "❌ Não foi possível confirmar a alteração. A tentativa foi "
+                "registrada como falha na auditoria; verifique o usuário antes "
+                "de tentar novamente.",
+            )
+        else:
+            responder_falha_comando_admin(
+                message,
+                "❌ Use: `/removervip ID`",
+                e,
+            )
 
 
 @bot.message_handler(commands=["zerar"])
@@ -3336,21 +3570,48 @@ def zerar_contador(message):
     if not exigir_admin_privado(message):
         return
 
+    auditoria_id = None
     try:
         args = message.text.split()
-        if len(args) < 2:
+        if len(args) != 2:
             return safe_reply_to(message, "❌ Use: `/zerar ID`", parse_mode="Markdown")
 
         alvo_id = str(args[1]).strip()
         if not re.fullmatch(r"[1-9]\d{0,19}", alvo_id):
             raise ValueError("ID inválida")
 
-        usuarios_col.update_one(
+        usuario_anterior = usuarios_col.find_one({"_id": alvo_id})
+        hoje = hoje_str()
+        auditoria_id = iniciar_auditoria_admin(
+            message,
+            "reset_daily_downloads",
+            alvo_id,
+            {
+                "user_exists": bool(usuario_anterior),
+                "downloads_hoje": (
+                    usuario_anterior.get("downloads_hoje", 0)
+                    if usuario_anterior
+                    else None
+                ),
+                "ultima_data": (
+                    usuario_anterior.get("ultima_data")
+                    if usuario_anterior
+                    else None
+                ),
+            },
+            {
+                "user_exists": True,
+                "downloads_hoje": 0,
+                "ultima_data": hoje,
+            },
+        )
+
+        resultado = usuarios_col.update_one(
             {"_id": str(alvo_id)},
             {
                 "$set": {
                     "downloads_hoje": 0,
-                    "ultima_data": hoje_str()
+                    "ultima_data": hoje
                 },
                 "$setOnInsert": {
                     "vip_ate": None
@@ -3359,14 +3620,44 @@ def zerar_contador(message):
             upsert=True
         )
 
-        safe_reply_to(message, f"✅ Contador do usuário {alvo_id} foi zerado!")
-        safe_send_message(
-            int(alvo_id),
-            "🔄 Suas tentativas diárias foram resetadas pelo suporte. Pode voltar a baixar!"
+        usuario_notificado = bool(
+            safe_send_message(
+                int(alvo_id),
+                "🔄 Suas tentativas diárias foram resetadas pelo suporte. "
+                "Pode voltar a baixar!"
+            )
+        )
+        admin_notificado = bool(
+            safe_reply_to(
+                message,
+                f"✅ Contador do usuário {alvo_id} foi zerado!",
+            )
+        )
+        finalizar_auditoria_admin(
+            auditoria_id,
+            user_notified=usuario_notificado,
+            admin_notified=admin_notificado,
+            change_applied=bool(
+                resultado.modified_count or resultado.upserted_id
+            ),
         )
     except Exception as e:
-        logger.error(f"[ZERAR] erro={e}")
-        safe_reply_to(message, "❌ Use: `/zerar ID`", parse_mode="Markdown")
+        if auditoria_id is not None:
+            falhar_auditoria_admin(auditoria_id, e)
+        logger.error(f"[ZERAR] erro={sanitizar_erro_log(e)}")
+        if auditoria_id is not None:
+            safe_reply_to(
+                message,
+                "❌ Não foi possível confirmar a alteração. A tentativa foi "
+                "registrada como falha na auditoria; verifique o usuário antes "
+                "de tentar novamente.",
+            )
+        else:
+            responder_falha_comando_admin(
+                message,
+                "❌ Use: `/zerar ID`",
+                e,
+            )
 
 
 def enviar_aviso_geral_usuario(user_id, msg_texto):
