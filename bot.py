@@ -2328,15 +2328,15 @@ def calcular_nova_data_vip(user, dias):
 
     try:
         if vip_atual:
-            data_base = datetime.strptime(vip_atual, "%Y-%m-%d").date()
-            if data_base < hoje:
-                data_base = hoje
-        else:
-            data_base = hoje
+            validade_atual = datetime.strptime(vip_atual, "%Y-%m-%d").date()
+            if validade_atual >= hoje:
+                # O período comprado começa no dia seguinte à validade atual.
+                return (validade_atual + timedelta(days=dias)).strftime("%Y-%m-%d")
     except Exception:
-        data_base = hoje
+        pass
 
-    nova_data = data_base + timedelta(days=dias)
+    # Em um plano novo ou vencido, hoje já conta como o primeiro dia.
+    nova_data = hoje + timedelta(days=dias - 1)
     return nova_data.strftime("%Y-%m-%d")
 
 
