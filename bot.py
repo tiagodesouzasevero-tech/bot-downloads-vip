@@ -3097,7 +3097,7 @@ def _eventos_globais_recentes(inicio_janela):
     }
 
 
-def _registrar_evento_global_mongodb(token, agora_utc, upsert):
+def _registrar_evento_global_mongodb(token, agora_utc):
     inicio_janela = agora_utc - timedelta(
         seconds=GLOBAL_RATE_LIMIT_WINDOW_SECONDS
     )
@@ -3133,9 +3133,41 @@ def _registrar_evento_global_mongodb(token, agora_utc, upsert):
                 }
             }
         ],
-        upsert=bool(upsert),
+        # O MongoDB não permite $expr no predicado de uma operação com
+        # upsert. O primeiro documento global é criado separadamente.
+        upsert=False,
         return_document=ReturnDocument.AFTER,
         projection={"_id": 1},
+    )
+
+
+def _criar_limite_global_mongodb(token, agora_utc):
+    """Cria o primeiro evento global sem $expr; _id resolve concorrência."""
+    expira_em = agora_utc + timedelta(
+        hours=GLOBAL_RATE_LIMIT_DOCUMENT_TTL_HOURS
+    )
+    resultado = limites_globais_col.insert_one(
+        {
+            "_id": GLOBAL_RATE_LIMIT_DOCUMENT_ID,
+            "events": [{"token": token, "at": agora_utc}],
+            "updated_at": agora_utc,
+            "expires_at": expira_em,
+            "window_seconds": GLOBAL_RATE_LIMIT_WINDOW_SECONDS,
+            "contains_user_ids": False,
+            "contains_urls": False,
+            "contains_message_text": False,
+        }
+    )
+    return {"_id": resultado.inserted_id}
+
+
+def _consultar_token_limite_global(token):
+    return limites_globais_col.find_one(
+        {
+            "_id": GLOBAL_RATE_LIMIT_DOCUMENT_ID,
+            "events.token": token,
+        },
+        {"_id": 1},
     )
 
 
@@ -3153,59 +3185,96 @@ def autorizar_limite_global_persistente(user_id):
         documento = _registrar_evento_global_mongodb(
             token,
             agora_utc,
-            upsert=True,
         )
     except Exception as e:
-        if getattr(e, "code", None) == 11000:
-            try:
-                # Duas instâncias podem tentar criar o primeiro documento ao
-                # mesmo tempo. A segunda repete sem upsert; se não houver vaga,
-                # o retorno será None e o limite permanece respeitado.
-                documento = _registrar_evento_global_mongodb(
-                    token,
-                    agora_utc,
-                    upsert=False,
-                )
-            except Exception as retry_error:
-                registrar_falha_componente("MongoDB", retry_error)
-                logger.warning(
-                    "[LIMITE_GLOBAL_PERSISTENTE] retry_criacao_falhou=True "
-                    f"erro={sanitizar_erro_log(retry_error)}"
-                )
-                return False, (
-                    "⏳ O controle de demanda está temporariamente "
-                    "indisponível. Aguarde alguns instantes e tente novamente."
-                )
-        else:
-            try:
-                gravado = limites_globais_col.find_one(
-                    {
-                        "_id": GLOBAL_RATE_LIMIT_DOCUMENT_ID,
-                        "events.token": token,
-                    },
-                    {"_id": 1},
-                )
-            except Exception as verificacao_erro:
-                registrar_falha_componente("MongoDB", verificacao_erro)
-                logger.warning(
-                    "[LIMITE_GLOBAL_PERSISTENTE] verificacao_falhou=True "
-                    f"erro={sanitizar_erro_log(verificacao_erro)}"
-                )
-                return False, (
-                    "⏳ O controle de demanda está temporariamente "
-                    "indisponível. Aguarde alguns instantes e tente novamente."
-                )
-            if not gravado:
-                registrar_falha_componente("MongoDB", e)
-                logger.warning(
-                    "[LIMITE_GLOBAL_PERSISTENTE] gravacao_falhou=True "
-                    f"erro={sanitizar_erro_log(e)}"
-                )
-                return False, (
-                    "⏳ O controle de demanda está temporariamente "
-                    "indisponível. Aguarde alguns instantes e tente novamente."
-                )
-            documento = gravado
+        try:
+            gravado = _consultar_token_limite_global(token)
+        except Exception as verificacao_erro:
+            registrar_falha_componente("MongoDB", verificacao_erro)
+            logger.warning(
+                "[LIMITE_GLOBAL_PERSISTENTE] verificacao_falhou=True "
+                f"erro={sanitizar_erro_log(verificacao_erro)}"
+            )
+            return False, (
+                "⏳ O controle de demanda está temporariamente "
+                "indisponível. Aguarde alguns instantes e tente novamente."
+            )
+        if not gravado:
+            registrar_falha_componente("MongoDB", e)
+            logger.warning(
+                "[LIMITE_GLOBAL_PERSISTENTE] gravacao_falhou=True "
+                f"erro={sanitizar_erro_log(e)}"
+            )
+            return False, (
+                "⏳ O controle de demanda está temporariamente "
+                "indisponível. Aguarde alguns instantes e tente novamente."
+            )
+        documento = gravado
+
+    if not documento:
+        try:
+            documento = _criar_limite_global_mongodb(token, agora_utc)
+        except Exception as criacao_erro:
+            if getattr(criacao_erro, "code", None) == 11000:
+                try:
+                    # Outra instância criou o documento entre a atualização e
+                    # a inserção. A repetição respeita o limite de 300.
+                    documento = _registrar_evento_global_mongodb(
+                        token,
+                        agora_utc,
+                    )
+                except Exception as retry_error:
+                    try:
+                        gravado = _consultar_token_limite_global(token)
+                    except Exception as verificacao_erro:
+                        registrar_falha_componente("MongoDB", verificacao_erro)
+                        logger.warning(
+                            "[LIMITE_GLOBAL_PERSISTENTE] "
+                            "verificacao_retry_falhou=True "
+                            f"erro={sanitizar_erro_log(verificacao_erro)}"
+                        )
+                        return False, (
+                            "⏳ O controle de demanda está temporariamente "
+                            "indisponível. Aguarde alguns instantes e tente "
+                            "novamente."
+                        )
+                    if not gravado:
+                        registrar_falha_componente("MongoDB", retry_error)
+                        logger.warning(
+                            "[LIMITE_GLOBAL_PERSISTENTE] retry_falhou=True "
+                            f"erro={sanitizar_erro_log(retry_error)}"
+                        )
+                        return False, (
+                            "⏳ O controle de demanda está temporariamente "
+                            "indisponível. Aguarde alguns instantes e tente "
+                            "novamente."
+                        )
+                    documento = gravado
+            else:
+                try:
+                    gravado = _consultar_token_limite_global(token)
+                except Exception as verificacao_erro:
+                    registrar_falha_componente("MongoDB", verificacao_erro)
+                    logger.warning(
+                        "[LIMITE_GLOBAL_PERSISTENTE] "
+                        "verificacao_criacao_falhou=True "
+                        f"erro={sanitizar_erro_log(verificacao_erro)}"
+                    )
+                    return False, (
+                        "⏳ O controle de demanda está temporariamente "
+                        "indisponível. Aguarde alguns instantes e tente novamente."
+                    )
+                if not gravado:
+                    registrar_falha_componente("MongoDB", criacao_erro)
+                    logger.warning(
+                        "[LIMITE_GLOBAL_PERSISTENTE] criacao_falhou=True "
+                        f"erro={sanitizar_erro_log(criacao_erro)}"
+                    )
+                    return False, (
+                        "⏳ O controle de demanda está temporariamente "
+                        "indisponível. Aguarde alguns instantes e tente novamente."
+                    )
+                documento = gravado
 
     if not documento:
         registrar_sucesso_componente("MongoDB")
@@ -8457,7 +8526,8 @@ if __name__ == "__main__":
         f"[LIMITE_GLOBAL_CONFIG] persistente=True janela_movel="
         f"{GLOBAL_RATE_LIMIT_WINDOW_SECONDS}s "
         f"limite={MAX_DOWNLOADS_GLOBAL_HOUR} mongo_writes_por_aceite=1 "
-        "compartilhado_entre_instancias=True contains_user_ids=False "
+        "compartilhado_entre_instancias=True expr_em_upsert=False "
+        "primeira_solicitacao_ops=2 contains_user_ids=False "
         "contains_urls=False"
     )
     logger.info(
