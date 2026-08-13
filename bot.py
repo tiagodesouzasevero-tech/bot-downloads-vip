@@ -158,6 +158,9 @@ MAX_DOWNLOADS_PER_USER_HOUR = get_env_int(
 MAX_DOWNLOADS_GLOBAL_HOUR = get_env_int(
     "MAX_DOWNLOADS_GLOBAL_HOUR", 300, 20, 10000
 )
+GLOBAL_RATE_LIMIT_WINDOW_SECONDS = 3600
+GLOBAL_RATE_LIMIT_DOCUMENT_TTL_HOURS = 2
+GLOBAL_RATE_LIMIT_DOCUMENT_ID = "downloads_rolling_hour"
 DOWNLOAD_QUEUE_MAX = get_env_int("DOWNLOAD_QUEUE_MAX", 10, 1, 50)
 DOWNLOAD_RESERVATION_TTL_SECONDS = max(
     7200,
@@ -462,6 +465,7 @@ midia_cache_col = db["midia_cache"]
 auditoria_admin_col = db["auditoria_admin"]
 auditoria_sistema_col = db["auditoria_sistema"]
 fila_recuperacao_col = db["fila_recuperacao"]
+limites_globais_col = db["limites_globais"]
 
 try:
     usuarios_col.create_index("vip_ate")
@@ -487,6 +491,7 @@ try:
     fila_recuperacao_col.create_index(
         [("instance_id", 1), ("status", 1), ("updated_at", 1)]
     )
+    limites_globais_col.create_index("expires_at", expireAfterSeconds=0)
 except Exception as e:
     erro_inicio = re.sub(
         r"(?i)(mongodb(?:\+srv)?|https?)://[^\s]+",
@@ -2682,7 +2687,7 @@ def nome_plataforma(is_pinterest, is_tiktok, is_instagram, is_rednote):
 
 
 def autorizar_tentativa_download(user_id):
-    """Aplica limites de velocidade, sem transformar o VIP em plano diário."""
+    """Aplica limites locais rápidos antes do contador global persistente."""
     try:
         if int(user_id) == ADMIN_ID:
             return True, None
@@ -2690,7 +2695,7 @@ def autorizar_tentativa_download(user_id):
         pass
 
     agora = time.monotonic()
-    inicio_hora = agora - 3600
+    inicio_hora = agora - GLOBAL_RATE_LIMIT_WINDOW_SECONDS
     chave = str(user_id)
 
     with DOWNLOAD_RATE_LOCK:
@@ -2722,7 +2727,6 @@ def autorizar_tentativa_download(user_id):
             )
 
         eventos_usuario.append(agora)
-        DOWNLOAD_GLOBAL_EVENTS.append(agora)
 
         # Remove usuários inativos para o dicionário não crescer indefinidamente.
         if len(DOWNLOAD_RATE_EVENTS) > 5000:
@@ -2733,6 +2737,152 @@ def autorizar_tentativa_download(user_id):
                 if not fila:
                     DOWNLOAD_RATE_EVENTS.pop(usuario_antigo, None)
 
+    return True, None
+
+
+def registrar_evento_global_local():
+    """Mantém um atalho local; o MongoDB continua sendo a autoridade."""
+    agora = time.monotonic()
+    inicio_hora = agora - GLOBAL_RATE_LIMIT_WINDOW_SECONDS
+    with DOWNLOAD_RATE_LOCK:
+        while DOWNLOAD_GLOBAL_EVENTS and DOWNLOAD_GLOBAL_EVENTS[0] < inicio_hora:
+            DOWNLOAD_GLOBAL_EVENTS.popleft()
+        DOWNLOAD_GLOBAL_EVENTS.append(agora)
+
+
+def _eventos_globais_recentes(inicio_janela):
+    return {
+        "$filter": {
+            "input": {"$ifNull": ["$events", []]},
+            "as": "event",
+            "cond": {"$gte": ["$$event.at", inicio_janela]},
+        }
+    }
+
+
+def _registrar_evento_global_mongodb(token, agora_utc, upsert):
+    inicio_janela = agora_utc - timedelta(
+        seconds=GLOBAL_RATE_LIMIT_WINDOW_SECONDS
+    )
+    eventos_recentes = _eventos_globais_recentes(inicio_janela)
+    expira_em = agora_utc + timedelta(
+        hours=GLOBAL_RATE_LIMIT_DOCUMENT_TTL_HOURS
+    )
+    return limites_globais_col.find_one_and_update(
+        {
+            "_id": GLOBAL_RATE_LIMIT_DOCUMENT_ID,
+            "$expr": {
+                "$lt": [
+                    {"$size": eventos_recentes},
+                    MAX_DOWNLOADS_GLOBAL_HOUR,
+                ]
+            },
+        },
+        [
+            {
+                "$set": {
+                    "events": {
+                        "$concatArrays": [
+                            eventos_recentes,
+                            [{"token": token, "at": agora_utc}],
+                        ]
+                    },
+                    "updated_at": agora_utc,
+                    "expires_at": expira_em,
+                    "window_seconds": GLOBAL_RATE_LIMIT_WINDOW_SECONDS,
+                    "contains_user_ids": False,
+                    "contains_urls": False,
+                    "contains_message_text": False,
+                }
+            }
+        ],
+        upsert=bool(upsert),
+        return_document=ReturnDocument.AFTER,
+        projection={"_id": 1},
+    )
+
+
+def autorizar_limite_global_persistente(user_id):
+    """Compartilha a janela real de uma hora entre deploys e réplicas."""
+    try:
+        if int(user_id) == ADMIN_ID:
+            return True, None
+    except (TypeError, ValueError):
+        pass
+
+    token = uuid.uuid4().hex
+    agora_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+    try:
+        documento = _registrar_evento_global_mongodb(
+            token,
+            agora_utc,
+            upsert=True,
+        )
+    except Exception as e:
+        if getattr(e, "code", None) == 11000:
+            try:
+                # Duas instâncias podem tentar criar o primeiro documento ao
+                # mesmo tempo. A segunda repete sem upsert; se não houver vaga,
+                # o retorno será None e o limite permanece respeitado.
+                documento = _registrar_evento_global_mongodb(
+                    token,
+                    agora_utc,
+                    upsert=False,
+                )
+            except Exception as retry_error:
+                registrar_falha_componente("MongoDB", retry_error)
+                logger.warning(
+                    "[LIMITE_GLOBAL_PERSISTENTE] retry_criacao_falhou=True "
+                    f"erro={sanitizar_erro_log(retry_error)}"
+                )
+                return False, (
+                    "⏳ O controle de demanda está temporariamente "
+                    "indisponível. Aguarde alguns instantes e tente novamente."
+                )
+        else:
+            try:
+                gravado = limites_globais_col.find_one(
+                    {
+                        "_id": GLOBAL_RATE_LIMIT_DOCUMENT_ID,
+                        "events.token": token,
+                    },
+                    {"_id": 1},
+                )
+            except Exception as verificacao_erro:
+                registrar_falha_componente("MongoDB", verificacao_erro)
+                logger.warning(
+                    "[LIMITE_GLOBAL_PERSISTENTE] verificacao_falhou=True "
+                    f"erro={sanitizar_erro_log(verificacao_erro)}"
+                )
+                return False, (
+                    "⏳ O controle de demanda está temporariamente "
+                    "indisponível. Aguarde alguns instantes e tente novamente."
+                )
+            if not gravado:
+                registrar_falha_componente("MongoDB", e)
+                logger.warning(
+                    "[LIMITE_GLOBAL_PERSISTENTE] gravacao_falhou=True "
+                    f"erro={sanitizar_erro_log(e)}"
+                )
+                return False, (
+                    "⏳ O controle de demanda está temporariamente "
+                    "indisponível. Aguarde alguns instantes e tente novamente."
+                )
+            documento = gravado
+
+    if not documento:
+        registrar_sucesso_componente("MongoDB")
+        logger.warning(
+            f"[LIMITE_GLOBAL_PERSISTENTE] atingido=True "
+            f"limite={MAX_DOWNLOADS_GLOBAL_HOUR} janela=60m"
+        )
+        return False, (
+            "⚠️ O bot está com alta demanda agora. "
+            "Aguarde alguns minutos e tente novamente."
+        )
+
+    registrar_sucesso_componente("MongoDB")
+    registrar_evento_global_local()
     return True, None
 
 
@@ -7763,6 +7913,21 @@ def handle_download(message):
                 )
             return
 
+    limite_global_ok, mensagem_limite_global = (
+        autorizar_limite_global_persistente(user_id)
+    )
+    if not limite_global_ok:
+        with DOWNLOAD_PENDING_LOCK:
+            DOWNLOAD_PENDING_USERS.discard(user_id)
+        devolver_reserva_download_gratis(
+            reserva_download,
+            user_id,
+            motivo="limite_global",
+        )
+        remover_trabalho_fila_persistente(user_id)
+        safe_reply_to(message, mensagem_limite_global)
+        return
+
     status_msg = safe_reply_to(
         message,
         "💎 Link recebido com prioridade VIP. Aguarde o processamento..."
@@ -7935,6 +8100,13 @@ if __name__ == "__main__":
         f"[CUSTO_CONFIG] cooldown={DOWNLOAD_COOLDOWN_SECONDS}s "
         f"user_hour={MAX_DOWNLOADS_PER_USER_HOUR} "
         f"global_hour={MAX_DOWNLOADS_GLOBAL_HOUR}"
+    )
+    logger.info(
+        f"[LIMITE_GLOBAL_CONFIG] persistente=True janela_movel="
+        f"{GLOBAL_RATE_LIMIT_WINDOW_SECONDS}s "
+        f"limite={MAX_DOWNLOADS_GLOBAL_HOUR} mongo_writes_por_aceite=1 "
+        "compartilhado_entre_instancias=True contains_user_ids=False "
+        "contains_urls=False"
     )
     logger.info(
         f"[LIMITE_GRATIS_CONFIG] atomico=True limite={FREE_DAILY_LIMIT} "
