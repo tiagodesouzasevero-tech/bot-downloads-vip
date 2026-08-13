@@ -161,6 +161,7 @@ MAX_DOWNLOADS_GLOBAL_HOUR = get_env_int(
 GLOBAL_RATE_LIMIT_WINDOW_SECONDS = 3600
 GLOBAL_RATE_LIMIT_DOCUMENT_TTL_HOURS = 2
 GLOBAL_RATE_LIMIT_DOCUMENT_ID = "downloads_rolling_hour"
+USER_RATE_LIMIT_DOCUMENT_TTL_HOURS = 2
 DOWNLOAD_QUEUE_MAX = get_env_int("DOWNLOAD_QUEUE_MAX", 10, 1, 50)
 DOWNLOAD_RESERVATION_TTL_SECONDS = max(
     7200,
@@ -466,6 +467,7 @@ auditoria_admin_col = db["auditoria_admin"]
 auditoria_sistema_col = db["auditoria_sistema"]
 fila_recuperacao_col = db["fila_recuperacao"]
 limites_globais_col = db["limites_globais"]
+limites_usuarios_col = db["limites_usuarios"]
 
 try:
     usuarios_col.create_index("vip_ate")
@@ -492,6 +494,7 @@ try:
         [("instance_id", 1), ("status", 1), ("updated_at", 1)]
     )
     limites_globais_col.create_index("expires_at", expireAfterSeconds=0)
+    limites_usuarios_col.create_index("expires_at", expireAfterSeconds=0)
 except Exception as e:
     erro_inicio = re.sub(
         r"(?i)(mongodb(?:\+srv)?|https?)://[^\s]+",
@@ -2687,7 +2690,7 @@ def nome_plataforma(is_pinterest, is_tiktok, is_instagram, is_rednote):
 
 
 def autorizar_tentativa_download(user_id):
-    """Aplica limites locais rápidos antes do contador global persistente."""
+    """Aplica atalhos locais; os contadores persistentes são a autoridade."""
     try:
         if int(user_id) == ADMIN_ID:
             return True, None
@@ -2702,9 +2705,10 @@ def autorizar_tentativa_download(user_id):
         while DOWNLOAD_GLOBAL_EVENTS and DOWNLOAD_GLOBAL_EVENTS[0] < inicio_hora:
             DOWNLOAD_GLOBAL_EVENTS.popleft()
 
-        eventos_usuario = DOWNLOAD_RATE_EVENTS[chave]
-        while eventos_usuario and eventos_usuario[0] < inicio_hora:
-            eventos_usuario.popleft()
+        eventos_usuario = DOWNLOAD_RATE_EVENTS.get(chave)
+        if eventos_usuario:
+            while eventos_usuario and eventos_usuario[0] < inicio_hora:
+                eventos_usuario.popleft()
 
         if DOWNLOAD_COOLDOWN_SECONDS and eventos_usuario:
             decorrido = agora - eventos_usuario[-1]
@@ -2714,7 +2718,7 @@ def autorizar_tentativa_download(user_id):
                     f"⏳ Aguarde {restante} segundos antes de enviar outro link."
                 )
 
-        if len(eventos_usuario) >= MAX_DOWNLOADS_PER_USER_HOUR:
+        if eventos_usuario and len(eventos_usuario) >= MAX_DOWNLOADS_PER_USER_HOUR:
             return False, (
                 "⚠️ Muitas solicitações em pouco tempo. "
                 "Aguarde alguns minutos e tente novamente."
@@ -2726,6 +2730,18 @@ def autorizar_tentativa_download(user_id):
                 "Aguarde alguns minutos e tente novamente."
             )
 
+    return True, None
+
+
+def registrar_evento_usuario_local(user_id):
+    """Atualiza o atalho local somente após autorização persistente."""
+    agora = time.monotonic()
+    inicio_hora = agora - GLOBAL_RATE_LIMIT_WINDOW_SECONDS
+    chave = str(user_id)
+    with DOWNLOAD_RATE_LOCK:
+        eventos_usuario = DOWNLOAD_RATE_EVENTS[chave]
+        while eventos_usuario and eventos_usuario[0] < inicio_hora:
+            eventos_usuario.popleft()
         eventos_usuario.append(agora)
 
         # Remove usuários inativos para o dicionário não crescer indefinidamente.
@@ -2737,6 +2753,241 @@ def autorizar_tentativa_download(user_id):
                 if not fila:
                     DOWNLOAD_RATE_EVENTS.pop(usuario_antigo, None)
 
+
+def referencia_limite_usuario(user_id):
+    """Identificador HMAC estável; o ID real nunca entra no documento."""
+    return referencia_privada_log("rate", user_id, tamanho=32)
+
+
+def _eventos_usuario_recentes(inicio_janela):
+    return {
+        "$filter": {
+            "input": {"$ifNull": ["$events", []]},
+            "as": "event",
+            "cond": {"$gte": ["$$event.at", inicio_janela]},
+        }
+    }
+
+
+def _registrar_evento_usuario_mongodb(
+    usuario_ref,
+    token,
+    agora_utc,
+    upsert,
+):
+    inicio_janela = agora_utc - timedelta(
+        seconds=GLOBAL_RATE_LIMIT_WINDOW_SECONDS
+    )
+    limite_cooldown = agora_utc - timedelta(
+        seconds=DOWNLOAD_COOLDOWN_SECONDS
+    )
+    eventos_recentes = _eventos_usuario_recentes(inicio_janela)
+    expira_em = agora_utc + timedelta(
+        hours=USER_RATE_LIMIT_DOCUMENT_TTL_HOURS
+    )
+    return limites_usuarios_col.find_one_and_update(
+        {
+            "_id": usuario_ref,
+            "$expr": {
+                "$and": [
+                    {
+                        "$lt": [
+                            {"$size": eventos_recentes},
+                            MAX_DOWNLOADS_PER_USER_HOUR,
+                        ]
+                    },
+                    {
+                        "$lte": [
+                            {
+                                "$ifNull": [
+                                    "$last_event_at",
+                                    datetime(1970, 1, 1),
+                                ]
+                            },
+                            limite_cooldown,
+                        ]
+                    },
+                ]
+            },
+        },
+        [
+            {
+                "$set": {
+                    "events": {
+                        "$concatArrays": [
+                            eventos_recentes,
+                            [{"token": token, "at": agora_utc}],
+                        ]
+                    },
+                    "last_event_at": agora_utc,
+                    "updated_at": agora_utc,
+                    "expires_at": expira_em,
+                    "window_seconds": GLOBAL_RATE_LIMIT_WINDOW_SECONDS,
+                    "cooldown_seconds": DOWNLOAD_COOLDOWN_SECONDS,
+                    "identifier_anonymized": True,
+                    "contains_plain_user_id": False,
+                    "contains_urls": False,
+                    "contains_message_text": False,
+                }
+            }
+        ],
+        upsert=bool(upsert),
+        return_document=ReturnDocument.AFTER,
+        projection={"_id": 1},
+    )
+
+
+def _mensagem_bloqueio_usuario_persistente(documento, agora_utc):
+    ultimo_evento = documento.get("last_event_at") if documento else None
+    if isinstance(ultimo_evento, datetime):
+        if ultimo_evento.tzinfo is not None:
+            ultimo_evento = ultimo_evento.astimezone(timezone.utc).replace(
+                tzinfo=None
+            )
+        decorrido = max(0.0, (agora_utc - ultimo_evento).total_seconds())
+        if DOWNLOAD_COOLDOWN_SECONDS and decorrido < DOWNLOAD_COOLDOWN_SECONDS:
+            restante = max(
+                1,
+                int(DOWNLOAD_COOLDOWN_SECONDS - decorrido) + 1,
+            )
+            return (
+                "cooldown",
+                f"⏳ Aguarde {restante} segundos antes de enviar outro link.",
+            )
+
+    inicio_janela = agora_utc - timedelta(
+        seconds=GLOBAL_RATE_LIMIT_WINDOW_SECONDS
+    )
+    eventos_recentes = [
+        evento
+        for evento in (documento or {}).get("events", [])
+        if isinstance(evento, dict)
+        and isinstance(evento.get("at"), datetime)
+        and (
+            evento["at"].astimezone(timezone.utc).replace(tzinfo=None)
+            if evento["at"].tzinfo is not None
+            else evento["at"]
+        ) >= inicio_janela
+    ]
+    if len(eventos_recentes) >= MAX_DOWNLOADS_PER_USER_HOUR:
+        return (
+            "hora",
+            "⚠️ Muitas solicitações em pouco tempo. "
+            "Aguarde alguns minutos e tente novamente.",
+        )
+
+    return (
+        "indisponivel",
+        "⏳ O controle de solicitações está temporariamente indisponível. "
+        "Aguarde alguns instantes e tente novamente.",
+    )
+
+
+def autorizar_limite_usuario_persistente(user_id):
+    """Compartilha cooldown e limite individual entre deploys e réplicas."""
+    try:
+        if int(user_id) == ADMIN_ID:
+            return True, None
+    except (TypeError, ValueError):
+        pass
+
+    usuario_ref = referencia_limite_usuario(user_id)
+    token = uuid.uuid4().hex
+    agora_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+    try:
+        documento = _registrar_evento_usuario_mongodb(
+            usuario_ref,
+            token,
+            agora_utc,
+            upsert=True,
+        )
+    except Exception as e:
+        if getattr(e, "code", None) == 11000:
+            try:
+                # Corrida na criação ou documento existente que não passou
+                # no cooldown/limite. A repetição sem upsert preserva a
+                # decisão atômica e nunca cria um segundo contador.
+                documento = _registrar_evento_usuario_mongodb(
+                    usuario_ref,
+                    token,
+                    agora_utc,
+                    upsert=False,
+                )
+            except Exception as retry_error:
+                registrar_falha_componente("MongoDB", retry_error)
+                logger.warning(
+                    "[LIMITE_USUARIO_PERSISTENTE] retry_falhou=True "
+                    f"user_ref={referencia_usuario_log(user_id)} "
+                    f"erro={sanitizar_erro_log(retry_error)}"
+                )
+                return False, (
+                    "⏳ O controle de solicitações está temporariamente "
+                    "indisponível. Aguarde alguns instantes e tente novamente."
+                )
+        else:
+            try:
+                gravado = limites_usuarios_col.find_one(
+                    {
+                        "_id": usuario_ref,
+                        "events.token": token,
+                    },
+                    {"_id": 1},
+                )
+            except Exception as verificacao_erro:
+                registrar_falha_componente("MongoDB", verificacao_erro)
+                logger.warning(
+                    "[LIMITE_USUARIO_PERSISTENTE] verificacao_falhou=True "
+                    f"user_ref={referencia_usuario_log(user_id)} "
+                    f"erro={sanitizar_erro_log(verificacao_erro)}"
+                )
+                return False, (
+                    "⏳ O controle de solicitações está temporariamente "
+                    "indisponível. Aguarde alguns instantes e tente novamente."
+                )
+            if not gravado:
+                registrar_falha_componente("MongoDB", e)
+                logger.warning(
+                    "[LIMITE_USUARIO_PERSISTENTE] gravacao_falhou=True "
+                    f"user_ref={referencia_usuario_log(user_id)} "
+                    f"erro={sanitizar_erro_log(e)}"
+                )
+                return False, (
+                    "⏳ O controle de solicitações está temporariamente "
+                    "indisponível. Aguarde alguns instantes e tente novamente."
+                )
+            documento = gravado
+
+    if not documento:
+        try:
+            estado = limites_usuarios_col.find_one(
+                {"_id": usuario_ref},
+                {"events.at": 1, "last_event_at": 1},
+            )
+        except Exception as consulta_erro:
+            registrar_falha_componente("MongoDB", consulta_erro)
+            logger.warning(
+                "[LIMITE_USUARIO_PERSISTENTE] consulta_bloqueio_falhou=True "
+                f"user_ref={referencia_usuario_log(user_id)} "
+                f"erro={sanitizar_erro_log(consulta_erro)}"
+            )
+            return False, (
+                "⏳ O controle de solicitações está temporariamente "
+                "indisponível. Aguarde alguns instantes e tente novamente."
+            )
+
+        motivo, mensagem = _mensagem_bloqueio_usuario_persistente(
+            estado,
+            agora_utc,
+        )
+        registrar_sucesso_componente("MongoDB")
+        logger.info(
+            f"[LIMITE_USUARIO_PERSISTENTE] bloqueado=True motivo={motivo} "
+            f"user_ref={referencia_usuario_log(user_id)}"
+        )
+        return False, mensagem
+
+    registrar_sucesso_componente("MongoDB")
+    registrar_evento_usuario_local(user_id)
     return True, None
 
 
@@ -7913,6 +8164,21 @@ def handle_download(message):
                 )
             return
 
+    limite_usuario_ok, mensagem_limite_usuario = (
+        autorizar_limite_usuario_persistente(user_id)
+    )
+    if not limite_usuario_ok:
+        with DOWNLOAD_PENDING_LOCK:
+            DOWNLOAD_PENDING_USERS.discard(user_id)
+        devolver_reserva_download_gratis(
+            reserva_download,
+            user_id,
+            motivo="limite_usuario",
+        )
+        remover_trabalho_fila_persistente(user_id)
+        safe_reply_to(message, mensagem_limite_usuario)
+        return
+
     limite_global_ok, mensagem_limite_global = (
         autorizar_limite_global_persistente(user_id)
     )
@@ -8106,6 +8372,15 @@ if __name__ == "__main__":
         f"{GLOBAL_RATE_LIMIT_WINDOW_SECONDS}s "
         f"limite={MAX_DOWNLOADS_GLOBAL_HOUR} mongo_writes_por_aceite=1 "
         "compartilhado_entre_instancias=True contains_user_ids=False "
+        "contains_urls=False"
+    )
+    logger.info(
+        f"[LIMITE_USUARIO_CONFIG] persistente=True janela_movel="
+        f"{GLOBAL_RATE_LIMIT_WINDOW_SECONDS}s "
+        f"limite={MAX_DOWNLOADS_PER_USER_HOUR} "
+        f"cooldown={DOWNLOAD_COOLDOWN_SECONDS}s "
+        "mongo_writes_por_aceite=1 compartilhado_entre_instancias=True "
+        "identifier_anonymized=True contains_plain_user_id=False "
         "contains_urls=False"
     )
     logger.info(
