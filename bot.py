@@ -76,8 +76,12 @@ def get_env_int(name, default, minimo=None, maximo=None):
 TOKEN_TELEGRAM = get_env_required("TOKEN_TELEGRAM")
 MONGO_URI = get_env_required("MONGO_URI")
 MONGO_DB_NAME = get_env_required("MONGO_DB_NAME")
-LINK_SUPORTE = get_env_required("LINK_SUPORTE")
 ADMIN_ID = int(get_env_required("ADMIN_ID"))
+
+# Contato público oficial. Mantê-lo no código evita que uma variável antiga
+# da Railway continue enviando usuários para o suporte anterior.
+SUPORTE_USERNAME = "@suportebaixarvideoshd"
+LINK_SUPORTE = f"https://t.me/{SUPORTE_USERNAME.lstrip('@')}"
 
 # Vendas exclusivamente por Pix manual. Nenhuma integração de checkout ou
 # cartão é carregada pelo bot. Os dados ficam somente nas variáveis do Railway.
@@ -5049,12 +5053,16 @@ def suporte(message):
 
         safe_send_message(
             message.chat.id,
-            "👋 Precisa de ajuda? Clique abaixo para falar com o suporte.",
+            "👋 Precisa de ajuda? Clique abaixo para falar com o suporte oficial:\n"
+            f"{SUPORTE_USERNAME}",
             reply_markup=markup
         )
     except Exception as e:
         logger.error(f"[SUPORTE] erro={e}")
-        safe_send_message(message.chat.id, f"Suporte: {LINK_SUPORTE}")
+        safe_send_message(
+            message.chat.id,
+            f"Suporte oficial: {SUPORTE_USERNAME}\n{LINK_SUPORTE}",
+        )
 
 
 def normalizar_datetime_tz(valor):
