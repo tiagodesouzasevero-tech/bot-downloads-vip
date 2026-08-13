@@ -1842,10 +1842,16 @@ def verificar_travamento_worker():
     return deve_alertar or deve_tentar_reinicio
 
 
-def extrair_file_id_telegram(mensagem):
+def extrair_dados_midia_telegram(mensagem):
     video = getattr(mensagem, "video", None)
     documento = getattr(mensagem, "document", None)
-    return getattr(video, "file_id", None) or getattr(documento, "file_id", None)
+    video_file_id = getattr(video, "file_id", None)
+    if video_file_id:
+        return video_file_id, "video"
+    documento_file_id = getattr(documento, "file_id", None)
+    if documento_file_id:
+        return documento_file_id, "document"
+    return None, None
 
 
 def enviar_arquivo_com_fallback(chat_id, arquivo):
@@ -1857,7 +1863,8 @@ def enviar_arquivo_com_fallback(chat_id, arquivo):
                 f,
                 caption="👉 Download concluído! Aqui está seu vídeo 👊",
             )
-        return True, extrair_file_id_telegram(mensagem)
+        telegram_file_id, telegram_media_type = extrair_dados_midia_telegram(mensagem)
+        return True, telegram_file_id, telegram_media_type
     except Exception as e_video:
         logger.warning(f"[SEND_VIDEO] Falhou no envio como vídeo. arquivo={arquivo} erro={e_video}")
 
@@ -1886,7 +1893,8 @@ def enviar_arquivo_com_fallback(chat_id, arquivo):
                 )
 
             logger.info(f"[SEND_VIDEO] Fallback H.264 enviado com sucesso | arquivo={arquivo_fallback}")
-            return True, extrair_file_id_telegram(mensagem)
+            telegram_file_id, telegram_media_type = extrair_dados_midia_telegram(mensagem)
+            return True, telegram_file_id, telegram_media_type
         except Exception as e_h264:
             logger.warning(f"[SEND_VIDEO] Fallback H.264 também falhou. erro={e_h264}")
 
@@ -1899,10 +1907,11 @@ def enviar_arquivo_com_fallback(chat_id, arquivo):
                 f,
                 caption="👉 Download concluído! Aqui está seu arquivo 👊",
             )
-        return True, extrair_file_id_telegram(mensagem)
+        telegram_file_id, telegram_media_type = extrair_dados_midia_telegram(mensagem)
+        return True, telegram_file_id, telegram_media_type
     except Exception as e_doc:
         logger.error(f"[SEND_DOCUMENT] Também falhou. erro={e_doc}")
-        return False, None
+        return False, None, None
 
 
 def montar_chave_cache_midia(plataforma, info, url):
@@ -1962,7 +1971,7 @@ def montar_chave_cache_url(plataforma, url):
     return hashlib.sha256(material.encode("utf-8")).hexdigest(), url_normalizada
 
 
-def obter_file_id_cache(cache_key):
+def obter_entrada_cache(cache_key):
     try:
         doc = midia_cache_col.find_one({"_id": cache_key})
         if not doc:
@@ -1972,7 +1981,16 @@ def obter_file_id_cache(cache_key):
         if expires_at and expires_at < agora_utc_naive:
             midia_cache_col.delete_one({"_id": cache_key})
             return None
-        return doc.get("telegram_file_id")
+        telegram_file_id = doc.get("telegram_file_id")
+        if not telegram_file_id:
+            return None
+        telegram_media_type = doc.get("telegram_media_type")
+        if telegram_media_type not in ("video", "document"):
+            telegram_media_type = None
+        return {
+            "telegram_file_id": telegram_file_id,
+            "telegram_media_type": telegram_media_type,
+        }
     except Exception as e:
         logger.warning(f"[CACHE_MIDIA_LEITURA] key={cache_key[:12]} erro={e}")
         return None
@@ -1983,10 +2001,17 @@ def salvar_file_id_cache(
     source_id,
     plataforma,
     telegram_file_id,
+    telegram_media_type,
     url_cache_key=None,
     url_normalizada=None,
 ):
     if not telegram_file_id:
+        return
+    if telegram_media_type not in ("video", "document"):
+        logger.warning(
+            f"[CACHE_MIDIA_GRAVACAO] key={cache_key[:12]} "
+            "tipo_telegram_invalido=True"
+        )
         return
     try:
         agora = datetime.now(timezone.utc).replace(tzinfo=None)
@@ -2011,6 +2036,7 @@ def salvar_file_id_cache(
                         "cache_identifier_hash": identificador_hash,
                         "plataforma": plataforma,
                         "telegram_file_id": telegram_file_id,
+                        "telegram_media_type": telegram_media_type,
                         "media_profile": MEDIA_PROFILE_VERSION,
                         "updated_at": agora,
                         "expires_at": agora + timedelta(days=MEDIA_CACHE_DAYS),
@@ -2027,23 +2053,174 @@ def salvar_file_id_cache(
         logger.warning(f"[CACHE_MIDIA_GRAVACAO] key={cache_key[:12]} erro={e}")
 
 
-def enviar_video_cacheado(chat_id, cache_key, telegram_file_id):
-    atualizar_heartbeat_worker("enviando_cache")
-    try:
-        bot.send_video(
+class CacheTelegramTemporariamenteIndisponivel(RuntimeError):
+    pass
+
+
+def classificar_erro_envio_cache(erro):
+    """Só classifica como inválido quando a resposta aponta para o arquivo."""
+    texto = str(erro or "").lower()
+    codigos = []
+    for objeto in (
+        erro,
+        getattr(erro, "result", None),
+        getattr(erro, "response", None),
+    ):
+        if objeto is None:
+            continue
+        for atributo in ("error_code", "status_code", "status"):
+            valor = getattr(objeto, atributo, None)
+            try:
+                if valor is not None:
+                    codigos.append(int(valor))
+            except (TypeError, ValueError):
+                pass
+
+    if 429 in codigos or any(codigo >= 500 for codigo in codigos):
+        return "temporario"
+
+    marcadores_temporarios = (
+        "too many requests",
+        "retry after",
+        "timeout",
+        "timed out",
+        "connection reset",
+        "connection aborted",
+        "connection refused",
+        "connection error",
+        "remote disconnected",
+        "network is unreachable",
+        "temporary failure",
+        "temporarily unavailable",
+        "bad gateway",
+        "service unavailable",
+        "gateway timeout",
+        "internal server error",
+        "server disconnected",
+        "read operation timed out",
+    )
+    if any(marcador in texto for marcador in marcadores_temporarios):
+        return "temporario"
+
+    marcadores_file_id_invalido = (
+        "wrong file identifier",
+        "file identifier/http url specified",
+        "file_id is not valid",
+        "file id is not valid",
+        "invalid file_id",
+        "invalid file id",
+        "file reference expired",
+        "file_reference_expired",
+        "file not found",
+        "can't use file of type",
+        "cannot use file of type",
+        "wrong file type",
+        "file type mismatch",
+        "video_content_type_invalid",
+        "document_invalid",
+    )
+    if any(marcador in texto for marcador in marcadores_file_id_invalido):
+        return "file_id_invalido"
+
+    # Chat inexistente, bloqueio do usuário ou uma mensagem desconhecida não
+    # provam que o arquivo deixou de existir. O cache permanece preservado.
+    return "inconclusivo"
+
+
+def _enviar_file_id_telegram(chat_id, telegram_file_id, telegram_media_type):
+    if telegram_media_type == "document":
+        return bot.send_document(
             chat_id,
             telegram_file_id,
-            caption="👉 Download concluído! Aqui está seu vídeo 👊",
+            caption="👉 Download concluído! Aqui está seu arquivo 👊",
         )
-        logger.info(f"[CACHE_MIDIA_HIT] key={cache_key[:12]} envio_sem_upload=True")
-        return True
-    except Exception as e:
-        logger.warning(f"[CACHE_MIDIA_INVALIDO] key={cache_key[:12]} erro={e}")
+    return bot.send_video(
+        chat_id,
+        telegram_file_id,
+        caption="👉 Download concluído! Aqui está seu vídeo 👊",
+    )
+
+
+def enviar_midia_cacheada(chat_id, cache_key, entrada_cache):
+    """Retorna o tipo usado, None se inválido, ou interrompe em falha temporária."""
+    atualizar_heartbeat_worker("enviando_cache")
+    telegram_file_id = entrada_cache.get("telegram_file_id")
+    tipo_armazenado = entrada_cache.get("telegram_media_type")
+    tipos_tentativa = (
+        [tipo_armazenado, "document" if tipo_armazenado == "video" else "video"]
+        if tipo_armazenado in ("video", "document")
+        else ["video", "document"]
+    )
+    erros_permanentes = 0
+
+    for telegram_media_type in tipos_tentativa:
+        for tentativa in range(1, 3):
+            try:
+                _enviar_file_id_telegram(
+                    chat_id,
+                    telegram_file_id,
+                    telegram_media_type,
+                )
+                logger.info(
+                    f"[CACHE_MIDIA_HIT] key={cache_key[:12]} "
+                    f"tipo={telegram_media_type} envio_sem_upload=True"
+                )
+                if tipo_armazenado != telegram_media_type:
+                    try:
+                        midia_cache_col.update_one(
+                            {
+                                "_id": cache_key,
+                                "telegram_file_id": telegram_file_id,
+                            },
+                            {
+                                "$set": {
+                                    "telegram_media_type": telegram_media_type,
+                                    "updated_at": datetime.now(timezone.utc).replace(
+                                        tzinfo=None
+                                    ),
+                                }
+                            },
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"[CACHE_MIDIA_MIGRACAO] key={cache_key[:12]} "
+                            f"erro={sanitizar_erro_log(e)}"
+                        )
+                return telegram_media_type
+            except Exception as e:
+                classificacao = classificar_erro_envio_cache(e)
+                logger.warning(
+                    f"[CACHE_MIDIA_ENVIO_FALHA] key={cache_key[:12]} "
+                    f"tipo={telegram_media_type} tentativa={tentativa}/2 "
+                    f"classificacao={classificacao} "
+                    f"erro={sanitizar_erro_log(e)}"
+                )
+                if classificacao == "temporario" and tentativa == 1:
+                    time.sleep(1)
+                    continue
+                if classificacao == "file_id_invalido":
+                    erros_permanentes += 1
+                    break
+                raise CacheTelegramTemporariamenteIndisponivel(
+                    "CACHE_TELEGRAM_TEMPORARIAMENTE_INDISPONIVEL"
+                ) from e
+
+    if erros_permanentes == len(tipos_tentativa):
         try:
-            midia_cache_col.delete_one({"_id": cache_key})
-        except Exception:
-            pass
-        return False
+            midia_cache_col.delete_one({
+                "_id": cache_key,
+                "telegram_file_id": telegram_file_id,
+            })
+        except Exception as e:
+            logger.warning(
+                f"[CACHE_MIDIA_REMOCAO] key={cache_key[:12]} "
+                f"erro={sanitizar_erro_log(e)}"
+            )
+        logger.warning(
+            f"[CACHE_MIDIA_INVALIDO] key={cache_key[:12]} "
+            "confirmado_em_video_e_documento=True"
+        )
+    return None
 
 
 def detectar_plataforma(url):
@@ -5634,10 +5811,17 @@ def _processar_download(message, url, status_msg):
                 plataforma, url_resolvida
             )
 
-            file_id_cache_url = obter_file_id_cache(url_cache_key)
-            if file_id_cache_url and enviar_video_cacheado(
-                message.chat.id, url_cache_key, file_id_cache_url
-            ):
+            entrada_cache_url = obter_entrada_cache(url_cache_key)
+            tipo_cache_url = (
+                enviar_midia_cacheada(
+                    message.chat.id,
+                    url_cache_key,
+                    entrada_cache_url,
+                )
+                if entrada_cache_url
+                else None
+            )
+            if tipo_cache_url:
                 registrar_download_diario(vip_status)
                 if not vip_status:
                     incrementar_download_gratis(
@@ -5666,15 +5850,23 @@ def _processar_download(message, url, status_msg):
                 cache_key, cache_source_id = montar_chave_cache_midia(
                     plataforma, info, url_resolvida
                 )
-                file_id_cache = obter_file_id_cache(cache_key)
-                if file_id_cache and enviar_video_cacheado(
-                    message.chat.id, cache_key, file_id_cache
-                ):
+                entrada_cache = obter_entrada_cache(cache_key)
+                tipo_cache = (
+                    enviar_midia_cacheada(
+                        message.chat.id,
+                        cache_key,
+                        entrada_cache,
+                    )
+                    if entrada_cache
+                    else None
+                )
+                if tipo_cache:
                     salvar_file_id_cache(
                         cache_key,
                         cache_source_id,
                         plataforma,
-                        file_id_cache,
+                        entrada_cache["telegram_file_id"],
+                        tipo_cache,
                         url_cache_key=url_cache_key,
                         url_normalizada=url_normalizada,
                     )
@@ -5687,6 +5879,8 @@ def _processar_download(message, url, status_msg):
                         safe_delete_message(message.chat.id, status_msg.message_id)
                     return
 
+            except CacheTelegramTemporariamenteIndisponivel:
+                raise
             except Exception as e:
                 logger.warning(f"[PINTEREST_INFO] Falha ao ler metadados: {e}")
 
@@ -5712,7 +5906,7 @@ def _processar_download(message, url, status_msg):
                     fase="envio_pinterest",
                 )
 
-                enviado, telegram_file_id = enviar_arquivo_com_fallback(
+                enviado, telegram_file_id, telegram_media_type = enviar_arquivo_com_fallback(
                     message.chat.id, arquivo_envio
                 )
                 if not enviado:
@@ -5727,6 +5921,7 @@ def _processar_download(message, url, status_msg):
                     cache_source_id,
                     plataforma,
                     telegram_file_id,
+                    telegram_media_type,
                     url_cache_key=url_cache_key,
                     url_normalizada=url_normalizada,
                 )
@@ -5760,10 +5955,17 @@ def _processar_download(message, url, status_msg):
                 return
 
         url_cache_key, url_normalizada = montar_chave_cache_url(plataforma, url)
-        file_id_cache_url = obter_file_id_cache(url_cache_key)
-        if file_id_cache_url and enviar_video_cacheado(
-            message.chat.id, url_cache_key, file_id_cache_url
-        ):
+        entrada_cache_url = obter_entrada_cache(url_cache_key)
+        tipo_cache_url = (
+            enviar_midia_cacheada(
+                message.chat.id,
+                url_cache_key,
+                entrada_cache_url,
+            )
+            if entrada_cache_url
+            else None
+        )
+        if tipo_cache_url:
             registrar_download_diario(vip_status)
             if not vip_status:
                 incrementar_download_gratis(user, message.chat.id, message.from_user.id)
@@ -5800,15 +6002,23 @@ def _processar_download(message, url, status_msg):
             return
 
         cache_key, cache_source_id = montar_chave_cache_midia(plataforma, info, url)
-        file_id_cache = obter_file_id_cache(cache_key)
-        if file_id_cache and enviar_video_cacheado(
-            message.chat.id, cache_key, file_id_cache
-        ):
+        entrada_cache = obter_entrada_cache(cache_key)
+        tipo_cache = (
+            enviar_midia_cacheada(
+                message.chat.id,
+                cache_key,
+                entrada_cache,
+            )
+            if entrada_cache
+            else None
+        )
+        if tipo_cache:
             salvar_file_id_cache(
                 cache_key,
                 cache_source_id,
                 plataforma,
-                file_id_cache,
+                entrada_cache["telegram_file_id"],
+                tipo_cache,
                 url_cache_key=url_cache_key,
                 url_normalizada=url_normalizada,
             )
@@ -5895,7 +6105,7 @@ def _processar_download(message, url, status_msg):
             fase="envio",
         )
 
-        enviado, telegram_file_id = enviar_arquivo_com_fallback(
+        enviado, telegram_file_id, telegram_media_type = enviar_arquivo_com_fallback(
             message.chat.id, arquivo_envio
         )
         if not enviado:
@@ -5906,6 +6116,7 @@ def _processar_download(message, url, status_msg):
             cache_source_id,
             plataforma,
             telegram_file_id,
+            telegram_media_type,
             url_cache_key=url_cache_key,
             url_normalizada=url_normalizada,
         )
@@ -5919,6 +6130,24 @@ def _processar_download(message, url, status_msg):
         if status_msg:
             safe_delete_message(message.chat.id, status_msg.message_id)
 
+    except CacheTelegramTemporariamenteIndisponivel as e:
+        logger.warning(
+            f"[CACHE_MIDIA_TEMPORARIO] user_id={message.from_user.id} "
+            f"url_ref={referencia_url_log(url)} erro={sanitizar_erro_log(e)}"
+        )
+        texto_cache_temporario = (
+            "⏳ O Telegram está temporariamente indisponível. O vídeo continua "
+            "salvo no cache; aguarde alguns instantes e envie o link novamente. "
+            "Esta tentativa não consumiu seu limite diário."
+        )
+        if status_msg:
+            safe_edit_message(
+                message.chat.id,
+                status_msg.message_id,
+                texto_cache_temporario,
+            )
+        else:
+            safe_send_message(message.chat.id, texto_cache_temporario)
     except Exception as e:
         registrar_falha_plataforma(plataforma, e)
         logger.error(
