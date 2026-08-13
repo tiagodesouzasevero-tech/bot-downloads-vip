@@ -121,6 +121,8 @@ MAX_SOURCE_FILE_MB = get_env_int("MAX_SOURCE_FILE_MB", 100, 10, 500)
 MAX_OUTPUT_FILE_MB = get_env_int("MAX_OUTPUT_FILE_MB", 50, 5, 200)
 MAX_SOURCE_FILE_BYTES = MAX_SOURCE_FILE_MB * 1024 * 1024
 MAX_OUTPUT_FILE_BYTES = MAX_OUTPUT_FILE_MB * 1024 * 1024
+MIN_DISK_FREE_MB = get_env_int("MIN_DISK_FREE_MB", 300, 100, 10000)
+MIN_DISK_FREE_BYTES = MIN_DISK_FREE_MB * 1024 * 1024
 FFPROBE_TIMEOUT_SECONDS = get_env_int("FFPROBE_TIMEOUT_SECONDS", 30, 5, 120)
 FFMPEG_TIMEOUT_SECONDS = get_env_int("FFMPEG_TIMEOUT_SECONDS", 300, 30, 1800)
 DOWNLOAD_TIMEOUT_SECONDS = get_env_int("DOWNLOAD_TIMEOUT_SECONDS", 240, 30, 1800)
@@ -222,6 +224,8 @@ DOWNLOAD_PENDING_USERS = set()
 DOWNLOAD_QUEUE = PriorityQueue(maxsize=DOWNLOAD_QUEUE_MAX)
 DOWNLOAD_QUEUE_STATE_LOCK = Lock()
 DOWNLOAD_SEQUENCE = itertools.count()
+DISK_SPACE_ALERT_LOCK = Lock()
+DISK_SPACE_ALERT_STATE = {"active": False, "last_alert_at": 0.0}
 SHUTDOWN_EVENT = Event()
 SHUTDOWN_SIGNAL = None
 SHUTDOWN_DEADLINE_MONOTONIC = None
@@ -889,6 +893,113 @@ def cleanup_download_dir_old_files(max_age_hours=6):
             f"[CLEANUP_OLD] diretorio_ref={referencia_arquivo_log(DOWNLOAD_DIR)} "
             f"erro={sanitizar_erro_log(e)}"
         )
+
+
+def _consultar_espaco_livre_download():
+    uso = shutil.disk_usage(DOWNLOAD_DIR)
+    return int(uso.free), int(uso.total)
+
+
+def _atualizar_alerta_espaco_disco(espaco_baixo, livre_bytes=None):
+    """Alerta no máximo uma vez por hora enquanto o disco continuar baixo."""
+    agora_monotonic = time.monotonic()
+    deve_alertar = False
+    recuperou = False
+
+    with DISK_SPACE_ALERT_LOCK:
+        estado = DISK_SPACE_ALERT_STATE
+        if espaco_baixo:
+            cooldown = max(3600, MONITOR_ALERT_COOLDOWN_SECONDS)
+            deve_alertar = (
+                not estado["active"]
+                or agora_monotonic - estado["last_alert_at"] >= cooldown
+            )
+            estado["active"] = True
+            if deve_alertar:
+                estado["last_alert_at"] = agora_monotonic
+        else:
+            recuperou = bool(estado["active"])
+            estado["active"] = False
+
+    if deve_alertar:
+        livre_mb = max(0, int(livre_bytes or 0)) / (1024 * 1024)
+        safe_send_message(
+            ADMIN_ID,
+            "⚠️ <b>Armazenamento temporário quase cheio</b>\n\n"
+            f"Espaço livre: <b>{livre_mb:.0f} MB</b>\n"
+            f"Mínimo configurado: <b>{MIN_DISK_FREE_MB} MB</b>\n\n"
+            "Novos downloads locais foram pausados para evitar arquivos "
+            "incompletos. Entregas já existentes no cache continuam "
+            "funcionando.",
+            parse_mode="HTML",
+        )
+    elif recuperou:
+        logger.info("[DISK_GUARD] armazenamento_normalizado=True")
+
+
+def garantir_espaco_para_novo_download():
+    """Limpa temporários uma vez e bloqueia se ainda faltar espaço."""
+    try:
+        livre_antes, _total = _consultar_espaco_livre_download()
+    except Exception as e:
+        registrar_falha_componente("Armazenamento", e)
+        logger.error(
+            f"[DISK_GUARD] consulta_falhou=True erro={sanitizar_erro_log(e)}"
+        )
+        return False, None
+
+    if livre_antes >= MIN_DISK_FREE_BYTES:
+        _atualizar_alerta_espaco_disco(False, livre_antes)
+        return True, livre_antes
+
+    logger.warning(
+        f"[DISK_GUARD] limpeza_necessaria=True "
+        f"livre_mb={livre_antes / (1024 * 1024):.0f} "
+        f"minimo_mb={MIN_DISK_FREE_MB}"
+    )
+    cleanup_download_dir_old_files(max_age_hours=0)
+
+    try:
+        livre_depois, _total = _consultar_espaco_livre_download()
+    except Exception as e:
+        registrar_falha_componente("Armazenamento", e)
+        logger.error(
+            "[DISK_GUARD] consulta_apos_limpeza_falhou=True "
+            f"erro={sanitizar_erro_log(e)}"
+        )
+        return False, None
+
+    if livre_depois >= MIN_DISK_FREE_BYTES:
+        _atualizar_alerta_espaco_disco(False, livre_depois)
+        logger.info(
+            f"[DISK_GUARD] limpeza_recuperou_espaco=True "
+            f"livre_mb={livre_depois / (1024 * 1024):.0f}"
+        )
+        return True, livre_depois
+
+    logger.error(
+        f"[DISK_GUARD] download_bloqueado=True "
+        f"livre_mb={livre_depois / (1024 * 1024):.0f} "
+        f"minimo_mb={MIN_DISK_FREE_MB}"
+    )
+    _atualizar_alerta_espaco_disco(True, livre_depois)
+    return False, livre_depois
+
+
+def informar_download_pausado_por_espaco(message, status_msg):
+    texto = (
+        "⏳ O armazenamento temporário do bot está quase cheio. Para evitar "
+        "um vídeo incompleto, este download não foi iniciado. Aguarde alguns "
+        "instantes e envie o link novamente. Esta tentativa não consumiu seu "
+        "limite diário."
+    )
+    if status_msg and safe_edit_message(
+        message.chat.id,
+        status_msg.message_id,
+        texto,
+    ):
+        return
+    safe_send_message(message.chat.id, texto)
 
 
 def cleanup_download_dir_periodicamente(interval_minutes=60, max_age_hours=6):
@@ -4439,12 +4550,16 @@ def montar_relatorio_diagnostico():
         livre_percentual = (
             (uso_disco.free / uso_disco.total) * 100 if uso_disco.total else 0
         )
-        icone_disco = "✅" if livre_percentual >= 10 else "⚠️"
+        disco_baixo = (
+            uso_disco.free < MIN_DISK_FREE_BYTES
+            or livre_percentual < 10
+        )
+        icone_disco = "⚠️" if disco_baixo else "✅"
         linhas.append(
             f"{icone_disco} Disco livre: {livre_mb:.0f} MB "
-            f"({livre_percentual:.0f}%)"
+            f"({livre_percentual:.0f}%, mínimo {MIN_DISK_FREE_MB} MB)"
         )
-        if livre_percentual < 10:
+        if disco_baixo:
             problemas.append("Pouco espaço livre em disco")
         registrar_sucesso_componente("Armazenamento")
     except Exception as e:
@@ -6356,6 +6471,11 @@ def _processar_download(message, url, status_msg):
                     f"{sanitizar_erro_log(e)}"
                 )
 
+            espaco_ok, _livre_bytes = garantir_espaco_para_novo_download()
+            if not espaco_ok:
+                informar_download_pausado_por_espaco(message, status_msg)
+                return
+
             try:
                 atualizar_heartbeat_worker("baixando")
                 try:
@@ -6534,6 +6654,11 @@ def _processar_download(message, url, status_msg):
                 incrementar_download_gratis(user, message.chat.id, message.from_user.id)
             if status_msg:
                 safe_delete_message(message.chat.id, status_msg.message_id)
+            return
+
+        espaco_ok, _livre_bytes = garantir_espaco_para_novo_download()
+        if not espaco_ok:
+            informar_download_pausado_por_espaco(message, status_msg)
             return
 
         formatos = formatos_por_plataforma(
@@ -7364,6 +7489,11 @@ if __name__ == "__main__":
         f"max_duration={MAX_DURATION_SECONDS}s source_max={MAX_SOURCE_FILE_MB}MB "
         f"output_max={MAX_OUTPUT_FILE_MB}MB ffmpeg_timeout={FFMPEG_TIMEOUT_SECONDS}s "
         f"threads={FFMPEG_THREADS}"
+    )
+    logger.info(
+        f"[DISK_GUARD_CONFIG] minimo_livre={MIN_DISK_FREE_MB}MB "
+        "limpeza_automatica=True cache_telegram_bloqueado=False "
+        "mongo_writes=0"
     )
     logger.info(
         f"[CUSTO_CONFIG] cooldown={DOWNLOAD_COOLDOWN_SECONDS}s "
