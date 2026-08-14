@@ -2432,6 +2432,19 @@ def _enviar_video_local_telegram(chat_id, arquivo):
         )
 
 
+def obter_tamanho_arquivo_para_metrica(arquivo):
+    """Obtém o tamanho sem transformar uma falha de métrica em falha do download."""
+    try:
+        return max(0, int(os.path.getsize(arquivo)))
+    except (OSError, TypeError, ValueError) as e:
+        logger.warning(
+            f"[METRICAS_UPLOAD_TAMANHO] "
+            f"arquivo_ref={referencia_arquivo_log(arquivo)} "
+            f"erro={sanitizar_erro_log(e)}"
+        )
+        return 0
+
+
 def enviar_arquivo_com_fallback(chat_id, arquivo):
     atualizar_heartbeat_worker("enviando_telegram")
     erro_video = None
@@ -2440,7 +2453,12 @@ def enviar_arquivo_com_fallback(chat_id, arquivo):
         mensagem = _enviar_video_local_telegram(chat_id, arquivo)
         telegram_file_id, telegram_media_type = extrair_dados_midia_telegram(mensagem)
         registrar_sucesso_componente("Telegram")
-        return True, telegram_file_id, telegram_media_type
+        return (
+            True,
+            telegram_file_id,
+            telegram_media_type,
+            obter_tamanho_arquivo_para_metrica(arquivo),
+        )
     except Exception as e_video:
         if isinstance(e_video, OSError):
             raise FalhaComponenteDownload("Armazenamento", e_video) from e_video
@@ -2471,7 +2489,12 @@ def enviar_arquivo_com_fallback(chat_id, arquivo):
                 mensagem
             )
             registrar_sucesso_componente("Telegram")
-            return True, telegram_file_id, telegram_media_type
+            return (
+                True,
+                telegram_file_id,
+                telegram_media_type,
+                obter_tamanho_arquivo_para_metrica(arquivo),
+            )
         except Exception as e_retry:
             if isinstance(e_retry, OSError):
                 raise FalhaComponenteDownload(
@@ -2526,7 +2549,12 @@ def enviar_arquivo_com_fallback(chat_id, arquivo):
             telegram_file_id, telegram_media_type = extrair_dados_midia_telegram(mensagem)
             registrar_sucesso_componente("Telegram")
             registrar_sucesso_componente("Processamento")
-            return True, telegram_file_id, telegram_media_type
+            return (
+                True,
+                telegram_file_id,
+                telegram_media_type,
+                obter_tamanho_arquivo_para_metrica(arquivo_fallback),
+            )
         except Exception as e_h264:
             if isinstance(e_h264, OSError):
                 raise FalhaComponenteDownload(
@@ -2554,7 +2582,12 @@ def enviar_arquivo_com_fallback(chat_id, arquivo):
             )
         telegram_file_id, telegram_media_type = extrair_dados_midia_telegram(mensagem)
         registrar_sucesso_componente("Telegram")
-        return True, telegram_file_id, telegram_media_type
+        return (
+            True,
+            telegram_file_id,
+            telegram_media_type,
+            obter_tamanho_arquivo_para_metrica(alvo_documento),
+        )
     except Exception as e_doc:
         logger.error(
             f"[SEND_DOCUMENT] Também falhou. erro={sanitizar_erro_log(e_doc)}"
@@ -4720,6 +4753,10 @@ def inicializar_metricas_diarias():
                     "downloads_total": gratuitos_existentes,
                     "downloads_gratuitos": gratuitos_existentes,
                     "downloads_vips": 0,
+                    "downloads_cache_url": 0,
+                    "downloads_cache_midia": 0,
+                    "downloads_upload": 0,
+                    "bytes_upload_telegram": 0,
                     "created_at": agora,
                     "updated_at": agora,
                 }
@@ -4734,20 +4771,44 @@ def inicializar_metricas_diarias():
         logger.error(f"[METRICAS_INIT] erro={sanitizar_erro_log(e)}")
 
 
-def registrar_download_diario(vip_status):
-    """Registra um download concluído sem interferir no limite do usuário gratuito."""
+def registrar_download_diario(vip_status, tipo_entrega="upload", bytes_upload=0):
+    """Registra o download e sua forma de entrega na mesma escrita diária."""
     try:
         hoje = hoje_str()
         agora = agora_tz()
         campo_tipo = "downloads_vips" if vip_status else "downloads_gratuitos"
+        campos_entrega = {
+            "cache_url": "downloads_cache_url",
+            "cache_midia": "downloads_cache_midia",
+            "upload": "downloads_upload",
+        }
+        tipo_entrega = str(tipo_entrega or "").strip().lower()
+        campo_entrega = campos_entrega.get(tipo_entrega)
+        if campo_entrega is None:
+            logger.warning(
+                f"[METRICAS_DOWNLOAD] tipo_entrega_invalido="
+                f"{sanitizar_erro_log(tipo_entrega, limite=50)} usando=upload"
+            )
+            tipo_entrega = "upload"
+            campo_entrega = campos_entrega[tipo_entrega]
+
+        try:
+            bytes_upload = max(0, int(bytes_upload or 0))
+        except (TypeError, ValueError):
+            bytes_upload = 0
+
+        incrementos = {
+            "downloads_total": 1,
+            campo_tipo: 1,
+            campo_entrega: 1,
+        }
+        if tipo_entrega == "upload":
+            incrementos["bytes_upload_telegram"] = bytes_upload
 
         metricas_col.update_one(
             {"_id": hoje},
             {
-                "$inc": {
-                    "downloads_total": 1,
-                    campo_tipo: 1,
-                },
+                "$inc": incrementos,
                 "$set": {
                     "updated_at": agora,
                 },
@@ -4761,10 +4822,26 @@ def registrar_download_diario(vip_status):
         registrar_sucesso_componente("MongoDB")
     except Exception as e:
         logger.error(
-            f"[METRICAS_DOWNLOAD] vip={vip_status} "
+            f"[METRICAS_DOWNLOAD] vip={vip_status} tipo={tipo_entrega} "
+            f"bytes_upload={bytes_upload} "
             f"erro={sanitizar_erro_log(e)}"
         )
         registrar_falha_componente("MongoDB", e)
+
+
+def formatar_tamanho_bytes(total_bytes):
+    try:
+        tamanho = max(0, int(total_bytes or 0))
+    except (TypeError, ValueError):
+        tamanho = 0
+
+    if tamanho >= 1024 ** 3:
+        return f"{tamanho / (1024 ** 3):.2f} GB"
+    if tamanho >= 1024 ** 2:
+        return f"{tamanho / (1024 ** 2):.1f} MB"
+    if tamanho >= 1024:
+        return f"{tamanho / 1024:.1f} KB"
+    return f"{tamanho} B"
 
 
 def gerar_order_nsu(user_id):
@@ -6393,6 +6470,25 @@ def painel_admin(message):
         downloads_totais_hoje = int(metricas_hoje.get("downloads_total", 0) or 0)
         downloads_gratuitos_hoje = int(metricas_hoje.get("downloads_gratuitos", 0) or 0)
         downloads_vips_hoje = int(metricas_hoje.get("downloads_vips", 0) or 0)
+        cache_url_hoje = int(metricas_hoje.get("downloads_cache_url", 0) or 0)
+        cache_midia_hoje = int(metricas_hoje.get("downloads_cache_midia", 0) or 0)
+        uploads_hoje = int(metricas_hoje.get("downloads_upload", 0) or 0)
+        bytes_upload_hoje = int(
+            metricas_hoje.get("bytes_upload_telegram", 0) or 0
+        )
+        cache_total_hoje = cache_url_hoje + cache_midia_hoje
+        entregas_medidas_hoje = cache_total_hoje + uploads_hoje
+        taxa_cache_hoje = (
+            cache_total_hoje * 100 / entregas_medidas_hoje
+            if entregas_medidas_hoje > 0
+            else 0.0
+        )
+        cobertura_metricas = ""
+        if entregas_medidas_hoje != downloads_totais_hoje:
+            cobertura_metricas = (
+                f"\n📊 Entregas medidas: `{entregas_medidas_hoje}` de "
+                f"`{downloads_totais_hoje}`"
+            )
 
         comprovantes_em_analise = pedidos_col.count_documents({
             "status": {"$in": ["receipt_submitted", "approving"]}
@@ -6406,6 +6502,12 @@ def painel_admin(message):
             f"📥 Downloads hoje: `{downloads_totais_hoje}`\n"
             f"   ├ 👤 Gratuitos: `{downloads_gratuitos_hoje}`\n"
             f"   └ 💎 VIPs: `{downloads_vips_hoje}`\n"
+            f"♻️ Cache hoje: `{cache_total_hoje}` (`{taxa_cache_hoje:.1f}%`)\n"
+            f"   ├ 🔗 Por URL: `{cache_url_hoje}`\n"
+            f"   └ 🎞️ Por mídia: `{cache_midia_hoje}`\n"
+            f"⬆️ Uploads novos: `{uploads_hoje}`\n"
+            f"🌐 Mídia enviada: `{formatar_tamanho_bytes(bytes_upload_hoje)}`"
+            f"{cobertura_metricas}\n"
             f"🧾 Comprovantes aguardando análise: `{comprovantes_em_analise}`\n"
             f"✅ Pagamentos aprovados: `{pedidos_pagos}`"
         )
@@ -7496,7 +7598,7 @@ def _processar_download(message, url, status_msg, reserva_download=None):
                 else None
             )
             if tipo_cache_url:
-                registrar_download_diario(vip_status)
+                registrar_download_diario(vip_status, tipo_entrega="cache_url")
                 if reserva_download:
                     confirmar_download_gratis(
                         reserva_download,
@@ -7551,7 +7653,7 @@ def _processar_download(message, url, status_msg, reserva_download=None):
                         url_cache_key=url_cache_key,
                         url_normalizada=url_normalizada,
                     )
-                    registrar_download_diario(vip_status)
+                    registrar_download_diario(vip_status, tipo_entrega="cache_midia")
                     if reserva_download:
                         confirmar_download_gratis(
                             reserva_download,
@@ -7605,9 +7707,12 @@ def _processar_download(message, url, status_msg, reserva_download=None):
                 )
                 registrar_sucesso_componente("Processamento")
 
-                enviado, telegram_file_id, telegram_media_type = enviar_arquivo_com_fallback(
-                    message.chat.id, arquivo_envio
-                )
+                (
+                    enviado,
+                    telegram_file_id,
+                    telegram_media_type,
+                    bytes_upload,
+                ) = enviar_arquivo_com_fallback(message.chat.id, arquivo_envio)
                 if not enviado:
                     raise Exception("Falha ao enviar arquivo ao Telegram")
 
@@ -7625,7 +7730,11 @@ def _processar_download(message, url, status_msg, reserva_download=None):
                     url_normalizada=url_normalizada,
                 )
 
-                registrar_download_diario(vip_status)
+                registrar_download_diario(
+                    vip_status,
+                    tipo_entrega="upload",
+                    bytes_upload=bytes_upload,
+                )
                 if reserva_download:
                     confirmar_download_gratis(
                         reserva_download,
@@ -7689,7 +7798,7 @@ def _processar_download(message, url, status_msg, reserva_download=None):
             else None
         )
         if tipo_cache_url:
-            registrar_download_diario(vip_status)
+            registrar_download_diario(vip_status, tipo_entrega="cache_url")
             if reserva_download:
                 confirmar_download_gratis(
                     reserva_download,
@@ -7759,7 +7868,7 @@ def _processar_download(message, url, status_msg, reserva_download=None):
                 url_cache_key=url_cache_key,
                 url_normalizada=url_normalizada,
             )
-            registrar_download_diario(vip_status)
+            registrar_download_diario(vip_status, tipo_entrega="cache_midia")
             if reserva_download:
                 confirmar_download_gratis(
                     reserva_download,
@@ -7863,9 +7972,12 @@ def _processar_download(message, url, status_msg, reserva_download=None):
         )
         registrar_sucesso_componente("Processamento")
 
-        enviado, telegram_file_id, telegram_media_type = enviar_arquivo_com_fallback(
-            message.chat.id, arquivo_envio
-        )
+        (
+            enviado,
+            telegram_file_id,
+            telegram_media_type,
+            bytes_upload,
+        ) = enviar_arquivo_com_fallback(message.chat.id, arquivo_envio)
         if not enviado:
             raise Exception("Falha ao enviar arquivo ao Telegram")
 
@@ -7879,7 +7991,11 @@ def _processar_download(message, url, status_msg, reserva_download=None):
             url_normalizada=url_normalizada,
         )
 
-        registrar_download_diario(vip_status)
+        registrar_download_diario(
+            vip_status,
+            tipo_entrega="upload",
+            bytes_upload=bytes_upload,
+        )
         if reserva_download:
             confirmar_download_gratis(
                 reserva_download,
