@@ -2281,28 +2281,225 @@ def extrair_dados_midia_telegram(mensagem):
     return None, None
 
 
+def _codigos_erro_telegram(erro):
+    """Extrai códigos HTTP/Bot API sem depender de uma classe de exceção."""
+    codigos = []
+    objetos = (
+        erro,
+        getattr(erro, "result", None),
+        getattr(erro, "response", None),
+        getattr(erro, "result_json", None),
+    )
+    for objeto in objetos:
+        if objeto is None:
+            continue
+        for atributo in ("error_code", "status_code", "status"):
+            valor = (
+                objeto.get(atributo)
+                if isinstance(objeto, dict)
+                else getattr(objeto, atributo, None)
+            )
+            try:
+                if valor is not None:
+                    codigos.append(int(valor))
+            except (TypeError, ValueError):
+                pass
+    return codigos
+
+
+def extrair_retry_after_telegram(erro):
+    """Lê retry_after das formas usadas pelo Telegram e pelo TeleBot."""
+    objetos = (
+        erro,
+        getattr(erro, "result", None),
+        getattr(erro, "response", None),
+        getattr(erro, "result_json", None),
+    )
+    for objeto in objetos:
+        if objeto is None:
+            continue
+
+        if isinstance(objeto, dict):
+            valor = objeto.get("retry_after")
+            parametros = objeto.get("parameters")
+        else:
+            valor = getattr(objeto, "retry_after", None)
+            parametros = getattr(objeto, "parameters", None)
+
+        if valor is None and parametros is not None:
+            valor = (
+                parametros.get("retry_after")
+                if isinstance(parametros, dict)
+                else getattr(parametros, "retry_after", None)
+            )
+
+        try:
+            if valor is not None:
+                return max(0, int(valor))
+        except (TypeError, ValueError):
+            pass
+    return None
+
+
+def classificar_erro_envio_arquivo(erro):
+    """Decide se um novo upload ou uma conversão realmente podem ajudar."""
+    texto = str(erro or "").lower()
+    codigos = _codigos_erro_telegram(erro)
+
+    if 429 in codigos or "too many requests" in texto or "retry after" in texto:
+        return "temporario_rate_limit"
+
+    marcadores_temporarios = (
+        "timeout",
+        "timed out",
+        "connection reset",
+        "connection aborted",
+        "connection refused",
+        "connection error",
+        "remote disconnected",
+        "network is unreachable",
+        "temporary failure",
+        "temporarily unavailable",
+        "bad gateway",
+        "service unavailable",
+        "gateway timeout",
+        "internal server error",
+        "server disconnected",
+        "read operation timed out",
+    )
+    if any(codigo >= 500 for codigo in codigos) or any(
+        marcador in texto for marcador in marcadores_temporarios
+    ):
+        return "temporario"
+
+    marcadores_destino_indisponivel = (
+        "bot was blocked by the user",
+        "user is deactivated",
+        "chat not found",
+        "bot can't initiate conversation",
+        "bot cannot initiate conversation",
+        "not enough rights to send",
+        "have no rights to send",
+        "chat_write_forbidden",
+        "peer_id_invalid",
+        "forbidden: bot",
+    )
+    if 403 in codigos or any(
+        marcador in texto for marcador in marcadores_destino_indisponivel
+    ):
+        return "destino_indisponivel"
+
+    marcadores_tamanho = (
+        "file is too big",
+        "file too large",
+        "request entity too large",
+        "payload too large",
+        "file_too_big",
+    )
+    if 413 in codigos or any(
+        marcador in texto for marcador in marcadores_tamanho
+    ):
+        return "arquivo_muito_grande"
+
+    marcadores_formato = (
+        "video_content_type_invalid",
+        "video content type invalid",
+        "wrong file type",
+        "can't use file of type",
+        "cannot use file of type",
+        "failed to process video",
+        "video_process_failed",
+        "video file is invalid",
+        "video is invalid",
+        "invalid video",
+        "unsupported video",
+        "unsupported codec",
+        "video codec",
+        "media_invalid",
+    )
+    if any(marcador in texto for marcador in marcadores_formato):
+        return "formato_incompativel"
+
+    return "inconclusivo"
+
+
+def _enviar_video_local_telegram(chat_id, arquivo):
+    with open(arquivo, "rb") as f:
+        return bot.send_video(
+            chat_id,
+            f,
+            caption="👉 Download concluído! Aqui está seu vídeo 👊",
+        )
+
+
 def enviar_arquivo_com_fallback(chat_id, arquivo):
     atualizar_heartbeat_worker("enviando_telegram")
+    erro_video = None
+    classificacao_video = None
     try:
-        with open(arquivo, "rb") as f:
-            mensagem = bot.send_video(
-                chat_id,
-                f,
-                caption="👉 Download concluído! Aqui está seu vídeo 👊",
-            )
+        mensagem = _enviar_video_local_telegram(chat_id, arquivo)
         telegram_file_id, telegram_media_type = extrair_dados_midia_telegram(mensagem)
         registrar_sucesso_componente("Telegram")
         return True, telegram_file_id, telegram_media_type
     except Exception as e_video:
         if isinstance(e_video, OSError):
             raise FalhaComponenteDownload("Armazenamento", e_video) from e_video
+        erro_video = e_video
+        classificacao_video = classificar_erro_envio_arquivo(e_video)
+        retry_after = extrair_retry_after_telegram(e_video)
         logger.warning(
             f"[SEND_VIDEO] arquivo_ref={referencia_arquivo_log(arquivo)} "
+            f"classificacao={classificacao_video} retry_after={retry_after} "
             f"erro={sanitizar_erro_log(e_video)}"
         )
 
+    if (
+        classificacao_video == "temporario_rate_limit"
+        and retry_after is not None
+        and retry_after <= 5
+    ):
+        espera = max(1, retry_after)
+        logger.info(
+            f"[SEND_VIDEO_RETRY] motivo=rate_limit espera={espera}s "
+            f"arquivo_ref={referencia_arquivo_log(arquivo)}"
+        )
+        time.sleep(espera)
+        atualizar_heartbeat_worker("reenviando_telegram")
+        try:
+            mensagem = _enviar_video_local_telegram(chat_id, arquivo)
+            telegram_file_id, telegram_media_type = extrair_dados_midia_telegram(
+                mensagem
+            )
+            registrar_sucesso_componente("Telegram")
+            return True, telegram_file_id, telegram_media_type
+        except Exception as e_retry:
+            if isinstance(e_retry, OSError):
+                raise FalhaComponenteDownload(
+                    "Armazenamento", e_retry
+                ) from e_retry
+            erro_video = e_retry
+            classificacao_video = classificar_erro_envio_arquivo(e_retry)
+            logger.warning(
+                f"[SEND_VIDEO_RETRY_FALHA] "
+                f"arquivo_ref={referencia_arquivo_log(arquivo)} "
+                f"classificacao={classificacao_video} "
+                f"erro={sanitizar_erro_log(e_retry)}"
+            )
+
+    if classificacao_video != "formato_incompativel":
+        logger.info(
+            f"[SEND_VIDEO_FALLBACK_BLOQUEADO] "
+            f"arquivo_ref={referencia_arquivo_log(arquivo)} "
+            f"classificacao={classificacao_video} conversao=False "
+            "envio_documento=False"
+        )
+        raise FalhaComponenteDownload("Telegram", erro_video) from erro_video
+
+    # FFprobe, conversão e novo upload só são executados quando o Telegram
+    # confirmou que o problema pertence ao formato do vídeo.
     info = obter_info_midia(arquivo)
     arquivo_fallback = None
+    alvo_documento = arquivo
 
     if arquivo_tem_codec_hevc(arquivo, info):
         try:
@@ -2312,19 +2509,15 @@ def enviar_arquivo_com_fallback(chat_id, arquivo):
                 f"width={(info or {}).get('width')} height={(info or {}).get('height')} "
                 f"fps={(info or {}).get('fps')} vcodec={(info or {}).get('vcodec')}"
             )
-            arquivo_fallback = converter_para_h264_compativel(arquivo, info)
+            candidato_fallback = converter_para_h264_compativel(arquivo, info)
             validar_arquivo_midia(
-                arquivo_fallback,
+                candidato_fallback,
                 MAX_OUTPUT_FILE_BYTES,
                 fase="fallback_h264",
             )
+            arquivo_fallback = candidato_fallback
 
-            with open(arquivo_fallback, "rb") as f:
-                mensagem = bot.send_video(
-                    chat_id,
-                    f,
-                    caption="👉 Download concluído! Aqui está seu vídeo 👊",
-                )
+            mensagem = _enviar_video_local_telegram(chat_id, arquivo_fallback)
 
             logger.info(
                 "[SEND_VIDEO] Fallback H.264 enviado com sucesso | "
@@ -2335,12 +2528,22 @@ def enviar_arquivo_com_fallback(chat_id, arquivo):
             registrar_sucesso_componente("Processamento")
             return True, telegram_file_id, telegram_media_type
         except Exception as e_h264:
+            if isinstance(e_h264, OSError):
+                raise FalhaComponenteDownload(
+                    "Armazenamento", e_h264
+                ) from e_h264
+            classificacao_h264 = classificar_erro_envio_arquivo(e_h264)
             logger.warning(
                 "[SEND_VIDEO] Fallback H.264 também falhou. "
+                f"classificacao={classificacao_h264} "
                 f"erro={sanitizar_erro_log(e_h264)}"
             )
-
-    alvo_documento = arquivo_fallback if arquivo_fallback and os.path.exists(arquivo_fallback) else arquivo
+            if arquivo_fallback is not None:
+                if classificacao_h264 != "formato_incompativel":
+                    raise FalhaComponenteDownload(
+                        "Telegram", e_h264
+                    ) from e_h264
+                alvo_documento = arquivo_fallback
 
     try:
         with open(alvo_documento, "rb") as f:
