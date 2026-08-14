@@ -4753,6 +4753,7 @@ def inicializar_metricas_diarias():
                     "downloads_total": gratuitos_existentes,
                     "downloads_gratuitos": gratuitos_existentes,
                     "downloads_vips": 0,
+                    "downloads_admin_teste": 0,
                     "downloads_cache_url": 0,
                     "downloads_cache_midia": 0,
                     "downloads_upload": 0,
@@ -4771,7 +4772,12 @@ def inicializar_metricas_diarias():
         logger.error(f"[METRICAS_INIT] erro={sanitizar_erro_log(e)}")
 
 
-def registrar_download_diario(vip_status, tipo_entrega="upload", bytes_upload=0):
+def registrar_download_diario(
+    vip_status,
+    tipo_entrega="upload",
+    bytes_upload=0,
+    admin_status=False,
+):
     """Registra o download e sua forma de entrega na mesma escrita diária."""
     try:
         hoje = hoje_str()
@@ -4797,11 +4803,12 @@ def registrar_download_diario(vip_status, tipo_entrega="upload", bytes_upload=0)
         except (TypeError, ValueError):
             bytes_upload = 0
 
-        incrementos = {
-            "downloads_total": 1,
-            campo_tipo: 1,
-            campo_entrega: 1,
-        }
+        incrementos = {campo_entrega: 1}
+        if admin_status:
+            incrementos["downloads_admin_teste"] = 1
+        else:
+            incrementos["downloads_total"] = 1
+            incrementos[campo_tipo] = 1
         if tipo_entrega == "upload":
             incrementos["bytes_upload_telegram"] = bytes_upload
 
@@ -4822,7 +4829,8 @@ def registrar_download_diario(vip_status, tipo_entrega="upload", bytes_upload=0)
         registrar_sucesso_componente("MongoDB")
     except Exception as e:
         logger.error(
-            f"[METRICAS_DOWNLOAD] vip={vip_status} tipo={tipo_entrega} "
+            f"[METRICAS_DOWNLOAD] vip={vip_status} admin={admin_status} "
+            f"tipo={tipo_entrega} "
             f"bytes_upload={bytes_upload} "
             f"erro={sanitizar_erro_log(e)}"
         )
@@ -6470,6 +6478,9 @@ def painel_admin(message):
         downloads_totais_hoje = int(metricas_hoje.get("downloads_total", 0) or 0)
         downloads_gratuitos_hoje = int(metricas_hoje.get("downloads_gratuitos", 0) or 0)
         downloads_vips_hoje = int(metricas_hoje.get("downloads_vips", 0) or 0)
+        downloads_admin_hoje = int(
+            metricas_hoje.get("downloads_admin_teste", 0) or 0
+        )
         cache_url_hoje = int(metricas_hoje.get("downloads_cache_url", 0) or 0)
         cache_midia_hoje = int(metricas_hoje.get("downloads_cache_midia", 0) or 0)
         uploads_hoje = int(metricas_hoje.get("downloads_upload", 0) or 0)
@@ -6478,16 +6489,19 @@ def painel_admin(message):
         )
         cache_total_hoje = cache_url_hoje + cache_midia_hoje
         entregas_medidas_hoje = cache_total_hoje + uploads_hoje
+        entregas_operacionais_hoje = (
+            downloads_totais_hoje + downloads_admin_hoje
+        )
         taxa_cache_hoje = (
             cache_total_hoje * 100 / entregas_medidas_hoje
             if entregas_medidas_hoje > 0
             else 0.0
         )
         cobertura_metricas = ""
-        if entregas_medidas_hoje != downloads_totais_hoje:
+        if entregas_medidas_hoje != entregas_operacionais_hoje:
             cobertura_metricas = (
                 f"\n📊 Entregas medidas: `{entregas_medidas_hoje}` de "
-                f"`{downloads_totais_hoje}`"
+                f"`{entregas_operacionais_hoje}`"
             )
 
         comprovantes_em_analise = pedidos_col.count_documents({
@@ -6499,9 +6513,10 @@ def painel_admin(message):
             "⚙️ *Painel Admin*\n\n"
             f"👥 Usuários: `{total_users}`\n"
             f"💎 VIPs: `{vips_ativos}`\n"
-            f"📥 Downloads hoje: `{downloads_totais_hoje}`\n"
+            f"📥 Downloads de usuários hoje: `{downloads_totais_hoje}`\n"
             f"   ├ 👤 Gratuitos: `{downloads_gratuitos_hoje}`\n"
             f"   └ 💎 VIPs: `{downloads_vips_hoje}`\n"
+            f"🧪 Testes do administrador: `{downloads_admin_hoje}`\n"
             f"♻️ Cache hoje: `{cache_total_hoje}` (`{taxa_cache_hoje:.1f}%`)\n"
             f"   ├ 🔗 Por URL: `{cache_url_hoje}`\n"
             f"   └ 🎞️ Por mídia: `{cache_midia_hoje}`\n"
@@ -7598,7 +7613,11 @@ def _processar_download(message, url, status_msg, reserva_download=None):
                 else None
             )
             if tipo_cache_url:
-                registrar_download_diario(vip_status, tipo_entrega="cache_url")
+                registrar_download_diario(
+                    vip_status,
+                    tipo_entrega="cache_url",
+                    admin_status=message.from_user.id == ADMIN_ID,
+                )
                 if reserva_download:
                     confirmar_download_gratis(
                         reserva_download,
@@ -7653,7 +7672,11 @@ def _processar_download(message, url, status_msg, reserva_download=None):
                         url_cache_key=url_cache_key,
                         url_normalizada=url_normalizada,
                     )
-                    registrar_download_diario(vip_status, tipo_entrega="cache_midia")
+                    registrar_download_diario(
+                        vip_status,
+                        tipo_entrega="cache_midia",
+                        admin_status=message.from_user.id == ADMIN_ID,
+                    )
                     if reserva_download:
                         confirmar_download_gratis(
                             reserva_download,
@@ -7734,6 +7757,7 @@ def _processar_download(message, url, status_msg, reserva_download=None):
                     vip_status,
                     tipo_entrega="upload",
                     bytes_upload=bytes_upload,
+                    admin_status=message.from_user.id == ADMIN_ID,
                 )
                 if reserva_download:
                     confirmar_download_gratis(
@@ -7798,7 +7822,11 @@ def _processar_download(message, url, status_msg, reserva_download=None):
             else None
         )
         if tipo_cache_url:
-            registrar_download_diario(vip_status, tipo_entrega="cache_url")
+            registrar_download_diario(
+                vip_status,
+                tipo_entrega="cache_url",
+                admin_status=message.from_user.id == ADMIN_ID,
+            )
             if reserva_download:
                 confirmar_download_gratis(
                     reserva_download,
@@ -7868,7 +7896,11 @@ def _processar_download(message, url, status_msg, reserva_download=None):
                 url_cache_key=url_cache_key,
                 url_normalizada=url_normalizada,
             )
-            registrar_download_diario(vip_status, tipo_entrega="cache_midia")
+            registrar_download_diario(
+                vip_status,
+                tipo_entrega="cache_midia",
+                admin_status=message.from_user.id == ADMIN_ID,
+            )
             if reserva_download:
                 confirmar_download_gratis(
                     reserva_download,
@@ -7995,6 +8027,7 @@ def _processar_download(message, url, status_msg, reserva_download=None):
             vip_status,
             tipo_entrega="upload",
             bytes_upload=bytes_upload,
+            admin_status=message.from_user.id == ADMIN_ID,
         )
         if reserva_download:
             confirmar_download_gratis(
