@@ -211,7 +211,7 @@ MONITOR_SUCCESS_LOG_INTERVAL_SECONDS = 900
 MEDIA_PROFILE_VERSION = (
     f"720x1280_30fps_h264_crf{VIDEO_CRF}_audio{AUDIO_BITRATE}_sem_marca_v2"
 )
-INSTAGRAM_AUDIO_CACHE_VERSION = "instagram_audio_v1"
+INSTAGRAM_AUDIO_CACHE_VERSION = "instagram_audio_v2"
 
 INSTAGRAM_COOKIES_TEXT = os.environ.get("INSTAGRAM_COOKIES_TEXT", "")
 TIKTOK_COOKIES_TEXT = os.environ.get("TIKTOK_COOKIES_TEXT", "")
@@ -4174,12 +4174,14 @@ def arquivo_possui_audio(info_midia):
 
 
 def extrair_info_instagram_com_fallback(url):
-    """Tenta com cookies e repete anonimamente para Reels públicos."""
+    """Tenta com cookies e repete de verdade sem eles quando faltar áudio."""
     tentativas = [True]
-    if INSTAGRAM_COOKIES_TEXT.strip():
+    tem_cookies = bool(INSTAGRAM_COOKIES_TEXT.strip())
+    if tem_cookies:
         tentativas.append(False)
 
     ultimo_erro = None
+    primeiro_sucesso = None
     for usar_cookies in tentativas:
         try:
             logger.info(
@@ -4189,6 +4191,24 @@ def extrair_info_instagram_com_fallback(url):
             opts = montar_info_opts(is_instagram=True, usar_cookies=usar_cookies)
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=False)
+
+            audio_disponivel = info_instagram_indica_audio(info)
+            if primeiro_sucesso is None:
+                primeiro_sucesso = (info, usar_cookies)
+
+            if audio_disponivel is True:
+                return info, usar_cookies
+
+            if usar_cookies and tem_cookies:
+                logger.warning(
+                    "[INSTAGRAM_INFO_SEM_AUDIO] "
+                    f"usar_cookies=True audio_disponivel={audio_disponivel} "
+                    "nova_consulta_sem_cookies=True"
+                )
+                continue
+
+            if primeiro_sucesso is not None:
+                return primeiro_sucesso
             return info, usar_cookies
         except FalhaComponenteDownload:
             raise
@@ -4198,9 +4218,18 @@ def extrair_info_instagram_com_fallback(url):
                 f"[INSTAGRAM_INFO_FALHA] usar_cookies={usar_cookies} "
                 f"url_ref={referencia_url_log(url)} erro={sanitizar_erro_log(e)}"
             )
+            if not usar_cookies and primeiro_sucesso is not None:
+                logger.warning(
+                    "[INSTAGRAM_INFO_FALLBACK] "
+                    "consulta_sem_cookies_falhou=True "
+                    "preservando_resposta_com_cookies=True"
+                )
+                return primeiro_sucesso
             if not usar_cookies or not erro_instagram_permite_fallback(e):
                 raise
 
+    if primeiro_sucesso is not None:
+        return primeiro_sucesso
     raise ultimo_erro or Exception("Falha ao consultar o Instagram")
 
 
