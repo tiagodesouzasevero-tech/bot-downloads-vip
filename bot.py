@@ -271,7 +271,13 @@ DOWNLOAD_WORKER_STATE = {
     "active_has_download_reservation": False,
 }
 COMPONENT_MONITOR_LOCK = Lock()
-COMPONENTES_PLATAFORMA = ("TikTok", "Instagram", "Pinterest", "RedNote")
+COMPONENTES_PLATAFORMA = (
+    "TikTok",
+    "Instagram",
+    "Pinterest",
+    "RedNote",
+    "Facebook Reels",
+)
 COMPONENTES_INTERNOS = (
     "Telegram",
     "Processamento",
@@ -772,12 +778,12 @@ def hostname_permitido(hostname, dominio_raiz):
     return hostname == dominio_raiz or hostname.endswith("." + dominio_raiz)
 
 
-def detectar_plataforma_url(url):
-    """Classifica apenas hosts oficiais para impedir URLs arbitrárias/SSRF."""
+def eh_url_facebook_reel_ou_compartilhada(url):
+    """Aceita somente Reels individuais e atalhos próprios de compartilhamento."""
     try:
-        parsed = urlparse(url)
+        parsed = urlparse(str(url or "").strip())
     except Exception:
-        return False, False, False, False
+        return False
 
     if (
         parsed.scheme not in ("http", "https")
@@ -785,13 +791,55 @@ def detectar_plataforma_url(url):
         or parsed.username
         or parsed.password
     ):
-        return False, False, False, False
+        return False
 
     try:
         if parsed.port not in (None, 80, 443):
-            return False, False, False, False
+            return False
     except ValueError:
-        return False, False, False, False
+        return False
+
+    host = parsed.hostname.lower().rstrip(".")
+    path = re.sub(r"/{2,}", "/", parsed.path or "/")
+    hosts_facebook = {
+        "facebook.com",
+        "www.facebook.com",
+        "m.facebook.com",
+        "mbasic.facebook.com",
+        "web.facebook.com",
+    }
+
+    if host in {"fb.watch", "www.fb.watch"}:
+        return bool(path.strip("/"))
+    if host not in hosts_facebook:
+        return False
+
+    return bool(
+        re.fullmatch(r"/(?:reel|reels)/[^/]+/?", path, flags=re.IGNORECASE)
+        or re.fullmatch(r"/share/r/[^/]+/?", path, flags=re.IGNORECASE)
+    )
+
+
+def detectar_plataforma_url(url):
+    """Classifica apenas hosts oficiais para impedir URLs arbitrárias/SSRF."""
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False, False, False, False, False
+
+    if (
+        parsed.scheme not in ("http", "https")
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+    ):
+        return False, False, False, False, False
+
+    try:
+        if parsed.port not in (None, 80, 443):
+            return False, False, False, False, False
+    except ValueError:
+        return False, False, False, False, False
 
     host = parsed.hostname.lower().rstrip(".")
     is_pinterest = hostname_permitido(host, "pinterest.com") or host == "pin.it"
@@ -817,7 +865,14 @@ def detectar_plataforma_url(url):
         "rednote.com",
         "www.rednote.com",
     }
-    return is_pinterest, is_tiktok, is_instagram, is_rednote
+    is_facebook_reel = eh_url_facebook_reel_ou_compartilhada(url)
+    return (
+        is_pinterest,
+        is_tiktok,
+        is_instagram,
+        is_rednote,
+        is_facebook_reel,
+    )
 
 
 def resolver_url_compartilhada(url):
@@ -835,8 +890,15 @@ def resolver_url_compartilhada(url):
         "www.instagr.am",
         "xhslink.com",
         "www.xhslink.com",
+        "fb.watch",
+        "www.fb.watch",
     }
-    if host not in hosts_curtos:
+    caminho = (urlparse(url).path or "").lower()
+    compartilhamento_facebook = (
+        flags_originais[4]
+        and bool(re.fullmatch(r"/share/r/[^/]+/?", caminho))
+    )
+    if host not in hosts_curtos and not compartilhamento_facebook:
         if not validar_url_http_publica(url):
             raise RuntimeError("URL_DESTINO_NAO_PUBLICO")
         return url
@@ -866,6 +928,35 @@ def normalizar_url_instagram(url):
     if tipo in ("reel", "reels"):
         tipo = "reel"
     return f"https://www.instagram.com/{tipo}/{match.group(2)}/"
+
+
+def normalizar_url_facebook_reel(url):
+    """Remove rastreamento sem transformar um Reel em outro tipo de link."""
+    try:
+        parsed = urlparse(str(url or "").strip())
+        host = (parsed.hostname or "").lower().rstrip(".")
+        if not eh_url_facebook_reel_ou_compartilhada(url):
+            raise RuntimeError("FACEBOOK_REELS_SOMENTE")
+
+        netloc = (
+            "fb.watch"
+            if host in {"fb.watch", "www.fb.watch"}
+            else "www.facebook.com"
+        )
+        path = re.sub(r"/{2,}", "/", parsed.path or "/")
+        if not path.endswith("/"):
+            path += "/"
+        return parsed._replace(
+            scheme="https",
+            netloc=netloc,
+            path=path,
+            query="",
+            fragment="",
+        ).geturl()
+    except RuntimeError:
+        raise
+    except Exception as e:
+        raise RuntimeError("FACEBOOK_REELS_SOMENTE") from e
 
 
 def cleanup_prefix(prefix):
@@ -1590,6 +1681,9 @@ def normalizar_plataforma_monitoramento(plataforma):
         "instagram": "Instagram",
         "pinterest": "Pinterest",
         "rednote": "RedNote",
+        "facebook": "Facebook Reels",
+        "facebook reel": "Facebook Reels",
+        "facebook reels": "Facebook Reels",
     }
     return mapa.get(str(plataforma or "").strip().lower())
 
@@ -2959,7 +3053,13 @@ def detectar_plataforma(url):
     return detectar_plataforma_url(url)
 
 
-def nome_plataforma(is_pinterest, is_tiktok, is_instagram, is_rednote):
+def nome_plataforma(
+    is_pinterest,
+    is_tiktok,
+    is_instagram,
+    is_rednote,
+    is_facebook_reel,
+):
     if is_pinterest:
         return "Pinterest"
     if is_tiktok:
@@ -2968,6 +3068,8 @@ def nome_plataforma(is_pinterest, is_tiktok, is_instagram, is_rednote):
         return "Instagram"
     if is_rednote:
         return "RedNote"
+    if is_facebook_reel:
+        return "Facebook Reels"
     return "Desconhecida"
 
 
@@ -4046,6 +4148,7 @@ def montar_info_opts(
     usar_cookies=True,
     is_tiktok=False,
     tiktok_extractor_args=None,
+    is_facebook_reel=False,
 ):
     opts = {
         "quiet": True,
@@ -4074,6 +4177,11 @@ def montar_info_opts(
             opts["cookiefile"] = get_tiktok_cookiefile()
         if tiktok_extractor_args:
             opts["extractor_args"] = tiktok_extractor_args
+    elif is_facebook_reel:
+        opts["http_headers"] = {
+            **DEFAULT_HEADERS,
+            "Referer": "https://www.facebook.com/",
+        }
 
     return opts
 
@@ -4085,6 +4193,7 @@ def montar_download_opts(
     usar_cookies=True,
     is_tiktok=False,
     tiktok_extractor_args=None,
+    is_facebook_reel=False,
 ):
     inicio_download = time.monotonic()
 
@@ -4136,6 +4245,13 @@ def montar_download_opts(
             opts["cookiefile"] = get_tiktok_cookiefile()
         if tiktok_extractor_args:
             opts["extractor_args"] = tiktok_extractor_args
+    elif is_facebook_reel:
+        opts["http_headers"] = {
+            **DEFAULT_HEADERS,
+            "Referer": "https://www.facebook.com/",
+        }
+        opts["format_sort"] = ["vcodec:h264", "acodec:aac"]
+        opts["extractor_retries"] = 2
 
     return opts
 
@@ -4153,7 +4269,7 @@ def erro_instagram_permite_fallback(erro):
     return any(sinal in texto for sinal in sinais)
 
 
-def info_instagram_indica_audio(info):
+def info_plataforma_indica_audio(info):
     """Retorna True/False quando os metadados permitem confirmar o áudio.
 
     None significa que o extrator não informou codecs suficientes. Nesse caso,
@@ -4233,7 +4349,7 @@ def extrair_info_instagram_com_fallback(url):
             with ydl_class(opts) as ydl:
                 info = ydl.extract_info(url, download=False)
 
-            audio_disponivel = info_instagram_indica_audio(info)
+            audio_disponivel = info_plataforma_indica_audio(info)
             if primeiro_sucesso is None:
                 primeiro_sucesso = (info, usar_cookies)
 
@@ -4494,6 +4610,33 @@ def mapear_erro_download(err_text, plataforma="geral"):
         if "timed out" in err or "timeout" in err:
             return "❌ O TikTok demorou para responder. Tente novamente."
         return "❌ Não consegui baixar esse link do TikTok agora."
+
+    if plataforma in ("facebook", "facebook_reels"):
+        if (
+            "facebook_reels_somente" in err
+            or "redirecionamento_fora_da_plataforma" in err
+            or "unsupported url" in err
+        ):
+            return (
+                "❌ Envie somente o link público de um Facebook Reel. "
+                "Vídeos comuns, lives, grupos e conteúdos privados não são "
+                "suportados."
+            )
+        if "facebook_audio_ausente_no_arquivo" in err:
+            return (
+                "❌ O Facebook não forneceu uma versão completa com áudio "
+                "deste Reel. Tente novamente em alguns instantes."
+            )
+        if "private" in err or "login required" in err:
+            return "❌ Esse Facebook Reel é privado ou exige login."
+        if "403" in err or "429" in err:
+            return (
+                "❌ O Facebook bloqueou temporariamente esse Reel. "
+                "Aguarde alguns instantes e tente novamente."
+            )
+        if "timed out" in err or "timeout" in err:
+            return "❌ O Facebook demorou para responder. Tente novamente."
+        return "❌ Não consegui baixar esse Facebook Reel público agora."
 
     texto_erro = "❌ Erro no link ou formato."
     if "unsupported url" in err:
@@ -5563,7 +5706,7 @@ def mostrar_planos_chat(chat_id, user_id):
         "Escolha o plano ideal para baixar sem limite diário.\n\n"
         "✅ Sem limite diário\n"
         "✅ Prioridade no processamento\n"
-        "✅ Uso liberado para TikTok, Pinterest, Instagram e RedNote\n"
+        "✅ Uso liberado para TikTok, Pinterest, Instagram, Facebook Reels e RedNote\n"
         "✅ Pagamento exclusivamente via Pix\n"
         "✅ Liberação após conferência do pagamento\n\n"
         f"Sua ID: `{user_id}`"
@@ -6006,6 +6149,7 @@ def montar_relatorio_diagnostico():
         if TIKTOK_COOKIES_TEXT.strip()
         else "ℹ️ Cookies do TikTok: não configurados (opcional)"
     )
+    linhas.append("✅ Facebook Reels: links públicos, sem cookies")
 
     resumo_monitor = obter_resumo_monitoramento()
     alertas_ativos = [
@@ -6805,7 +6949,7 @@ def start(message):
 
     texto = (
         "📥 *Baixar Vídeos HD*\n\n"
-        "Baixe vídeos do TikTok, Pinterest, Instagram e RedNote.\n\n"
+        "Baixe vídeos do TikTok, Pinterest, Instagram, Facebook Reels e RedNote.\n\n"
         "• Qualidade: até 720×1280\n"
         f"• Duração máxima: {MAX_DURATION_SECONDS} segundos\n"
         f"• ID de usuário: `{message.from_user.id}`\n\n"
@@ -7749,7 +7893,13 @@ def formatos_capados_gerais():
     ]
 
 
-def formatos_por_plataforma(is_tiktok=False, is_instagram=False, is_pinterest=False, is_rednote=False):
+def formatos_por_plataforma(
+    is_tiktok=False,
+    is_instagram=False,
+    is_pinterest=False,
+    is_rednote=False,
+    is_facebook_reel=False,
+):
     if is_instagram:
         return [
             "best[ext=mp4][vcodec!=none][acodec!=none][width<=720][height<=1280][fps<=30]",
@@ -7783,6 +7933,17 @@ def formatos_por_plataforma(is_tiktok=False, is_instagram=False, is_pinterest=Fa
             "best[ext=mp4]/best"
         ]
 
+    if is_facebook_reel:
+        return [
+            "best[ext=mp4][vcodec!=none][acodec!=none][width<=720][height<=1280][fps<=30]",
+            "best[ext=mp4][vcodec!=none][acodec!=none][width<=720][height<=1280]",
+            "bestvideo[ext=mp4][width<=720][height<=1280][fps<=30]+bestaudio[ext=m4a]/best[ext=mp4][width<=720][height<=1280][fps<=30]",
+            "bestvideo[width<=720][height<=1280][fps<=30]+bestaudio/best[width<=720][height<=1280][fps<=30]",
+            "best[ext=mp4][vcodec!=none][acodec!=none]",
+            "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]",
+            "bestvideo+bestaudio/best",
+        ]
+
     return formatos_capados_gerais()
 
 
@@ -7814,19 +7975,42 @@ def _processar_download(message, url, status_msg, reserva_download=None):
             url = resolver_url_compartilhada(url)
         except Exception as e:
             raise FalhaComponenteDownload(plataforma, e) from e
-        is_pinterest, is_tiktok, is_instagram, is_rednote = detectar_plataforma(url)
-        plataforma = nome_plataforma(is_pinterest, is_tiktok, is_instagram, is_rednote)
+        (
+            is_pinterest,
+            is_tiktok,
+            is_instagram,
+            is_rednote,
+            is_facebook_reel,
+        ) = detectar_plataforma(url)
+        plataforma = nome_plataforma(
+            is_pinterest,
+            is_tiktok,
+            is_instagram,
+            is_rednote,
+            is_facebook_reel,
+        )
 
         if is_instagram:
             url = normalizar_url_instagram(url)
+        elif is_facebook_reel:
+            url = normalizar_url_facebook_reel(url)
 
         logger.info(
             f"[DOWNLOAD_INICIO] user_ref={referencia_usuario_log(message.from_user.id)} "
             f"plataforma={plataforma} url_ref={referencia_url_log(url)}"
         )
 
-        if not (is_pinterest or is_tiktok or is_instagram or is_rednote):
-            texto_nao_reconhecido = "❌ Link não reconhecido. Envie um link do TikTok, Pinterest, Instagram ou RedNote."
+        if not (
+            is_pinterest
+            or is_tiktok
+            or is_instagram
+            or is_rednote
+            or is_facebook_reel
+        ):
+            texto_nao_reconhecido = (
+                "❌ Link não reconhecido. Envie um link do TikTok, Pinterest, "
+                "Instagram, Facebook Reels ou RedNote."
+            )
             if status_msg:
                 safe_edit_message(message.chat.id, status_msg.message_id, texto_nao_reconhecido)
             else:
@@ -8096,6 +8280,11 @@ def _processar_download(message, url, status_msg, reserva_download=None):
                     usar_cookies_plataforma,
                     tiktok_extractor_args_usados,
                 ) = extrair_info_tiktok_com_fallback(url)
+            elif is_facebook_reel:
+                with yt_dlp.YoutubeDL(
+                    montar_info_opts(is_facebook_reel=True)
+                ) as ydl:
+                    info = ydl.extract_info(url, download=False)
             else:
                 with yt_dlp.YoutubeDL(montar_info_opts()) as ydl:
                     info = ydl.extract_info(url, download=False)
@@ -8106,10 +8295,18 @@ def _processar_download(message, url, status_msg, reserva_download=None):
 
         audio_instagram_esperado = None
         if is_instagram:
-            audio_instagram_esperado = info_instagram_indica_audio(info)
+            audio_instagram_esperado = info_plataforma_indica_audio(info)
             logger.info(
                 "[INSTAGRAM_AUDIO_INFO] "
                 f"audio_disponivel={audio_instagram_esperado}"
+            )
+
+        audio_facebook_esperado = None
+        if is_facebook_reel:
+            audio_facebook_esperado = info_plataforma_indica_audio(info)
+            logger.info(
+                "[FACEBOOK_REELS_AUDIO_INFO] "
+                f"audio_disponivel={audio_facebook_esperado}"
             )
 
         duracao = info.get("duration")
@@ -8174,6 +8371,7 @@ def _processar_download(message, url, status_msg, reserva_download=None):
             is_instagram=is_instagram,
             is_pinterest=is_pinterest,
             is_rednote=is_rednote,
+            is_facebook_reel=is_facebook_reel,
         )
         baixou = False
         ultimo_erro = None
@@ -8197,6 +8395,7 @@ def _processar_download(message, url, status_msg, reserva_download=None):
                 usar_cookies=usar_cookies,
                 is_tiktok=is_tiktok,
                 tiktok_extractor_args=tiktok_extractor_args_usados,
+                is_facebook_reel=is_facebook_reel,
             )
 
             for fmt in formatos:
@@ -8222,6 +8421,21 @@ def _processar_download(message, url, status_msg, reserva_download=None):
                                 logger.warning(
                                     "[INSTAGRAM_AUDIO_RETRY] "
                                     f"audio_esperado={audio_instagram_esperado} "
+                                    f"formato={fmt} "
+                                    f"arquivo_ref={referencia_arquivo_log(arquivo_baixado)}"
+                                )
+                                cleanup_prefix(prefix)
+                                continue
+                        if is_facebook_reel and audio_facebook_esperado is not False:
+                            info_arquivo_baixado = obter_info_midia(arquivo_baixado)
+                            if not arquivo_possui_audio(info_arquivo_baixado):
+                                ultimo_erro = (
+                                    "FACEBOOK_AUDIO_AUSENTE_NO_ARQUIVO "
+                                    f"metadata={audio_facebook_esperado}"
+                                )
+                                logger.warning(
+                                    "[FACEBOOK_REELS_AUDIO_RETRY] "
+                                    f"audio_esperado={audio_facebook_esperado} "
                                     f"formato={fmt} "
                                     f"arquivo_ref={referencia_arquivo_log(arquivo_baixado)}"
                                 )
@@ -8339,6 +8553,8 @@ def _processar_download(message, url, status_msg, reserva_download=None):
             plataforma_erro = "instagram"
         elif "tiktok.com" in url_erro:
             plataforma_erro = "tiktok"
+        elif "facebook.com" in url_erro or "fb.watch" in url_erro:
+            plataforma_erro = "facebook"
         else:
             plataforma_erro = "geral"
         texto_erro = mapear_falha_componente_download(
@@ -8362,6 +8578,8 @@ def _processar_download(message, url, status_msg, reserva_download=None):
             plataforma_erro = "instagram"
         elif "tiktok.com" in url_erro:
             plataforma_erro = "tiktok"
+        elif "facebook.com" in url_erro or "fb.watch" in url_erro:
+            plataforma_erro = "facebook"
         else:
             plataforma_erro = "geral"
         texto_erro = mapear_erro_download(str(e), plataforma=plataforma_erro)
@@ -8837,7 +9055,7 @@ def handle_download(message):
         safe_reply_to(
             message,
             "❌ Link não reconhecido. Envie um link do TikTok, Pinterest, "
-            "Instagram ou RedNote.",
+            "Instagram, Facebook Reels ou RedNote.",
         )
         return
 
@@ -9222,6 +9440,11 @@ if __name__ == "__main__":
         "[INSTAGRAM_AUDIO_CONFIG] validacao=True "
         f"cache_version={INSTAGRAM_AUDIO_CACHE_VERSION} "
         "prefer_h264=True fallback_com_audio=True"
+    )
+    logger.info(
+        "[FACEBOOK_REELS_CONFIG] publico_somente=True cookies=False "
+        "max_duration_compartilhado=True prefer_h264=True "
+        "validacao_audio=True"
     )
     if TIKTOK_IMPERSONATION_DISPONIVEL:
         logger.info(f"[TIKTOK_DEPENDENCIAS] curl_cffi={CURL_CFFI_VERSION}")
