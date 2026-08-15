@@ -8992,7 +8992,7 @@ if __name__ == "__main__":
         try:
             atualizar_estado_bot("polling")
             logger.info("Iniciando bot.infinity_polling...")
-            bot.infinity_polling(skip_pending=False, timeout=20, long_polling_timeout=20)
+            bot.infinity_polling(skip_pending=False, timeout=20, long_polling_timeout=50)
         except Exception as e:
             if SHUTDOWN_EVENT.is_set():
                 break
