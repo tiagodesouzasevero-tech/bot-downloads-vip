@@ -211,7 +211,7 @@ MONITOR_SUCCESS_LOG_INTERVAL_SECONDS = 900
 MEDIA_PROFILE_VERSION = (
     f"720x1280_30fps_h264_crf{VIDEO_CRF}_audio{AUDIO_BITRATE}_sem_marca_v2"
 )
-INSTAGRAM_AUDIO_CACHE_VERSION = "instagram_audio_v2"
+INSTAGRAM_AUDIO_CACHE_VERSION = "instagram_audio_v3"
 
 INSTAGRAM_COOKIES_TEXT = os.environ.get("INSTAGRAM_COOKIES_TEXT", "")
 TIKTOK_COOKIES_TEXT = os.environ.get("TIKTOK_COOKIES_TEXT", "")
@@ -4173,23 +4173,45 @@ def arquivo_possui_audio(info_midia):
     return acodec not in ("", "none", "null", "unknown")
 
 
+class InstagramYoutubeDLSemImpersonacao(yt_dlp.YoutubeDL):
+    """Força o extrator do Instagram a consultar a página pública comum."""
+
+    def _impersonate_target_available(self, target):
+        return False
+
+
 def extrair_info_instagram_com_fallback(url):
-    """Tenta com cookies e repete de verdade sem eles quando faltar áudio."""
-    tentativas = [True]
+    """Tenta cookies, acesso anônimo e página pública sem impersonação."""
     tem_cookies = bool(INSTAGRAM_COOKIES_TEXT.strip())
+    tentativas = []
     if tem_cookies:
-        tentativas.append(False)
+        tentativas.append((True, False, "cookies"))
+    tentativas.append((False, False, "anonima"))
+    if CURL_CFFI_VERSION is not None:
+        tentativas.append((False, True, "publica_sem_impersonacao"))
 
     ultimo_erro = None
     primeiro_sucesso = None
-    for usar_cookies in tentativas:
+    for indice, (usar_cookies, sem_impersonacao, modo) in enumerate(tentativas):
+        proxima_tentativa = (
+            tentativas[indice + 1][2]
+            if indice + 1 < len(tentativas)
+            else None
+        )
         try:
             logger.info(
-                f"[INSTAGRAM_INFO] usar_cookies={usar_cookies} "
+                f"[INSTAGRAM_INFO] modo={modo} "
+                f"usar_cookies={usar_cookies} "
+                f"sem_impersonacao={sem_impersonacao} "
                 f"url_ref={referencia_url_log(url)}"
             )
             opts = montar_info_opts(is_instagram=True, usar_cookies=usar_cookies)
-            with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl_class = (
+                InstagramYoutubeDLSemImpersonacao
+                if sem_impersonacao
+                else yt_dlp.YoutubeDL
+            )
+            with ydl_class(opts) as ydl:
                 info = ydl.extract_info(url, download=False)
 
             audio_disponivel = info_instagram_indica_audio(info)
@@ -4199,11 +4221,11 @@ def extrair_info_instagram_com_fallback(url):
             if audio_disponivel is True:
                 return info, usar_cookies
 
-            if usar_cookies and tem_cookies:
+            if proxima_tentativa is not None:
                 logger.warning(
                     "[INSTAGRAM_INFO_SEM_AUDIO] "
-                    f"usar_cookies=True audio_disponivel={audio_disponivel} "
-                    "nova_consulta_sem_cookies=True"
+                    f"modo={modo} audio_disponivel={audio_disponivel} "
+                    f"proxima_tentativa={proxima_tentativa}"
                 )
                 continue
 
@@ -4215,18 +4237,29 @@ def extrair_info_instagram_com_fallback(url):
         except Exception as e:
             ultimo_erro = e
             logger.warning(
-                f"[INSTAGRAM_INFO_FALHA] usar_cookies={usar_cookies} "
+                f"[INSTAGRAM_INFO_FALHA] modo={modo} "
+                f"usar_cookies={usar_cookies} "
                 f"url_ref={referencia_url_log(url)} erro={sanitizar_erro_log(e)}"
             )
-            if not usar_cookies and primeiro_sucesso is not None:
+
+            if proxima_tentativa is not None:
+                if usar_cookies and not erro_instagram_permite_fallback(e):
+                    raise
                 logger.warning(
                     "[INSTAGRAM_INFO_FALLBACK] "
-                    "consulta_sem_cookies_falhou=True "
-                    "preservando_resposta_com_cookies=True"
+                    f"modo={modo} falhou=True "
+                    f"proxima_tentativa={proxima_tentativa}"
+                )
+                continue
+
+            if primeiro_sucesso is not None:
+                logger.warning(
+                    "[INSTAGRAM_INFO_FALLBACK] "
+                    f"modo={modo} falhou=True "
+                    "preservando_primeira_resposta=True"
                 )
                 return primeiro_sucesso
-            if not usar_cookies or not erro_instagram_permite_fallback(e):
-                raise
+            raise
 
     if primeiro_sucesso is not None:
         return primeiro_sucesso
