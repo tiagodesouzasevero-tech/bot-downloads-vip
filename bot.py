@@ -4089,6 +4089,9 @@ def montar_download_opts(
 
     if is_instagram:
         opts.pop("http_headers", None)
+        # Prefere uma origem já compatível com o Telegram. Se o Instagram
+        # não oferecer H.264/AAC, o yt-dlp mantém os formatos de fallback.
+        opts["format_sort"] = ["vcodec:h264", "acodec:aac"]
         if usar_cookies:
             cookiefile = get_instagram_cookiefile()
             if cookiefile:
