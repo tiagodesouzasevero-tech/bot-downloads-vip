@@ -211,7 +211,7 @@ MONITOR_SUCCESS_LOG_INTERVAL_SECONDS = 900
 MEDIA_PROFILE_VERSION = (
     f"720x1280_30fps_h264_crf{VIDEO_CRF}_audio{AUDIO_BITRATE}_sem_marca_v2"
 )
-INSTAGRAM_AUDIO_CACHE_VERSION = "instagram_audio_v3"
+INSTAGRAM_AUDIO_CACHE_VERSION = "instagram_audio_v4"
 
 INSTAGRAM_COOKIES_TEXT = os.environ.get("INSTAGRAM_COOKIES_TEXT", "")
 TIKTOK_COOKIES_TEXT = os.environ.get("TIKTOK_COOKIES_TEXT", "")
@@ -4025,6 +4025,7 @@ def montar_info_opts(
     is_instagram=False,
     is_pinterest=False,
     usar_cookies=True,
+    instagram_app_id=None,
     is_tiktok=False,
     tiktok_extractor_args=None,
 ):
@@ -4041,6 +4042,12 @@ def montar_info_opts(
     if is_instagram:
         # O extrator do yt-dlp configura os cabeçalhos e a impersonação.
         # Cabeçalhos manuais podem ficar incompatíveis quando o Instagram muda.
+        if instagram_app_id:
+            opts["extractor_args"] = {
+                "instagram": {
+                    "app_id": [instagram_app_id],
+                }
+            }
         if usar_cookies:
             cookiefile = get_instagram_cookiefile()
             if cookiefile:
@@ -4173,26 +4180,22 @@ def arquivo_possui_audio(info_midia):
     return acodec not in ("", "none", "null", "unknown")
 
 
-class InstagramYoutubeDLSemImpersonacao(yt_dlp.YoutubeDL):
-    """Força o extrator do Instagram a consultar a página pública comum."""
-
-    def _impersonate_target_available(self, target):
-        return False
-
-
 def extrair_info_instagram_com_fallback(url):
-    """Tenta cookies, acesso anônimo e página pública sem impersonação."""
+    """Tenta os modos web/iOS oficiais e preserva o acesso anônimo."""
     tem_cookies = bool(INSTAGRAM_COOKIES_TEXT.strip())
     tentativas = []
     if tem_cookies:
-        tentativas.append((True, False, "cookies"))
-    tentativas.append((False, False, "anonima"))
-    if CURL_CFFI_VERSION is not None:
-        tentativas.append((False, True, "publica_sem_impersonacao"))
+        tentativas.extend([
+            (True, None, "cookies_web"),
+            (True, "ios", "cookies_ios"),
+        ])
+    tentativas.append((False, None, "anonima_web"))
+    if not tem_cookies:
+        tentativas.append((False, "ios", "anonima_ios"))
 
     ultimo_erro = None
     primeiro_sucesso = None
-    for indice, (usar_cookies, sem_impersonacao, modo) in enumerate(tentativas):
+    for indice, (usar_cookies, instagram_app_id, modo) in enumerate(tentativas):
         proxima_tentativa = (
             tentativas[indice + 1][2]
             if indice + 1 < len(tentativas)
@@ -4202,16 +4205,15 @@ def extrair_info_instagram_com_fallback(url):
             logger.info(
                 f"[INSTAGRAM_INFO] modo={modo} "
                 f"usar_cookies={usar_cookies} "
-                f"sem_impersonacao={sem_impersonacao} "
+                f"app_id={instagram_app_id or 'web'} "
                 f"url_ref={referencia_url_log(url)}"
             )
-            opts = montar_info_opts(is_instagram=True, usar_cookies=usar_cookies)
-            ydl_class = (
-                InstagramYoutubeDLSemImpersonacao
-                if sem_impersonacao
-                else yt_dlp.YoutubeDL
+            opts = montar_info_opts(
+                is_instagram=True,
+                usar_cookies=usar_cookies,
+                instagram_app_id=instagram_app_id,
             )
-            with ydl_class(opts) as ydl:
+            with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=False)
 
             audio_disponivel = info_instagram_indica_audio(info)
@@ -9099,7 +9101,7 @@ if __name__ == "__main__":
     logger.info(
         "[INSTAGRAM_AUDIO_CONFIG] validacao=True "
         f"cache_version={INSTAGRAM_AUDIO_CACHE_VERSION} "
-        "prefer_h264=True fallback_com_audio=True"
+        "prefer_h264=True fallback_app_ios=True fallback_com_audio=True"
     )
     if TIKTOK_IMPERSONATION_DISPONIVEL:
         logger.info(f"[TIKTOK_DEPENDENCIAS] curl_cffi={CURL_CFFI_VERSION}")
