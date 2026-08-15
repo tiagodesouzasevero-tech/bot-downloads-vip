@@ -187,6 +187,10 @@ QUEUE_RECOVERY_DELAY_SECONDS = min(
 PIX_ORDER_EXPIRATION_HOURS = get_env_int(
     "PIX_ORDER_EXPIRATION_HOURS", 24, 1, 168
 )
+VIP_EXPIRATION_NOTICE_CHECK_SECONDS = get_env_int(
+    "VIP_EXPIRATION_NOTICE_CHECK_SECONDS", 3600, 300, 86400
+)
+VIP_EXPIRATION_NOTICE_INITIAL_DELAY_SECONDS = 60
 PIX_PENDING_PAGE_SIZE = 8
 TIKWM_REQUEST_TIMEOUT_SECONDS = get_env_int(
     "TIKWM_REQUEST_TIMEOUT_SECONDS", 12, 5, 30
@@ -211,7 +215,7 @@ MONITOR_SUCCESS_LOG_INTERVAL_SECONDS = 900
 MEDIA_PROFILE_VERSION = (
     f"720x1280_30fps_h264_crf{VIDEO_CRF}_audio{AUDIO_BITRATE}_sem_marca_v2"
 )
-INSTAGRAM_AUDIO_CACHE_VERSION = "instagram_audio_v4"
+INSTAGRAM_AUDIO_CACHE_VERSION = "instagram_audio_v3"
 
 INSTAGRAM_COOKIES_TEXT = os.environ.get("INSTAGRAM_COOKIES_TEXT", "")
 TIKTOK_COOKIES_TEXT = os.environ.get("TIKTOK_COOKIES_TEXT", "")
@@ -1021,12 +1025,16 @@ def informar_download_pausado_por_espaco(message, status_msg):
 def cleanup_download_dir_periodicamente(interval_minutes=60, max_age_hours=6):
     intervalo_segundos = max(300, int(interval_minutes * 60))
     proxima_limpeza = time.monotonic() + intervalo_segundos
+    proximo_aviso_vip = (
+        time.monotonic() + VIP_EXPIRATION_NOTICE_INITIAL_DELAY_SECONDS
+    )
     recuperar_fila_em = time.monotonic() + QUEUE_RECOVERY_DELAY_SECONDS
     recuperacao_fila_executada = False
     logger.info(
         f"[MAINTENANCE_LOOP] iniciado cleanup_minutes={interval_minutes} "
         f"max_age_hours={max_age_hours} "
         f"watchdog_seconds={WORKER_WATCHDOG_INTERVAL_SECONDS} "
+        f"vip_notice_check_seconds={VIP_EXPIRATION_NOTICE_CHECK_SECONDS} "
         f"queue_recovery_delay_seconds={QUEUE_RECOVERY_DELAY_SECONDS} "
         f"queue_recovery_ttl_hours={QUEUE_RECOVERY_TTL_HOURS} "
         "queue_recovery_contains_urls=False"
@@ -1053,7 +1061,18 @@ def cleanup_download_dir_periodicamente(interval_minutes=60, max_age_hours=6):
                 logger.warning(f"[CLEANUP_LOOP] erro={sanitizar_erro_log(e)}")
             proxima_limpeza = agora_monotonic + intervalo_segundos
 
-        proxima_atividade = proxima_limpeza
+        if agora_monotonic >= proximo_aviso_vip:
+            try:
+                notificar_vips_com_vencimento_proximo()
+            except Exception as e:
+                logger.warning(
+                    f"[VIP_EXPIRATION_NOTICE_LOOP] erro={sanitizar_erro_log(e)}"
+                )
+            proximo_aviso_vip = (
+                agora_monotonic + VIP_EXPIRATION_NOTICE_CHECK_SECONDS
+            )
+
+        proxima_atividade = min(proxima_limpeza, proximo_aviso_vip)
         if not recuperacao_fila_executada:
             proxima_atividade = min(proxima_atividade, recuperar_fila_em)
         espera = max(
@@ -4025,7 +4044,6 @@ def montar_info_opts(
     is_instagram=False,
     is_pinterest=False,
     usar_cookies=True,
-    instagram_app_id=None,
     is_tiktok=False,
     tiktok_extractor_args=None,
 ):
@@ -4042,12 +4060,6 @@ def montar_info_opts(
     if is_instagram:
         # O extrator do yt-dlp configura os cabeçalhos e a impersonação.
         # Cabeçalhos manuais podem ficar incompatíveis quando o Instagram muda.
-        if instagram_app_id:
-            opts["extractor_args"] = {
-                "instagram": {
-                    "app_id": [instagram_app_id],
-                }
-            }
         if usar_cookies:
             cookiefile = get_instagram_cookiefile()
             if cookiefile:
@@ -4180,22 +4192,26 @@ def arquivo_possui_audio(info_midia):
     return acodec not in ("", "none", "null", "unknown")
 
 
+class InstagramYoutubeDLSemImpersonacao(yt_dlp.YoutubeDL):
+    """Força o extrator do Instagram a consultar a página pública comum."""
+
+    def _impersonate_target_available(self, target):
+        return False
+
+
 def extrair_info_instagram_com_fallback(url):
-    """Tenta os modos web/iOS oficiais e preserva o acesso anônimo."""
+    """Tenta cookies, acesso anônimo e página pública sem impersonação."""
     tem_cookies = bool(INSTAGRAM_COOKIES_TEXT.strip())
     tentativas = []
     if tem_cookies:
-        tentativas.extend([
-            (True, None, "cookies_web"),
-            (True, "ios", "cookies_ios"),
-        ])
-    tentativas.append((False, None, "anonima_web"))
-    if not tem_cookies:
-        tentativas.append((False, "ios", "anonima_ios"))
+        tentativas.append((True, False, "cookies"))
+    tentativas.append((False, False, "anonima"))
+    if CURL_CFFI_VERSION is not None:
+        tentativas.append((False, True, "publica_sem_impersonacao"))
 
     ultimo_erro = None
     primeiro_sucesso = None
-    for indice, (usar_cookies, instagram_app_id, modo) in enumerate(tentativas):
+    for indice, (usar_cookies, sem_impersonacao, modo) in enumerate(tentativas):
         proxima_tentativa = (
             tentativas[indice + 1][2]
             if indice + 1 < len(tentativas)
@@ -4205,15 +4221,16 @@ def extrair_info_instagram_com_fallback(url):
             logger.info(
                 f"[INSTAGRAM_INFO] modo={modo} "
                 f"usar_cookies={usar_cookies} "
-                f"app_id={instagram_app_id or 'web'} "
+                f"sem_impersonacao={sem_impersonacao} "
                 f"url_ref={referencia_url_log(url)}"
             )
-            opts = montar_info_opts(
-                is_instagram=True,
-                usar_cookies=usar_cookies,
-                instagram_app_id=instagram_app_id,
+            opts = montar_info_opts(is_instagram=True, usar_cookies=usar_cookies)
+            ydl_class = (
+                InstagramYoutubeDLSemImpersonacao
+                if sem_impersonacao
+                else yt_dlp.YoutubeDL
             )
-            with yt_dlp.YoutubeDL(opts) as ydl:
+            with ydl_class(opts) as ydl:
                 info = ydl.extract_info(url, download=False)
 
             audio_disponivel = info_instagram_indica_audio(info)
@@ -5297,6 +5314,109 @@ def is_vip_user(user):
             f"[IS_VIP_USER] validade_invalida=True erro={sanitizar_erro_log(e)}"
         )
         return False
+
+
+def notificar_vips_com_vencimento_proximo():
+    """Envia um único lembrete no dia anterior ao vencimento do VIP."""
+    data_alvo = (
+        agora_tz().date() + timedelta(days=1)
+    ).strftime("%Y-%m-%d")
+    filtro_pendente = {
+        "vip_ate": data_alvo,
+        "vip_expiration_notice_for": {"$ne": data_alvo},
+    }
+    total_reservados = 0
+    total_enviados = 0
+    total_falhas = 0
+
+    candidatos = usuarios_col.find(
+        filtro_pendente,
+        {"_id": 1},
+    ).limit(500)
+
+    for candidato in candidatos:
+        user_id = str(candidato.get("_id") or "").strip()
+        if not user_id.isdigit():
+            total_falhas += 1
+            logger.warning("[VIP_EXPIRATION_NOTICE] user_ref=invalido status=ignorado")
+            continue
+
+        agora = agora_tz()
+        reservado = usuarios_col.find_one_and_update(
+            {
+                "_id": user_id,
+                "vip_ate": data_alvo,
+                "vip_expiration_notice_for": {"$ne": data_alvo},
+            },
+            {
+                "$set": {
+                    "vip_expiration_notice_for": data_alvo,
+                    "vip_expiration_notice_status": "reserved",
+                    "vip_expiration_notice_updated_at": agora,
+                }
+            },
+            return_document=ReturnDocument.AFTER,
+        )
+        if not reservado:
+            continue
+
+        total_reservados += 1
+        markup = types.InlineKeyboardMarkup(row_width=1)
+        markup.add(
+            types.InlineKeyboardButton(
+                "💠 Renovar VIP Mensal - R$ 10,00",
+                callback_data="pay_10.00",
+            ),
+            types.InlineKeyboardButton(
+                "💠 Renovar VIP Anual - R$ 79,90",
+                callback_data="pay_79.90",
+            ),
+        )
+        mensagem = (
+            "⚠️ *Seu acesso VIP termina amanhã*\n\n"
+            f"Válido até: *{formatar_validade_vip(data_alvo)}*\n\n"
+            "Renove para continuar com downloads sem limite diário e "
+            "prioridade no processamento."
+        )
+
+        enviado = safe_send_message(
+            int(user_id),
+            mensagem,
+            parse_mode="Markdown",
+            reply_markup=markup,
+        )
+        status = "sent" if enviado else "failed"
+        usuarios_col.update_one(
+            {
+                "_id": user_id,
+                "vip_expiration_notice_for": data_alvo,
+            },
+            {
+                "$set": {
+                    "vip_expiration_notice_status": status,
+                    "vip_expiration_notice_updated_at": agora_tz(),
+                }
+            },
+        )
+
+        if enviado:
+            total_enviados += 1
+        else:
+            total_falhas += 1
+
+    if total_reservados or total_falhas:
+        logger.info(
+            f"[VIP_EXPIRATION_NOTICE] data={data_alvo} "
+            f"reservados={total_reservados} enviados={total_enviados} "
+            f"falhas={total_falhas}"
+        )
+
+    return {
+        "data": data_alvo,
+        "reservados": total_reservados,
+        "enviados": total_enviados,
+        "falhas": total_falhas,
+    }
 
 
 # =========================================
@@ -9101,7 +9221,7 @@ if __name__ == "__main__":
     logger.info(
         "[INSTAGRAM_AUDIO_CONFIG] validacao=True "
         f"cache_version={INSTAGRAM_AUDIO_CACHE_VERSION} "
-        "prefer_h264=True fallback_app_ios=True fallback_com_audio=True"
+        "prefer_h264=True fallback_com_audio=True"
     )
     if TIKTOK_IMPERSONATION_DISPONIVEL:
         logger.info(f"[TIKTOK_DEPENDENCIAS] curl_cffi={CURL_CFFI_VERSION}")
