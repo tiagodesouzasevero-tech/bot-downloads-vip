@@ -211,6 +211,7 @@ MONITOR_SUCCESS_LOG_INTERVAL_SECONDS = 900
 MEDIA_PROFILE_VERSION = (
     f"720x1280_30fps_h264_crf{VIDEO_CRF}_audio{AUDIO_BITRATE}_sem_marca_v2"
 )
+INSTAGRAM_AUDIO_CACHE_VERSION = "instagram_audio_v1"
 
 INSTAGRAM_COOKIES_TEXT = os.environ.get("INSTAGRAM_COOKIES_TEXT", "")
 TIKTOK_COOKIES_TEXT = os.environ.get("TIKTOK_COOKIES_TEXT", "")
@@ -2597,6 +2598,13 @@ def enviar_arquivo_com_fallback(chat_id, arquivo):
         raise FalhaComponenteDownload("Telegram", e_doc) from e_doc
 
 
+def perfil_cache_plataforma(plataforma):
+    perfil = MEDIA_PROFILE_VERSION
+    if str(plataforma or "").strip().lower() == "instagram":
+        perfil = f"{perfil}|{INSTAGRAM_AUDIO_CACHE_VERSION}"
+    return perfil
+
+
 def montar_chave_cache_midia(plataforma, info, url):
     source_id = str(
         (info or {}).get("id")
@@ -2604,7 +2612,8 @@ def montar_chave_cache_midia(plataforma, info, url):
         or (info or {}).get("webpage_url")
         or url
     ).strip()
-    material = f"{MEDIA_PROFILE_VERSION}|source|{plataforma.lower()}|{source_id}"
+    perfil_cache = perfil_cache_plataforma(plataforma)
+    material = f"{perfil_cache}|source|{plataforma.lower()}|{source_id}"
     return hashlib.sha256(material.encode("utf-8")).hexdigest(), source_id
 
 
@@ -2650,7 +2659,8 @@ def normalizar_url_cache(url):
 
 def montar_chave_cache_url(plataforma, url):
     url_normalizada = normalizar_url_cache(url)
-    material = f"{MEDIA_PROFILE_VERSION}|url|{plataforma.lower()}|{url_normalizada}"
+    perfil_cache = perfil_cache_plataforma(plataforma)
+    material = f"{perfil_cache}|url|{plataforma.lower()}|{url_normalizada}"
     return hashlib.sha256(material.encode("utf-8")).hexdigest(), url_normalizada
 
 
@@ -4124,6 +4134,45 @@ def erro_instagram_permite_fallback(erro):
     return any(sinal in texto for sinal in sinais)
 
 
+def info_instagram_indica_audio(info):
+    """Retorna True/False quando os metadados permitem confirmar o áudio.
+
+    None significa que o extrator não informou codecs suficientes. Nesse caso,
+    o download é tratado de forma conservadora e um arquivo mudo é rejeitado.
+    """
+    if not isinstance(info, dict):
+        return None
+
+    itens = [info]
+    for campo in ("requested_formats", "requested_downloads", "formats"):
+        valor = info.get(campo)
+        if isinstance(valor, list):
+            itens.extend(item for item in valor if isinstance(item, dict))
+        elif isinstance(valor, dict):
+            itens.append(valor)
+
+    codec_observado = False
+    for item in itens:
+        acodec = item.get("acodec")
+        if acodec not in (None, ""):
+            codec_observado = True
+            if str(acodec).strip().lower() not in ("none", "null", "unknown"):
+                return True
+
+        audio_ext = item.get("audio_ext")
+        if audio_ext not in (None, ""):
+            codec_observado = True
+            if str(audio_ext).strip().lower() not in ("none", "null", "unknown"):
+                return True
+
+    return False if codec_observado else None
+
+
+def arquivo_possui_audio(info_midia):
+    acodec = str((info_midia or {}).get("acodec") or "").strip().lower()
+    return acodec not in ("", "none", "null", "unknown")
+
+
 def extrair_info_instagram_com_fallback(url):
     """Tenta com cookies e repete anonimamente para Reels públicos."""
     tentativas = [True]
@@ -4325,6 +4374,11 @@ def mapear_erro_download(err_text, plataforma="geral"):
         return texto_erro
 
     if plataforma == "instagram":
+        if "instagram_audio_ausente_no_arquivo" in err:
+            return (
+                "❌ O Instagram não forneceu uma versão completa com áudio "
+                "deste Reel. Tente novamente em alguns instantes."
+            )
         if "login required" in err or "requested content is not available" in err or "rate-limit reached" in err:
             return "❌ O Instagram bloqueou esse link no momento. Para Reels assim, o bot precisa de cookies válidos da conta logada no Instagram."
         if "private" in err:
@@ -7514,10 +7568,13 @@ def formatos_capados_gerais():
 def formatos_por_plataforma(is_tiktok=False, is_instagram=False, is_pinterest=False, is_rednote=False):
     if is_instagram:
         return [
+            "best[ext=mp4][vcodec!=none][acodec!=none][width<=720][height<=1280][fps<=30]",
+            "best[ext=mp4][vcodec!=none][acodec!=none][width<=720][height<=1280]",
             "bestvideo[ext=mp4][width<=720][height<=1280][fps<=30]+bestaudio[ext=m4a]/best[ext=mp4][width<=720][height<=1280][fps<=30]",
             "bestvideo[ext=mp4][width<=720][height<=1280]+bestaudio[ext=m4a]/best[ext=mp4][width<=720][height<=1280]",
-            "best[ext=mp4][width<=720][height<=1280][fps<=30]",
-            "best[ext=mp4][width<=720][height<=1280]",
+            "best[ext=mp4][vcodec!=none][acodec!=none]",
+            "best[vcodec!=none][acodec!=none]",
+            "bestvideo[ext=mp4]+bestaudio[ext=m4a]",
             "best[ext=mp4]/best"
         ]
 
@@ -7863,6 +7920,14 @@ def _processar_download(message, url, status_msg, reserva_download=None):
         except Exception as e:
             raise FalhaComponenteDownload(plataforma, e) from e
 
+        audio_instagram_esperado = None
+        if is_instagram:
+            audio_instagram_esperado = info_instagram_indica_audio(info)
+            logger.info(
+                "[INSTAGRAM_AUDIO_INFO] "
+                f"audio_disponivel={audio_instagram_esperado}"
+            )
+
         duracao = info.get("duration")
         logger.info(
             f"[META] plataforma={plataforma} "
@@ -7963,6 +8028,21 @@ def _processar_download(message, url, status_msg, reserva_download=None):
 
                     arquivo_baixado = encontrar_arquivo_baixado(prefix)
                     if arquivo_baixado and os.path.exists(arquivo_baixado):
+                        if is_instagram and audio_instagram_esperado is not False:
+                            info_arquivo_baixado = obter_info_midia(arquivo_baixado)
+                            if not arquivo_possui_audio(info_arquivo_baixado):
+                                ultimo_erro = (
+                                    "INSTAGRAM_AUDIO_AUSENTE_NO_ARQUIVO "
+                                    f"metadata={audio_instagram_esperado}"
+                                )
+                                logger.warning(
+                                    "[INSTAGRAM_AUDIO_RETRY] "
+                                    f"audio_esperado={audio_instagram_esperado} "
+                                    f"formato={fmt} "
+                                    f"arquivo_ref={referencia_arquivo_log(arquivo_baixado)}"
+                                )
+                                cleanup_prefix(prefix)
+                                continue
                         baixou = True
                         break
 
@@ -8954,6 +9034,11 @@ if __name__ == "__main__":
             parse_mode="HTML",
         )
     logger.info("[PAGAMENTO_CONFIG] modo=manual_pix configurado=True")
+    logger.info(
+        "[INSTAGRAM_AUDIO_CONFIG] validacao=True "
+        f"cache_version={INSTAGRAM_AUDIO_CACHE_VERSION} "
+        "prefer_h264=True fallback_com_audio=True"
+    )
     if TIKTOK_IMPERSONATION_DISPONIVEL:
         logger.info(f"[TIKTOK_DEPENDENCIAS] curl_cffi={CURL_CFFI_VERSION}")
     else:
