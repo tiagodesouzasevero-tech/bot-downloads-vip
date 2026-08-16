@@ -215,9 +215,10 @@ MONITOR_SUCCESS_LOG_INTERVAL_SECONDS = 900
 MEDIA_PROFILE_VERSION = (
     f"720x1280_30fps_h264_crf{VIDEO_CRF}_audio{AUDIO_BITRATE}_sem_marca_v2"
 )
-INSTAGRAM_AUDIO_CACHE_VERSION = "instagram_audio_v5_nocookies"
+INSTAGRAM_AUDIO_CACHE_VERSION = "instagram_audio_v3"
 FACEBOOK_AUDIO_CACHE_VERSION = "facebook_audio_v2"
 
+INSTAGRAM_COOKIES_TEXT = os.environ.get("INSTAGRAM_COOKIES_TEXT", "")
 TIKTOK_COOKIES_TEXT = os.environ.get("TIKTOK_COOKIES_TEXT", "")
 TIKTOK_DEVICE_ID_TEXT = os.environ.get("TIKTOK_DEVICE_ID", "")
 TIKWM_API_URL = os.environ.get("TIKWM_API_URL", "https://www.tikwm.com/api/").strip()
@@ -298,6 +299,7 @@ COMPONENT_MONITOR_STATE = {
 }
 
 ARQUIVOS_PERSISTENTES_DOWNLOAD_DIR = {
+    "instagram_cookies.txt",
     "tiktok_cookies.txt",
     "tiktok_device_id.txt",
 }
@@ -3678,6 +3680,38 @@ def autorizar_limite_global_persistente(user_id):
     return True, None
 
 
+def get_instagram_cookiefile():
+    texto = (INSTAGRAM_COOKIES_TEXT or "").strip()
+    if not texto:
+        return None
+
+    garantir_estrutura_privada()
+
+    # Algumas plataformas salvam quebras de linha como os caracteres \n.
+    if "\n" not in texto and "\\n" in texto:
+        texto = texto.replace("\\r\\n", "\n").replace("\\n", "\n")
+
+    texto = texto.replace("\r\n", "\n").replace("\r", "\n").strip()
+
+    # O yt-dlp espera o formato Netscape/Mozilla.
+    if not texto.startswith("# Netscape HTTP Cookie File") and not texto.startswith("# HTTP Cookie File"):
+        texto = "# Netscape HTTP Cookie File\n" + texto
+
+    cookie_path = os.path.join(PRIVATE_COOKIES_DIR, "instagram_cookies.txt")
+    escrever_texto_privado(cookie_path, texto + "\n")
+
+    linhas = [linha for linha in texto.splitlines() if linha and not linha.startswith("#")]
+    tem_sessionid = any(
+        len(partes := linha.split("\t")) >= 7 and partes[5] == "sessionid"
+        for linha in linhas
+    )
+    logger.info(
+        f"[INSTAGRAM_COOKIES] arquivo_criado=True linhas={len(linhas)} "
+        f"tem_sessionid={tem_sessionid}"
+    )
+    return cookie_path
+
+
 def normalizar_tiktok_cookies_text(texto):
     texto = (texto or "").strip().lstrip("\ufeff")
     if not texto:
@@ -4131,9 +4165,12 @@ def montar_info_opts(
     }
 
     if is_instagram:
-        # Instagram funciona apenas em modo público/anônimo.
-        # Nenhuma sessão, cookie ou credencial de conta é enviada.
-        pass
+        # O extrator do yt-dlp configura os cabeçalhos e a impersonação.
+        # Cabeçalhos manuais podem ficar incompatíveis quando o Instagram muda.
+        if usar_cookies:
+            cookiefile = get_instagram_cookiefile()
+            if cookiefile:
+                opts["cookiefile"] = cookiefile
     elif is_pinterest:
         opts["http_headers"] = PINTEREST_HEADERS
     elif is_tiktok:
@@ -4194,9 +4231,15 @@ def montar_download_opts(
 
     if is_instagram:
         opts.pop("http_headers", None)
-        # Instagram funciona apenas em modo público/anônimo.
-        # O yt-dlp define os cabeçalhos/impersonação e nenhuma sessão é usada.
+        # Desde a reestruturação recente do extrator do Instagram, o próprio
+        # yt-dlp define os cabeçalhos e a impersonação necessários. Não
+        # forçamos format_sort aqui: formatos válidos podem desaparecer se a
+        # seleção for restringida antes de o extrator terminar de montá-los.
         opts["extractor_retries"] = 3
+        if usar_cookies:
+            cookiefile = get_instagram_cookiefile()
+            if cookiefile:
+                opts["cookiefile"] = cookiefile
     elif is_pinterest:
         opts["http_headers"] = PINTEREST_HEADERS
     elif is_tiktok:
@@ -4233,11 +4276,10 @@ def erro_instagram_permite_fallback(erro):
 
 
 def info_plataforma_indica_audio(info):
-    """Retorna True/False/None conforme a certeza dos metadados de áudio.
+    """Retorna True/False quando os metadados permitem confirmar o áudio.
 
-    True  = existe ao menos um stream confirmado com áudio.
-    False = todos os formatos observáveis são explicitamente video-only.
-    None  = há formatos com codec desconhecido; o arquivo precisa de ffprobe.
+    None significa que o extrator não informou codecs suficientes. Nesse caso,
+    o download é tratado de forma conservadora e um arquivo mudo é rejeitado.
     """
     if not isinstance(info, dict):
         return None
@@ -4250,36 +4292,21 @@ def info_plataforma_indica_audio(info):
         elif isinstance(valor, dict):
             itens.append(valor)
 
-    viu_sem_audio_explicito = False
-    viu_codec_desconhecido = False
-
+    codec_observado = False
     for item in itens:
-        acodec_raw = item.get("acodec")
-        audio_ext_raw = item.get("audio_ext")
+        acodec = item.get("acodec")
+        if acodec not in (None, ""):
+            codec_observado = True
+            if str(acodec).strip().lower() not in ("none", "null", "unknown"):
+                return True
 
-        if acodec_raw in (None, "") and audio_ext_raw in (None, ""):
-            # Formatos progressivos do Instagram costumam aparecer assim.
-            viu_codec_desconhecido = True
-            continue
+        audio_ext = item.get("audio_ext")
+        if audio_ext not in (None, ""):
+            codec_observado = True
+            if str(audio_ext).strip().lower() not in ("none", "null", "unknown"):
+                return True
 
-        acodec = str(acodec_raw or "").strip().lower()
-        audio_ext = str(audio_ext_raw or "").strip().lower()
-
-        if acodec and acodec not in ("none", "null", "unknown"):
-            return True
-        if audio_ext and audio_ext not in ("none", "null", "unknown"):
-            return True
-
-        if acodec == "unknown" or audio_ext == "unknown":
-            viu_codec_desconhecido = True
-        if acodec in ("none", "null") or audio_ext in ("none", "null"):
-            viu_sem_audio_explicito = True
-
-    if viu_codec_desconhecido:
-        return None
-    if viu_sem_audio_explicito:
-        return False
-    return None
+    return False if codec_observado else None
 
 
 def arquivo_possui_audio(info_midia):
@@ -4404,119 +4431,62 @@ def extrair_info_facebook_com_fallback(url):
     raise RuntimeError("FACEBOOK_AUDIO_INDISPONIVEL_PUBLICO")
 
 
-def resumir_formatos_instagram(info):
-    """Registra codecs/formats sem expor URLs assinadas do Instagram."""
-    formatos = (info or {}).get("formats") if isinstance(info, dict) else None
-    if not isinstance(formatos, list):
-        logger.info("[INSTAGRAM_FORMATOS] total=0")
-        return
-
-    resumo = []
-    for item in formatos[:20]:
-        if not isinstance(item, dict):
-            continue
-        resumo.append(
-            "{id=%s ext=%s v=%s a=%s %sx%s fps=%s proto=%s}" % (
-                item.get("format_id"),
-                item.get("ext"),
-                item.get("vcodec"),
-                item.get("acodec"),
-                item.get("width"),
-                item.get("height"),
-                item.get("fps"),
-                item.get("protocol"),
-            )
-        )
-
-    logger.info(
-        f"[INSTAGRAM_FORMATOS] total={len(formatos)} "
-        f"itens={' '.join(resumo)[:3500]}"
-    )
-
-
-def formatos_progressivos_instagram(info):
-    """Retorna MP4s HTTP diretos antes dos DASH video-only.
-
-    O Instagram frequentemente expõe os codecs desses MP4s como desconhecidos
-    (None/unknown), embora o arquivo final possa ser H.264 + AAC. Por isso cada
-    candidato é baixado e confirmado com ffprobe antes de ser aceito.
-    """
-    formatos = (info or {}).get("formats") if isinstance(info, dict) else None
-    if not isinstance(formatos, list):
-        return []
-
-    candidatos = []
-    for item in formatos:
-        if not isinstance(item, dict):
-            continue
-        format_id = str(item.get("format_id") or "").strip()
-        if not format_id or format_id.lower().startswith("dash-"):
-            continue
-        if str(item.get("ext") or "").lower() != "mp4":
-            continue
-        protocolo = str(item.get("protocol") or "").lower()
-        if protocolo and not protocolo.startswith("http"):
-            continue
-
-        # Se o extrator afirma explicitamente que é video-only, não é candidato
-        # progressivo. None/unknown é mantido porque precisa ser verificado no
-        # arquivo real com ffprobe.
-        acodec = str(item.get("acodec") or "").strip().lower()
-        if acodec in ("none", "null"):
-            continue
-
-        largura = item.get("width")
-        altura = item.get("height")
-        try:
-            if largura and int(largura) > 720:
-                continue
-            if altura and int(altura) > 1280:
-                continue
-        except (TypeError, ValueError):
-            pass
-
-        candidatos.append(format_id)
-
-    # Remove duplicados preservando a ordem entregue pelo Instagram.
-    candidatos = list(dict.fromkeys(candidatos))
-    logger.info(
-        f"[INSTAGRAM_PROGRESSIVOS] total={len(candidatos)} "
-        f"ids={','.join(candidatos[:12])}"
-    )
-    return candidatos
-
-
 def extrair_info_instagram_com_fallback(url):
-    """Consulta o Instagram somente em modo público/anônimo.
+    """Consulta o Instagram com o extrator oficial do yt-dlp.
 
-    Cookies e credenciais de conta do Instagram ficam deliberadamente
-    desativados para evitar qualquer dependência de uma sessão pessoal.
+    Se houver cookies configurados, eles são usados primeiro. Para conteúdo
+    público, uma falha da sessão autenticada cai para acesso anônimo. A
+    impersonação fica totalmente a cargo do yt-dlp/curl-cffi; desativá-la
+    manualmente quebra o fluxo público usado pelas versões atuais do extrator.
     """
-    logger.info(
-        "[INSTAGRAM_INFO] modo=anonima usar_cookies=False "
-        f"url_ref={referencia_url_log(url)}"
-    )
-    try:
-        opts = montar_info_opts(is_instagram=True, usar_cookies=False)
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
+    tem_cookies = bool(INSTAGRAM_COOKIES_TEXT.strip())
+    tentativas = []
+    if tem_cookies:
+        tentativas.append((True, "cookies"))
+    tentativas.append((False, "anonima"))
 
-        audio_disponivel = info_plataforma_indica_audio(info)
-        logger.info(
-            "[INSTAGRAM_INFO_OK] "
-            f"modo=anonima audio_disponivel={audio_disponivel}"
-        )
-        resumir_formatos_instagram(info)
-        return info, False
-    except FalhaComponenteDownload:
-        raise
-    except Exception as e:
-        logger.warning(
-            "[INSTAGRAM_INFO_FALHA] modo=anonima usar_cookies=False "
-            f"url_ref={referencia_url_log(url)} "
-            f"erro={sanitizar_erro_log(e)}"
-        )
-        raise
+    ultimo_erro = None
+    for indice, (usar_cookies, modo) in enumerate(tentativas):
+        try:
+            logger.info(
+                f"[INSTAGRAM_INFO] modo={modo} "
+                f"usar_cookies={usar_cookies} "
+                f"url_ref={referencia_url_log(url)}"
+            )
+            opts = montar_info_opts(
+                is_instagram=True,
+                usar_cookies=usar_cookies,
+            )
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+
+            logger.info(
+                "[INSTAGRAM_INFO_OK] "
+                f"modo={modo} "
+                f"audio_disponivel={info_plataforma_indica_audio(info)}"
+            )
+            return info, usar_cookies
+        except FalhaComponenteDownload:
+            raise
+        except Exception as e:
+            ultimo_erro = e
+            logger.warning(
+                f"[INSTAGRAM_INFO_FALHA] modo={modo} "
+                f"usar_cookies={usar_cookies} "
+                f"url_ref={referencia_url_log(url)} "
+                f"erro={sanitizar_erro_log(e)}"
+            )
+
+            if indice + 1 < len(tentativas):
+                logger.warning(
+                    "[INSTAGRAM_INFO_FALLBACK] "
+                    f"modo={modo} falhou=True "
+                    f"proxima_tentativa={tentativas[indice + 1][1]}"
+                )
+                continue
+            raise
+
+    raise ultimo_erro or Exception("Falha ao consultar o Instagram")
 
 def erro_tiktok_permite_nova_tentativa(erro):
     texto = str(erro or "").lower()
@@ -4694,7 +4664,7 @@ def mapear_erro_download(err_text, plataforma="geral"):
                 "deste Reel. Tente novamente em alguns instantes."
             )
         if "login required" in err or "requested content is not available" in err or "rate-limit reached" in err:
-            return "❌ Esse conteúdo do Instagram não está disponível pelo acesso público no momento."
+            return "❌ O Instagram bloqueou esse link no momento. Para Reels assim, o bot precisa de cookies válidos da conta logada no Instagram."
         if "private" in err:
             return "❌ Esse conteúdo do Instagram é privado."
         if "403" in err:
@@ -6259,7 +6229,11 @@ def montar_relatorio_diagnostico():
         linhas.append("⚠️ TikTok sem marca: pausa automática temporária")
         problemas.append("Circuito TikTok temporariamente pausado")
 
-    linhas.append("✅ Instagram: modo público/anônimo, sem cookies")
+    linhas.append(
+        "✅ Cookies do Instagram: configurados"
+        if INSTAGRAM_COOKIES_TEXT.strip()
+        else "ℹ️ Cookies do Instagram: não configurados (opcional)"
+    )
     linhas.append(
         "✅ Cookies do TikTok: configurados"
         if TIKTOK_COOKIES_TEXT.strip()
@@ -8484,22 +8458,20 @@ def _processar_download(message, url, status_msg, reserva_download=None):
             informar_download_pausado_por_espaco(message, status_msg)
             return
 
-        formatos_progressivos_ig = (
-            formatos_progressivos_instagram(info) if is_instagram else []
-        )
-        formatos = formatos_progressivos_ig + formatos_por_plataforma(
+        formatos = formatos_por_plataforma(
             is_tiktok=is_tiktok,
             is_instagram=is_instagram,
             is_pinterest=is_pinterest,
             is_rednote=is_rednote,
             is_facebook_reel=is_facebook_reel,
         )
-        formatos = list(dict.fromkeys(formatos))
         baixou = False
         ultimo_erro = None
 
         if is_instagram:
-            modos_cookie = [False]
+            modos_cookie = [usar_cookies_plataforma]
+            if usar_cookies_plataforma and INSTAGRAM_COOKIES_TEXT.strip():
+                modos_cookie.append(False)
         elif is_tiktok:
             modos_cookie = [usar_cookies_plataforma]
             if usar_cookies_plataforma:
@@ -8531,43 +8503,21 @@ def _processar_download(message, url, status_msg, reserva_download=None):
 
                     arquivo_baixado = encontrar_arquivo_baixado(prefix)
                     if arquivo_baixado and os.path.exists(arquivo_baixado):
-                        if is_instagram:
+                        if is_instagram and audio_instagram_esperado is True:
                             info_arquivo_baixado = obter_info_midia(arquivo_baixado)
-                            tem_audio_real = arquivo_possui_audio(info_arquivo_baixado)
-                            logger.info(
-                                "[INSTAGRAM_AUDIO_PROBE] "
-                                f"formato={fmt} tem_audio={tem_audio_real} "
-                                f"vcodec={info_arquivo_baixado.get('vcodec')} "
-                                f"acodec={info_arquivo_baixado.get('acodec')}"
-                            )
-                            if not tem_audio_real:
+                            if not arquivo_possui_audio(info_arquivo_baixado):
                                 ultimo_erro = (
                                     "INSTAGRAM_AUDIO_AUSENTE_NO_ARQUIVO "
                                     f"metadata={audio_instagram_esperado}"
                                 )
-                                # Os IDs diretos/HTTP são justamente os formatos
-                                # que o yt-dlp marca como codec desconhecido. Testa
-                                # todos eles antes de aceitar o fallback mudo.
-                                if fmt in formatos_progressivos_ig:
-                                    logger.warning(
-                                        "[INSTAGRAM_PROGRESSIVO_SEM_AUDIO] "
-                                        f"formato={fmt} tentando_proximo=True"
-                                    )
-                                    cleanup_prefix(prefix)
-                                    continue
-                                if audio_instagram_esperado is True:
-                                    logger.warning(
-                                        "[INSTAGRAM_AUDIO_RETRY] "
-                                        f"audio_esperado={audio_instagram_esperado} "
-                                        f"formato={fmt} "
-                                        f"arquivo_ref={referencia_arquivo_log(arquivo_baixado)}"
-                                    )
-                                    cleanup_prefix(prefix)
-                                    continue
                                 logger.warning(
-                                    "[INSTAGRAM_FALLBACK_SEM_AUDIO] "
-                                    f"formato={fmt} metadata={audio_instagram_esperado}"
+                                    "[INSTAGRAM_AUDIO_RETRY] "
+                                    f"audio_esperado={audio_instagram_esperado} "
+                                    f"formato={fmt} "
+                                    f"arquivo_ref={referencia_arquivo_log(arquivo_baixado)}"
                                 )
+                                cleanup_prefix(prefix)
+                                continue
                         if is_facebook_reel:
                             info_arquivo_baixado = obter_info_midia(arquivo_baixado)
                             if not arquivo_possui_audio(info_arquivo_baixado):
@@ -8650,24 +8600,15 @@ def _processar_download(message, url, status_msg, reserva_download=None):
         if not enviado:
             raise Exception("Falha ao enviar arquivo ao Telegram")
 
-        # Nunca guarda no cache um Reel do Instagram que chegou sem áudio.
-        # Além de evitar repetir um arquivo defeituoso, isso permite que uma
-        # tentativa futura use novamente as rotas web/iOS do extrator.
-        if is_instagram and instagram_sem_audio:
-            logger.warning(
-                "[INSTAGRAM_CACHE_IGNORADO_SEM_AUDIO] "
-                f"url_ref={referencia_url_log(url)}"
-            )
-        else:
-            salvar_file_id_cache(
-                cache_key,
-                cache_source_id,
-                plataforma,
-                telegram_file_id,
-                telegram_media_type,
-                url_cache_key=url_cache_key,
-                url_normalizada=url_normalizada,
-            )
+        salvar_file_id_cache(
+            cache_key,
+            cache_source_id,
+            plataforma,
+            telegram_file_id,
+            telegram_media_type,
+            url_cache_key=url_cache_key,
+            url_normalizada=url_normalizada,
+        )
 
         registrar_download_diario(
             vip_status,
