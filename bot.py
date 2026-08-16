@@ -1572,11 +1572,14 @@ def converter_para_h264_compativel(arquivo_entrada, info=None):
         "-crf", str(VIDEO_CRF),
         "-threads", str(FFMPEG_THREADS),
         "-pix_fmt", "yuv420p",
-        "-c:a", "aac",
-        "-b:a", AUDIO_BITRATE,
-        "-movflags", "+faststart",
-        arquivo_saida
     ]
+    if str(info.get("acodec") or "").lower() == "aac":
+        # Preserva a faixa original quando ela já é compatível. Isso evita
+        # perda de áudio e reduz CPU durante a conversão apenas do vídeo.
+        cmd += ["-c:a", "copy"]
+    else:
+        cmd += ["-c:a", "aac", "-b:a", AUDIO_BITRATE]
+    cmd += ["-movflags", "+faststart", arquivo_saida]
 
     try:
         atualizar_heartbeat_worker("convertendo_h264")
@@ -1638,11 +1641,12 @@ def converter_para_720x1280_30fps(arquivo_entrada):
         "-crf", str(VIDEO_CRF),
         "-threads", str(FFMPEG_THREADS),
         "-pix_fmt", "yuv420p",
-        "-c:a", "aac",
-        "-b:a", AUDIO_BITRATE,
-        "-movflags", "+faststart",
-        arquivo_saida
     ]
+    if str(info.get("acodec") or "").lower() == "aac":
+        cmd += ["-c:a", "copy"]
+    else:
+        cmd += ["-c:a", "aac", "-b:a", AUDIO_BITRATE]
+    cmd += ["-movflags", "+faststart", arquivo_saida]
 
     try:
         atualizar_heartbeat_worker("convertendo_video")
@@ -8377,10 +8381,10 @@ def formatos_por_plataforma(
 ):
     if is_instagram:
         return [
-            "best[ext=mp4][vcodec!=none][acodec!=none][width<=720][height<=1280][fps<=30]",
-            "best[ext=mp4][vcodec!=none][acodec!=none][width<=720][height<=1280]",
             "bestvideo[ext=mp4][width<=720][height<=1280][fps<=30]+bestaudio[ext=m4a]/best[ext=mp4][width<=720][height<=1280][fps<=30]",
             "bestvideo[ext=mp4][width<=720][height<=1280]+bestaudio[ext=m4a]/best[ext=mp4][width<=720][height<=1280]",
+            "best[ext=mp4][vcodec!=none][acodec!=none][width<=720][height<=1280][fps<=30]",
+            "best[ext=mp4][vcodec!=none][acodec!=none][width<=720][height<=1280]",
             "best[ext=mp4][vcodec!=none][acodec!=none]",
             "best[vcodec!=none][acodec!=none]",
             "bestvideo[ext=mp4]+bestaudio[ext=m4a]",
@@ -8410,10 +8414,10 @@ def formatos_por_plataforma(
 
     if is_facebook_reel:
         return [
-            "best[ext=mp4][vcodec!=none][acodec!=none][width<=720][height<=1280][fps<=30]",
-            "best[ext=mp4][vcodec!=none][acodec!=none][width<=720][height<=1280]",
             "bestvideo[ext=mp4][width<=720][height<=1280][fps<=30]+bestaudio[ext=m4a]/best[ext=mp4][width<=720][height<=1280][fps<=30]",
             "bestvideo[width<=720][height<=1280][fps<=30]+bestaudio/best[width<=720][height<=1280][fps<=30]",
+            "best[ext=mp4][vcodec!=none][acodec!=none][width<=720][height<=1280][fps<=30]",
+            "best[ext=mp4][vcodec!=none][acodec!=none][width<=720][height<=1280]",
             "best[ext=mp4][vcodec!=none][acodec!=none]",
             "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]",
             "bestvideo+bestaudio/best",
@@ -8428,7 +8432,6 @@ def formatos_por_plataforma(
 def _processar_download(message, url, status_msg, reserva_download=None):
     atualizar_heartbeat_worker("preparando")
     prefix = None
-    prefix_sem_audio = None
     plataforma = nome_plataforma(*detectar_plataforma(url))
 
     try:
@@ -8859,12 +8862,6 @@ def _processar_download(message, url, status_msg, reserva_download=None):
         )
         baixou = False
         ultimo_erro = None
-        arquivo_sem_audio_fallback = None
-        if is_instagram or is_facebook_reel:
-            prefix_sem_audio = os.path.join(
-                DOWNLOAD_DIR,
-                f"mudo_{uuid.uuid4().hex}",
-            )
 
         if is_instagram:
             modos_cookie = [usar_cookies_plataforma]
@@ -8915,15 +8912,6 @@ def _processar_download(message, url, status_msg, reserva_download=None):
                                     f"formato={fmt} "
                                     f"arquivo_ref={referencia_arquivo_log(arquivo_baixado)}"
                                 )
-                                if arquivo_sem_audio_fallback is None:
-                                    extensao = os.path.splitext(arquivo_baixado)[1] or ".mp4"
-                                    arquivo_sem_audio_fallback = (
-                                        f"{prefix_sem_audio}{extensao}"
-                                    )
-                                    os.replace(
-                                        arquivo_baixado,
-                                        arquivo_sem_audio_fallback,
-                                    )
                                 cleanup_prefix(prefix)
                                 continue
                         if is_facebook_reel:
@@ -8939,15 +8927,6 @@ def _processar_download(message, url, status_msg, reserva_download=None):
                                     f"formato={fmt} "
                                     f"arquivo_ref={referencia_arquivo_log(arquivo_baixado)}"
                                 )
-                                if arquivo_sem_audio_fallback is None:
-                                    extensao = os.path.splitext(arquivo_baixado)[1] or ".mp4"
-                                    arquivo_sem_audio_fallback = (
-                                        f"{prefix_sem_audio}{extensao}"
-                                    )
-                                    os.replace(
-                                        arquivo_baixado,
-                                        arquivo_sem_audio_fallback,
-                                    )
                                 cleanup_prefix(prefix)
                                 continue
                         if is_shopee:
@@ -8975,21 +8954,6 @@ def _processar_download(message, url, status_msg, reserva_download=None):
 
             if baixou:
                 break
-
-        if not baixou and arquivo_sem_audio_fallback:
-            extensao = os.path.splitext(arquivo_sem_audio_fallback)[1] or ".mp4"
-            arquivo_destino_sem_audio = f"{prefix}{extensao}"
-            cleanup_prefix(prefix)
-            os.replace(
-                arquivo_sem_audio_fallback,
-                arquivo_destino_sem_audio,
-            )
-            arquivo_sem_audio_fallback = None
-            baixou = True
-            logger.warning(
-                f"[AUDIO_FALLBACK_SEM_AUDIO] plataforma={plataforma} "
-                f"arquivo_ref={referencia_arquivo_log(arquivo_destino_sem_audio)}"
-            )
 
         if not baixou:
             raise FalhaComponenteDownload(
@@ -9027,10 +8991,16 @@ def _processar_download(message, url, status_msg, reserva_download=None):
                 f"[AUDIO_ARQUIVO_FINAL] plataforma={plataforma} "
                 f"sem_audio={envio_sem_audio}"
             )
-            if is_shopee and envio_sem_audio:
+            if envio_sem_audio:
+                if is_instagram:
+                    erro_audio = "INSTAGRAM_AUDIO_AUSENTE_NO_ARQUIVO"
+                elif is_facebook_reel:
+                    erro_audio = "FACEBOOK_AUDIO_AUSENTE_NO_ARQUIVO"
+                else:
+                    erro_audio = "SHOPEE_AUDIO_AUSENTE_NO_ORIGINAL"
                 raise FalhaComponenteDownload(
                     plataforma,
-                    "SHOPEE_AUDIO_AUSENTE_NO_ORIGINAL",
+                    erro_audio,
                 )
 
         (
@@ -9154,8 +9124,6 @@ def _processar_download(message, url, status_msg, reserva_download=None):
     finally:
         if prefix:
             cleanup_prefix(prefix)
-        if prefix_sem_audio:
-            cleanup_prefix(prefix_sem_audio)
 
 
 def registrar_trabalho_fila_persistente(user_id):
@@ -10003,13 +9971,15 @@ if __name__ == "__main__":
     logger.info(
         "[INSTAGRAM_AUDIO_CONFIG] validacao=True "
         f"cache_version={INSTAGRAM_AUDIO_CACHE_VERSION} "
-        "prefer_h264=True fallback_com_audio=True"
+        "prefer_h264=True audio_obrigatorio=True "
+        "envia_sem_audio=False preserva_aac=True"
     )
     logger.info(
         "[FACEBOOK_REELS_CONFIG] publico_somente=True cookies=False "
         "max_duration_compartilhado=True prefer_h264=True "
         "validacao_audio=True fallback_publico=True "
-        "envia_sem_audio_com_aviso=True cache_sem_audio=False "
+        "audio_obrigatorio=True envia_sem_audio=False "
+        "preserva_aac=True cache_sem_audio=False "
         f"cache_version={FACEBOOK_AUDIO_CACHE_VERSION}"
     )
     if TIKTOK_IMPERSONATION_DISPONIVEL:
