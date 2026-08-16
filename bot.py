@@ -215,9 +215,8 @@ MONITOR_SUCCESS_LOG_INTERVAL_SECONDS = 900
 MEDIA_PROFILE_VERSION = (
     f"720x1280_30fps_h264_crf{VIDEO_CRF}_audio{AUDIO_BITRATE}_sem_marca_v2"
 )
-INSTAGRAM_AUDIO_CACHE_VERSION = "instagram_audio_v4"
-FACEBOOK_AUDIO_CACHE_VERSION = "facebook_audio_v3"
-SHOPEE_ORIGINAL_CACHE_VERSION = "shopee_original_v1"
+INSTAGRAM_AUDIO_CACHE_VERSION = "instagram_audio_v3"
+FACEBOOK_AUDIO_CACHE_VERSION = "facebook_audio_v2"
 
 INSTAGRAM_COOKIES_TEXT = os.environ.get("INSTAGRAM_COOKIES_TEXT", "")
 TIKTOK_COOKIES_TEXT = os.environ.get("TIKTOK_COOKIES_TEXT", "")
@@ -279,7 +278,6 @@ COMPONENTES_PLATAFORMA = (
     "Pinterest",
     "RedNote",
     "Facebook Reels",
-    "Shopee Vídeos",
 )
 COMPONENTES_INTERNOS = (
     "Telegram",
@@ -536,17 +534,6 @@ PINTEREST_HEADERS = {
     "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8"
 }
 
-SHOPEE_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Linux; Android 13; Pixel 7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/131.0.0.0 Mobile Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
-    "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
-    "Referer": "https://sv.shopee.com.br/",
-}
-
 PLANOS = {
     "10.00": {
         "nome": "VIP Mensal",
@@ -761,47 +748,6 @@ def seguir_redirecionamentos_seguros(url, headers=None, max_redirects=5):
     raise RuntimeError("MUITOS_REDIRECIONAMENTOS")
 
 
-def seguir_redirecionamentos_no_dominio(
-    url,
-    dominio_raiz,
-    headers=None,
-    max_redirects=3,
-):
-    """Segue somente destinos públicos que permaneçam no domínio informado."""
-    atual = str(url or "").strip()
-    resposta = None
-
-    for _ in range(max_redirects + 1):
-        parsed = urlparse(atual)
-        host = (parsed.hostname or "").lower().rstrip(".")
-        if (
-            not hostname_permitido(host, dominio_raiz)
-            or not validar_url_http_publica(atual)
-        ):
-            raise RuntimeError("REDIRECIONAMENTO_DOMINIO_NAO_PERMITIDO")
-
-        resposta = requests.get(
-            atual,
-            allow_redirects=False,
-            stream=True,
-            timeout=(5, 20),
-            headers=headers or DEFAULT_HEADERS,
-        )
-        if resposta.status_code not in (301, 302, 303, 307, 308):
-            resposta.raise_for_status()
-            return resposta, atual
-
-        destino = urljoin(atual, resposta.headers.get("Location") or "")
-        resposta.close()
-        if not destino or destino == atual:
-            raise RuntimeError("REDIRECIONAMENTO_INVALIDO")
-        atual = destino
-
-    if resposta is not None:
-        resposta.close()
-    raise RuntimeError("MUITOS_REDIRECIONAMENTOS")
-
-
 def atualizar_estado_bot(estado, registrar_atividade=False):
     global BOT_STATE, BOT_LAST_UPDATE_AT
     with BOT_STATE_LOCK:
@@ -880,7 +826,7 @@ def detectar_plataforma_url(url):
     try:
         parsed = urlparse(url)
     except Exception:
-        return False, False, False, False, False, False
+        return False, False, False, False, False
 
     if (
         parsed.scheme not in ("http", "https")
@@ -888,13 +834,13 @@ def detectar_plataforma_url(url):
         or parsed.username
         or parsed.password
     ):
-        return False, False, False, False, False, False
+        return False, False, False, False, False
 
     try:
         if parsed.port not in (None, 80, 443):
-            return False, False, False, False, False, False
+            return False, False, False, False, False
     except ValueError:
-        return False, False, False, False, False, False
+        return False, False, False, False, False
 
     host = parsed.hostname.lower().rstrip(".")
     is_pinterest = hostname_permitido(host, "pinterest.com") or host == "pin.it"
@@ -921,26 +867,12 @@ def detectar_plataforma_url(url):
         "www.rednote.com",
     }
     is_facebook_reel = eh_url_facebook_reel_ou_compartilhada(url)
-    is_shopee = host in {
-        "shp.ee",
-        "www.shp.ee",
-        "br.shp.ee",
-    } or (
-        host == "sv.shopee.com.br"
-        and bool(
-            re.fullmatch(
-                r"/share-video/[A-Za-z0-9_-]+(?:={0,2}|%3[dD]%3[dD])/?",
-                re.sub(r"/{2,}", "/", parsed.path or "/"),
-            )
-        )
-    )
     return (
         is_pinterest,
         is_tiktok,
         is_instagram,
         is_rednote,
         is_facebook_reel,
-        is_shopee,
     )
 
 
@@ -961,9 +893,6 @@ def resolver_url_compartilhada(url):
         "www.xhslink.com",
         "fb.watch",
         "www.fb.watch",
-        "shp.ee",
-        "www.shp.ee",
-        "br.shp.ee",
     }
     caminho = (urlparse(url).path or "").lower()
     compartilhamento_facebook = (
@@ -1029,31 +958,6 @@ def normalizar_url_facebook_reel(url):
         raise
     except Exception as e:
         raise RuntimeError("FACEBOOK_REELS_SOMENTE") from e
-
-
-def normalizar_url_shopee_video(url):
-    """Mantém somente o endereço canônico do post público do Shopee Vídeos."""
-    try:
-        parsed = urlparse(str(url or "").strip())
-        host = (parsed.hostname or "").lower().rstrip(".")
-        path = re.sub(r"/{2,}", "/", parsed.path or "/")
-        match = re.fullmatch(
-            r"/share-video/([A-Za-z0-9_-]+(?:={0,2}|%3[dD]%3[dD]))/?",
-            path,
-        )
-        if host != "sv.shopee.com.br" or not match:
-            raise RuntimeError("SHOPEE_VIDEO_SOMENTE")
-        return parsed._replace(
-            scheme="https",
-            netloc="sv.shopee.com.br",
-            path=f"/share-video/{match.group(1)}",
-            query="",
-            fragment="",
-        ).geturl()
-    except RuntimeError:
-        raise
-    except Exception as e:
-        raise RuntimeError("SHOPEE_VIDEO_SOMENTE") from e
 
 
 def cleanup_prefix(prefix):
@@ -1572,14 +1476,11 @@ def converter_para_h264_compativel(arquivo_entrada, info=None):
         "-crf", str(VIDEO_CRF),
         "-threads", str(FFMPEG_THREADS),
         "-pix_fmt", "yuv420p",
+        "-c:a", "aac",
+        "-b:a", AUDIO_BITRATE,
+        "-movflags", "+faststart",
+        arquivo_saida
     ]
-    if str(info.get("acodec") or "").lower() == "aac":
-        # Preserva a faixa original quando ela já é compatível. Isso evita
-        # perda de áudio e reduz CPU durante a conversão apenas do vídeo.
-        cmd += ["-c:a", "copy"]
-    else:
-        cmd += ["-c:a", "aac", "-b:a", AUDIO_BITRATE]
-    cmd += ["-movflags", "+faststart", arquivo_saida]
 
     try:
         atualizar_heartbeat_worker("convertendo_h264")
@@ -1641,12 +1542,11 @@ def converter_para_720x1280_30fps(arquivo_entrada):
         "-crf", str(VIDEO_CRF),
         "-threads", str(FFMPEG_THREADS),
         "-pix_fmt", "yuv420p",
+        "-c:a", "aac",
+        "-b:a", AUDIO_BITRATE,
+        "-movflags", "+faststart",
+        arquivo_saida
     ]
-    if str(info.get("acodec") or "").lower() == "aac":
-        cmd += ["-c:a", "copy"]
-    else:
-        cmd += ["-c:a", "aac", "-b:a", AUDIO_BITRATE]
-    cmd += ["-movflags", "+faststart", arquivo_saida]
 
     try:
         atualizar_heartbeat_worker("convertendo_video")
@@ -1682,22 +1582,6 @@ def preparar_arquivo_para_envio(arquivo_entrada, plataforma=None):
     atualizar_heartbeat_worker("preparando_envio")
     info = obter_info_midia(arquivo_entrada)
     permitir_hevc = permitir_hevc_por_plataforma(plataforma)
-    plataforma_normalizada = str(plataforma or "").strip().lower()
-    try:
-        tamanho_entrada = os.path.getsize(arquivo_entrada)
-    except OSError as e:
-        raise FalhaComponenteDownload("Armazenamento", e) from e
-
-    if (
-        plataforma_normalizada in ("shopee", "shopee vídeos", "shopee videos")
-        and tamanho_entrada > MAX_OUTPUT_FILE_BYTES
-    ):
-        logger.info(
-            "[SHOPEE_OTIMIZACAO_EXCEPCIONAL] "
-            f"arquivo_ref={referencia_arquivo_log(arquivo_entrada)} "
-            f"tamanho={tamanho_entrada} limite={MAX_OUTPUT_FILE_BYTES}"
-        )
-        return converter_para_720x1280_30fps(arquivo_entrada)
 
     if arquivo_ja_otimizado_para_envio(arquivo_entrada, info, permitir_hevc=permitir_hevc):
         logger.info(
@@ -1801,9 +1685,6 @@ def normalizar_plataforma_monitoramento(plataforma):
         "facebook": "Facebook Reels",
         "facebook reel": "Facebook Reels",
         "facebook reels": "Facebook Reels",
-        "shopee": "Shopee Vídeos",
-        "shopee video": "Shopee Vídeos",
-        "shopee vídeos": "Shopee Vídeos",
     }
     return mapa.get(str(plataforma or "").strip().lower())
 
@@ -2657,23 +2538,12 @@ def classificar_erro_envio_arquivo(erro):
     return "inconclusivo"
 
 
-def legenda_download_concluido(sem_audio=False, tipo="video"):
-    if sem_audio:
-        return (
-            "✅ Download concluído\n"
-            "🔇 Não foi possível incluir o áudio nesta versão."
-        )
-    if tipo == "arquivo":
-        return "👉 Download concluído! Aqui está seu arquivo 👊"
-    return "👉 Download concluído! Aqui está seu vídeo 👊"
-
-
-def _enviar_video_local_telegram(chat_id, arquivo, sem_audio=False):
+def _enviar_video_local_telegram(chat_id, arquivo):
     with open(arquivo, "rb") as f:
         return bot.send_video(
             chat_id,
             f,
-            caption=legenda_download_concluido(sem_audio=sem_audio),
+            caption="👉 Download concluído! Aqui está seu vídeo 👊",
         )
 
 
@@ -2690,16 +2560,12 @@ def obter_tamanho_arquivo_para_metrica(arquivo):
         return 0
 
 
-def enviar_arquivo_com_fallback(chat_id, arquivo, sem_audio=False):
+def enviar_arquivo_com_fallback(chat_id, arquivo):
     atualizar_heartbeat_worker("enviando_telegram")
     erro_video = None
     classificacao_video = None
     try:
-        mensagem = _enviar_video_local_telegram(
-            chat_id,
-            arquivo,
-            sem_audio=sem_audio,
-        )
+        mensagem = _enviar_video_local_telegram(chat_id, arquivo)
         telegram_file_id, telegram_media_type = extrair_dados_midia_telegram(mensagem)
         registrar_sucesso_componente("Telegram")
         return (
@@ -2733,11 +2599,7 @@ def enviar_arquivo_com_fallback(chat_id, arquivo, sem_audio=False):
         time.sleep(espera)
         atualizar_heartbeat_worker("reenviando_telegram")
         try:
-            mensagem = _enviar_video_local_telegram(
-                chat_id,
-                arquivo,
-                sem_audio=sem_audio,
-            )
+            mensagem = _enviar_video_local_telegram(chat_id, arquivo)
             telegram_file_id, telegram_media_type = extrair_dados_midia_telegram(
                 mensagem
             )
@@ -2793,11 +2655,7 @@ def enviar_arquivo_com_fallback(chat_id, arquivo, sem_audio=False):
             )
             arquivo_fallback = candidato_fallback
 
-            mensagem = _enviar_video_local_telegram(
-                chat_id,
-                arquivo_fallback,
-                sem_audio=sem_audio,
-            )
+            mensagem = _enviar_video_local_telegram(chat_id, arquivo_fallback)
 
             logger.info(
                 "[SEND_VIDEO] Fallback H.264 enviado com sucesso | "
@@ -2835,10 +2693,7 @@ def enviar_arquivo_com_fallback(chat_id, arquivo, sem_audio=False):
             mensagem = bot.send_document(
                 chat_id,
                 f,
-                caption=legenda_download_concluido(
-                    sem_audio=sem_audio,
-                    tipo="arquivo",
-                ),
+                caption="👉 Download concluído! Aqui está seu arquivo 👊",
             )
         telegram_file_id, telegram_media_type = extrair_dados_midia_telegram(mensagem)
         registrar_sucesso_componente("Telegram")
@@ -2864,8 +2719,6 @@ def perfil_cache_plataforma(plataforma):
         perfil = f"{perfil}|{INSTAGRAM_AUDIO_CACHE_VERSION}"
     elif plataforma_normalizada in ("facebook", "facebook reels", "facebook_reels"):
         perfil = f"{perfil}|{FACEBOOK_AUDIO_CACHE_VERSION}"
-    elif plataforma_normalizada in ("shopee", "shopee vídeos", "shopee videos"):
-        perfil = f"{perfil}|{SHOPEE_ORIGINAL_CACHE_VERSION}"
     return perfil
 
 
@@ -3210,7 +3063,6 @@ def nome_plataforma(
     is_instagram,
     is_rednote,
     is_facebook_reel,
-    is_shopee,
 ):
     if is_pinterest:
         return "Pinterest"
@@ -3222,8 +3074,6 @@ def nome_plataforma(
         return "RedNote"
     if is_facebook_reel:
         return "Facebook Reels"
-    if is_shopee:
-        return "Shopee Vídeos"
     return "Desconhecida"
 
 
@@ -4296,170 +4146,6 @@ def extrair_info_tiktok_hd_sem_marca(url):
     )
 
 
-def extrair_json_next_shopee(html_pagina):
-    """Lê apenas o JSON público incorporado à página de compartilhamento."""
-    texto = str(html_pagina or "")
-    match = re.search(
-        r"<script\b[^>]*\bid=[\"']__NEXT_DATA__[\"'][^>]*>(.*?)</script>",
-        texto,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-    if not match:
-        raise RuntimeError("SHOPEE_DADOS_PUBLICOS_NAO_ENCONTRADOS")
-    try:
-        return json.loads(html.unescape(match.group(1)).strip())
-    except (TypeError, ValueError, json.JSONDecodeError) as e:
-        raise RuntimeError("SHOPEE_DADOS_PUBLICOS_INVALIDOS") from e
-
-
-def localizar_video_shopee(dados):
-    """Localiza o objeto de vídeo sem depender da posição exata no Next.js."""
-    pilha = [dados]
-    visitados = 0
-    while pilha:
-        atual = pilha.pop()
-        visitados += 1
-        if visitados > 10000:
-            raise RuntimeError("SHOPEE_DADOS_PUBLICOS_EXCESSIVOS")
-        if isinstance(atual, dict):
-            url_marca = atual.get("watermarkVideoUrl")
-            if isinstance(url_marca, str) and url_marca.strip():
-                return atual
-            pilha.extend(atual.values())
-        elif isinstance(atual, list):
-            pilha.extend(atual)
-    raise RuntimeError("SHOPEE_VIDEO_PUBLICO_NAO_ENCONTRADO")
-
-
-def derivar_url_original_shopee(url_marca):
-    """Deriva a mídia original somente do padrão oficial e conhecido do CDN."""
-    try:
-        parsed = urlparse(str(url_marca or "").strip())
-        host = (parsed.hostname or "").lower().rstrip(".")
-        if (
-            parsed.scheme != "https"
-            or not hostname_permitido(host, "susercontent.com")
-            or parsed.username
-            or parsed.password
-            or parsed.port not in (None, 443)
-        ):
-            raise RuntimeError("SHOPEE_URL_MARCA_NAO_OFICIAL")
-
-        match = re.fullmatch(
-            r"(?P<base>/api/v4/\d+/mms/[A-Za-z0-9_-]+)\.\d{6,}\.\d+\.mp4",
-            parsed.path or "",
-            flags=re.IGNORECASE,
-        )
-        if not match:
-            raise RuntimeError("SHOPEE_ORIGINAL_NAO_DERIVAVEL")
-
-        candidata = parsed._replace(
-            path=f"{match.group('base')}.mp4",
-            query="",
-            fragment="",
-        ).geturl()
-        return candidata, match.group("base").rsplit("/", 1)[-1]
-    except RuntimeError:
-        raise
-    except Exception as e:
-        raise RuntimeError("SHOPEE_ORIGINAL_NAO_DERIVAVEL") from e
-
-
-def tamanho_total_resposta_http(resposta):
-    content_range = str(resposta.headers.get("Content-Range") or "")
-    match = re.search(r"/(\d+)$", content_range)
-    if match:
-        return int(match.group(1))
-    content_length = str(resposta.headers.get("Content-Length") or "").strip()
-    return int(content_length) if content_length.isdigit() else None
-
-
-def validar_midia_original_shopee(url_original):
-    """Confirma a existência do original sem baixar o arquivo inteiro duas vezes."""
-    if not validar_url_http_publica(url_original):
-        raise RuntimeError("SHOPEE_ORIGINAL_DESTINO_INVALIDO")
-
-    headers = {
-        **SHOPEE_HEADERS,
-        "Accept": "video/mp4,video/*;q=0.9,*/*;q=0.8",
-        "Range": "bytes=0-0",
-    }
-    resposta, url_final = seguir_redirecionamentos_no_dominio(
-        url_original,
-        "susercontent.com",
-        headers=headers,
-        max_redirects=3,
-    )
-    try:
-        parsed = urlparse(url_final)
-        host = (parsed.hostname or "").lower().rstrip(".")
-        if not hostname_permitido(host, "susercontent.com"):
-            raise RuntimeError("SHOPEE_ORIGINAL_REDIRECIONAMENTO_INVALIDO")
-        tamanho = tamanho_total_resposta_http(resposta)
-        if tamanho is not None and tamanho > MAX_SOURCE_FILE_BYTES:
-            raise RuntimeError(
-                "ARQUIVO_MIDIA_MUITO_GRANDE fase=shopee_original "
-                f"tamanho={tamanho} limite={MAX_SOURCE_FILE_BYTES}"
-            )
-        return url_final, tamanho
-    finally:
-        resposta.close()
-
-
-def extrair_info_shopee_original(url):
-    """Obtém a mídia pública original, com áudio e sem a versão marcada."""
-    resposta, url_pagina = seguir_redirecionamentos_no_dominio(
-        url,
-        "shopee.com.br",
-        headers=SHOPEE_HEADERS,
-        max_redirects=3,
-    )
-    try:
-        if not detectar_plataforma_url(url_pagina)[5]:
-            raise RuntimeError("SHOPEE_REDIRECIONAMENTO_FORA_DA_PLATAFORMA")
-        conteudo = resposta.content
-        if len(conteudo) > 2 * 1024 * 1024:
-            raise RuntimeError("SHOPEE_PAGINA_EXCESSIVA")
-        encoding = resposta.encoding or "utf-8"
-        html_pagina = conteudo.decode(encoding, errors="replace")
-    finally:
-        resposta.close()
-
-    dados = extrair_json_next_shopee(html_pagina)
-    video = localizar_video_shopee(dados)
-    url_original, video_id = derivar_url_original_shopee(
-        video.get("watermarkVideoUrl")
-    )
-    url_original, tamanho = validar_midia_original_shopee(url_original)
-
-    caption = str(video.get("caption") or "").strip()
-    logger.info(
-        "[SHOPEE_ORIGINAL_OK] "
-        f"video_ref={referencia_privada_log('video', video_id)} "
-        f"tamanho={tamanho} sem_marca=True"
-    )
-    return {
-        "id": video_id,
-        "title": caption or f"Shopee Vídeo {video_id}",
-        "webpage_url": url,
-        "extractor": "ShopeeVideoOriginal",
-        "extractor_key": "ShopeeVideoOriginal",
-        "formats": [
-            {
-                "format_id": "shopee_original",
-                "format_note": "Original sem marca",
-                "url": url_original,
-                "ext": "mp4",
-                "filesize": tamanho,
-                "http_headers": {
-                    **SHOPEE_HEADERS,
-                    "Accept": "video/mp4,video/*;q=0.9,*/*;q=0.8",
-                },
-            }
-        ],
-    }
-
-
 def montar_info_opts(
     is_instagram=False,
     is_pinterest=False,
@@ -4512,7 +4198,6 @@ def montar_download_opts(
     is_tiktok=False,
     tiktok_extractor_args=None,
     is_facebook_reel=False,
-    is_shopee=False,
 ):
     inicio_download = time.monotonic()
 
@@ -4546,9 +4231,11 @@ def montar_download_opts(
 
     if is_instagram:
         opts.pop("http_headers", None)
-        # Prefere uma origem já compatível com o Telegram. Se o Instagram
-        # não oferecer H.264/AAC, o yt-dlp mantém os formatos de fallback.
-        opts["format_sort"] = ["vcodec:h264", "acodec:aac"]
+        # Desde a reestruturação recente do extrator do Instagram, o próprio
+        # yt-dlp define os cabeçalhos e a impersonação necessários. Não
+        # forçamos format_sort aqui: formatos válidos podem desaparecer se a
+        # seleção for restringida antes de o extrator terminar de montá-los.
+        opts["extractor_retries"] = 3
         if usar_cookies:
             cookiefile = get_instagram_cookiefile()
             if cookiefile:
@@ -4571,11 +4258,6 @@ def montar_download_opts(
         }
         opts["format_sort"] = ["vcodec:h264", "acodec:aac"]
         opts["extractor_retries"] = 2
-    elif is_shopee:
-        opts["http_headers"] = {
-            **SHOPEE_HEADERS,
-            "Accept": "video/mp4,video/*;q=0.9,*/*;q=0.8",
-        }
 
     return opts
 
@@ -4596,8 +4278,8 @@ def erro_instagram_permite_fallback(erro):
 def info_plataforma_indica_audio(info):
     """Retorna True/False quando os metadados permitem confirmar o áudio.
 
-    None significa que o extrator não informou codecs suficientes. A decisão
-    final é feita depois do download, inspecionando o arquivo que será enviado.
+    None significa que o extrator não informou codecs suficientes. Nesse caso,
+    o download é tratado de forma conservadora e um arquivo mudo é rejeitado.
     """
     if not isinstance(info, dict):
         return None
@@ -4662,7 +4344,7 @@ def extrair_id_facebook_para_fallback(info, url):
 
 
 def extrair_info_facebook_com_fallback(url):
-    """Prioriza áudio e preserva a melhor resposta pública como último recurso."""
+    """Exige áudio e tenta uma segunda página pública oficial quando necessário."""
     primeiro_info = None
     ultimo_erro = None
 
@@ -4698,7 +4380,7 @@ def extrair_info_facebook_com_fallback(url):
         )
         if primeiro_info is None and ultimo_erro is not None:
             raise ultimo_erro
-        return primeiro_info
+        raise RuntimeError("FACEBOOK_AUDIO_INDISPONIVEL_PUBLICO")
 
     url_alternativa = (
         "https://www.facebook.com/photo.php?"
@@ -4731,13 +4413,7 @@ def extrair_info_facebook_com_fallback(url):
             f"url_ref={referencia_url_log(url_alternativa)} "
             f"erro={sanitizar_erro_log(e)}"
         )
-        if primeiro_info is not None:
-            logger.warning(
-                "[FACEBOOK_REELS_INFO_FALLBACK] "
-                "preservando_primeira_resposta=True"
-            )
-            return primeiro_info
-        raise
+        raise RuntimeError("FACEBOOK_AUDIO_INDISPONIVEL_PUBLICO") from e
 
     audio_alternativo = info_plataforma_indica_audio(info_alternativa)
     if audio_alternativo is True:
@@ -4752,67 +4428,43 @@ def extrair_info_facebook_com_fallback(url):
         "modo=pagina_publica_alternativa "
         f"audio_disponivel={audio_alternativo} fallback_disponivel=False"
     )
-    return primeiro_info or info_alternativa
-
-
-class InstagramYoutubeDLSemImpersonacao(yt_dlp.YoutubeDL):
-    """Força o extrator do Instagram a consultar a página pública comum."""
-
-    def _impersonate_target_available(self, target):
-        return False
+    raise RuntimeError("FACEBOOK_AUDIO_INDISPONIVEL_PUBLICO")
 
 
 def extrair_info_instagram_com_fallback(url):
-    """Tenta cookies, acesso anônimo e página pública sem impersonação."""
+    """Consulta o Instagram com o extrator oficial do yt-dlp.
+
+    Se houver cookies configurados, eles são usados primeiro. Para conteúdo
+    público, uma falha da sessão autenticada cai para acesso anônimo. A
+    impersonação fica totalmente a cargo do yt-dlp/curl-cffi; desativá-la
+    manualmente quebra o fluxo público usado pelas versões atuais do extrator.
+    """
     tem_cookies = bool(INSTAGRAM_COOKIES_TEXT.strip())
     tentativas = []
     if tem_cookies:
-        tentativas.append((True, False, "cookies"))
-    tentativas.append((False, False, "anonima"))
-    if CURL_CFFI_VERSION is not None:
-        tentativas.append((False, True, "publica_sem_impersonacao"))
+        tentativas.append((True, "cookies"))
+    tentativas.append((False, "anonima"))
 
     ultimo_erro = None
-    primeiro_sucesso = None
-    for indice, (usar_cookies, sem_impersonacao, modo) in enumerate(tentativas):
-        proxima_tentativa = (
-            tentativas[indice + 1][2]
-            if indice + 1 < len(tentativas)
-            else None
-        )
+    for indice, (usar_cookies, modo) in enumerate(tentativas):
         try:
             logger.info(
                 f"[INSTAGRAM_INFO] modo={modo} "
                 f"usar_cookies={usar_cookies} "
-                f"sem_impersonacao={sem_impersonacao} "
                 f"url_ref={referencia_url_log(url)}"
             )
-            opts = montar_info_opts(is_instagram=True, usar_cookies=usar_cookies)
-            ydl_class = (
-                InstagramYoutubeDLSemImpersonacao
-                if sem_impersonacao
-                else yt_dlp.YoutubeDL
+            opts = montar_info_opts(
+                is_instagram=True,
+                usar_cookies=usar_cookies,
             )
-            with ydl_class(opts) as ydl:
+            with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=False)
 
-            audio_disponivel = info_plataforma_indica_audio(info)
-            if primeiro_sucesso is None:
-                primeiro_sucesso = (info, usar_cookies)
-
-            if audio_disponivel is True:
-                return info, usar_cookies
-
-            if proxima_tentativa is not None:
-                logger.warning(
-                    "[INSTAGRAM_INFO_SEM_AUDIO] "
-                    f"modo={modo} audio_disponivel={audio_disponivel} "
-                    f"proxima_tentativa={proxima_tentativa}"
-                )
-                continue
-
-            if primeiro_sucesso is not None:
-                return primeiro_sucesso
+            logger.info(
+                "[INSTAGRAM_INFO_OK] "
+                f"modo={modo} "
+                f"audio_disponivel={info_plataforma_indica_audio(info)}"
+            )
             return info, usar_cookies
         except FalhaComponenteDownload:
             raise
@@ -4821,32 +4473,20 @@ def extrair_info_instagram_com_fallback(url):
             logger.warning(
                 f"[INSTAGRAM_INFO_FALHA] modo={modo} "
                 f"usar_cookies={usar_cookies} "
-                f"url_ref={referencia_url_log(url)} erro={sanitizar_erro_log(e)}"
+                f"url_ref={referencia_url_log(url)} "
+                f"erro={sanitizar_erro_log(e)}"
             )
 
-            if proxima_tentativa is not None:
-                if usar_cookies and not erro_instagram_permite_fallback(e):
-                    raise
+            if indice + 1 < len(tentativas):
                 logger.warning(
                     "[INSTAGRAM_INFO_FALLBACK] "
                     f"modo={modo} falhou=True "
-                    f"proxima_tentativa={proxima_tentativa}"
+                    f"proxima_tentativa={tentativas[indice + 1][1]}"
                 )
                 continue
-
-            if primeiro_sucesso is not None:
-                logger.warning(
-                    "[INSTAGRAM_INFO_FALLBACK] "
-                    f"modo={modo} falhou=True "
-                    "preservando_primeira_resposta=True"
-                )
-                return primeiro_sucesso
             raise
 
-    if primeiro_sucesso is not None:
-        return primeiro_sucesso
     raise ultimo_erro or Exception("Falha ao consultar o Instagram")
-
 
 def erro_tiktok_permite_nova_tentativa(erro):
     texto = str(erro or "").lower()
@@ -5019,7 +4659,10 @@ def mapear_erro_download(err_text, plataforma="geral"):
 
     if plataforma == "instagram":
         if "instagram_audio_ausente_no_arquivo" in err:
-            return "❌ Não consegui concluir esse download agora."
+            return (
+                "❌ O Instagram não forneceu uma versão completa com áudio "
+                "deste Reel. Tente novamente em alguns instantes."
+            )
         if "login required" in err or "requested content is not available" in err or "rate-limit reached" in err:
             return "❌ O Instagram bloqueou esse link no momento. Para Reels assim, o bot precisa de cookies válidos da conta logada no Instagram."
         if "private" in err:
@@ -5070,7 +4713,10 @@ def mapear_erro_download(err_text, plataforma="geral"):
             "facebook_audio_ausente_no_arquivo" in err
             or "facebook_audio_indisponivel_publico" in err
         ):
-            return "❌ Não consegui concluir esse download agora."
+            return (
+                "❌ O Facebook não forneceu uma versão completa com áudio "
+                "deste Reel. Tente novamente em alguns instantes."
+            )
         if "private" in err or "login required" in err:
             return "❌ Esse Facebook Reel é privado ou exige login."
         if "403" in err or "429" in err:
@@ -5081,39 +4727,6 @@ def mapear_erro_download(err_text, plataforma="geral"):
         if "timed out" in err or "timeout" in err:
             return "❌ O Facebook demorou para responder. Tente novamente."
         return "❌ Não consegui baixar esse Facebook Reel público agora."
-
-    if plataforma == "shopee":
-        if (
-            "shopee_video_somente" in err
-            or "shopee_redirecionamento_fora_da_plataforma" in err
-            or "redirecionamento_fora_da_plataforma" in err
-        ):
-            return "❌ Envie somente um link público do Shopee Vídeos."
-        if "shopee_audio_ausente_no_original" in err:
-            return (
-                "❌ A Shopee não disponibilizou o áudio na versão original "
-                "desse vídeo. Tente outro link."
-            )
-        if (
-            "shopee_original_nao_derivavel" in err
-            or "shopee_video_publico_nao_encontrado" in err
-            or "shopee_dados_publicos" in err
-            or "shopee_original_destino_invalido" in err
-        ):
-            return (
-                "❌ Não encontrei a versão original sem marca desse vídeo da "
-                "Shopee. Tente outro link."
-            )
-        if "403" in err or "429" in err:
-            return (
-                "❌ A Shopee bloqueou temporariamente esse vídeo. Aguarde alguns "
-                "instantes e tente novamente."
-            )
-        if "404" in err:
-            return "❌ A versão original desse vídeo não está mais disponível."
-        if "timed out" in err or "timeout" in err:
-            return "❌ A Shopee demorou para responder. Tente novamente."
-        return "❌ Não consegui baixar esse vídeo da Shopee agora."
 
     texto_erro = "❌ Erro no link ou formato."
     if "unsupported url" in err:
@@ -6183,7 +5796,7 @@ def mostrar_planos_chat(chat_id, user_id):
         "Escolha o plano ideal para baixar sem limite diário.\n\n"
         "✅ Sem limite diário\n"
         "✅ Prioridade no processamento\n"
-        "✅ Uso liberado para TikTok, Pinterest, Instagram, Facebook Reels, Shopee Vídeos e RedNote\n"
+        "✅ Uso liberado para TikTok, Pinterest, Instagram, Facebook Reels e RedNote\n"
         "✅ Pagamento exclusivamente via Pix\n"
         "✅ Liberação após conferência do pagamento\n\n"
         f"Sua ID: `{user_id}`"
@@ -6627,7 +6240,6 @@ def montar_relatorio_diagnostico():
         else "ℹ️ Cookies do TikTok: não configurados (opcional)"
     )
     linhas.append("✅ Facebook Reels: links públicos, sem cookies")
-    linhas.append("✅ Shopee Vídeos: original público sem marca, sem cookies")
 
     resumo_monitor = obter_resumo_monitoramento()
     alertas_ativos = [
@@ -7427,7 +7039,7 @@ def start(message):
 
     texto = (
         "📥 *Baixar Vídeos HD*\n\n"
-        "Baixe vídeos do TikTok, Pinterest, Instagram, Facebook Reels, Shopee Vídeos e RedNote.\n\n"
+        "Baixe vídeos do TikTok, Pinterest, Instagram, Facebook Reels e RedNote.\n\n"
         "• Qualidade: até 720×1280\n"
         f"• Duração máxima: {MAX_DURATION_SECONDS} segundos\n"
         f"• ID de usuário: `{message.from_user.id}`\n\n"
@@ -8377,18 +7989,17 @@ def formatos_por_plataforma(
     is_pinterest=False,
     is_rednote=False,
     is_facebook_reel=False,
-    is_shopee=False,
 ):
     if is_instagram:
+        # O seletor bv*+ba/b é o padrão moderno recomendado pelo yt-dlp:
+        # prefere um vídeo que já possa conter áudio e combina uma faixa de
+        # áudio separada quando ela existe. As primeiras opções mantêm o limite
+        # do bot; a última é um fallback que o pipeline reduz depois, se preciso.
         return [
-            "bestvideo[ext=mp4][width<=720][height<=1280][fps<=30]+bestaudio[ext=m4a]/best[ext=mp4][width<=720][height<=1280][fps<=30]",
-            "bestvideo[ext=mp4][width<=720][height<=1280]+bestaudio[ext=m4a]/best[ext=mp4][width<=720][height<=1280]",
-            "best[ext=mp4][vcodec!=none][acodec!=none][width<=720][height<=1280][fps<=30]",
-            "best[ext=mp4][vcodec!=none][acodec!=none][width<=720][height<=1280]",
-            "best[ext=mp4][vcodec!=none][acodec!=none]",
-            "best[vcodec!=none][acodec!=none]",
-            "bestvideo[ext=mp4]+bestaudio[ext=m4a]",
-            "best[ext=mp4]/best"
+            "bv*[ext=mp4][width<=720][height<=1280][fps<=30]+ba[ext=m4a]/b[ext=mp4][width<=720][height<=1280][fps<=30]",
+            "bv*[width<=720][height<=1280][fps<=30]+ba/b[width<=720][height<=1280][fps<=30]",
+            "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]",
+            "bv*+ba/b",
         ]
 
     if is_pinterest:
@@ -8414,17 +8025,14 @@ def formatos_por_plataforma(
 
     if is_facebook_reel:
         return [
-            "bestvideo[ext=mp4][width<=720][height<=1280][fps<=30]+bestaudio[ext=m4a]/best[ext=mp4][width<=720][height<=1280][fps<=30]",
-            "bestvideo[width<=720][height<=1280][fps<=30]+bestaudio/best[width<=720][height<=1280][fps<=30]",
             "best[ext=mp4][vcodec!=none][acodec!=none][width<=720][height<=1280][fps<=30]",
             "best[ext=mp4][vcodec!=none][acodec!=none][width<=720][height<=1280]",
+            "bestvideo[ext=mp4][width<=720][height<=1280][fps<=30]+bestaudio[ext=m4a]/best[ext=mp4][width<=720][height<=1280][fps<=30]",
+            "bestvideo[width<=720][height<=1280][fps<=30]+bestaudio/best[width<=720][height<=1280][fps<=30]",
             "best[ext=mp4][vcodec!=none][acodec!=none]",
             "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]",
             "bestvideo+bestaudio/best",
         ]
-
-    if is_shopee:
-        return ["shopee_original"]
 
     return formatos_capados_gerais()
 
@@ -8463,7 +8071,6 @@ def _processar_download(message, url, status_msg, reserva_download=None):
             is_instagram,
             is_rednote,
             is_facebook_reel,
-            is_shopee,
         ) = detectar_plataforma(url)
         plataforma = nome_plataforma(
             is_pinterest,
@@ -8471,15 +8078,12 @@ def _processar_download(message, url, status_msg, reserva_download=None):
             is_instagram,
             is_rednote,
             is_facebook_reel,
-            is_shopee,
         )
 
         if is_instagram:
             url = normalizar_url_instagram(url)
         elif is_facebook_reel:
             url = normalizar_url_facebook_reel(url)
-        elif is_shopee:
-            url = normalizar_url_shopee_video(url)
 
         logger.info(
             f"[DOWNLOAD_INICIO] user_ref={referencia_usuario_log(message.from_user.id)} "
@@ -8492,11 +8096,10 @@ def _processar_download(message, url, status_msg, reserva_download=None):
             or is_instagram
             or is_rednote
             or is_facebook_reel
-            or is_shopee
         ):
             texto_nao_reconhecido = (
                 "❌ Link não reconhecido. Envie um link do TikTok, Pinterest, "
-                "Instagram, Facebook Reels, Shopee Vídeos ou RedNote."
+                "Instagram, Facebook Reels ou RedNote."
             )
             if status_msg:
                 safe_edit_message(message.chat.id, status_msg.message_id, texto_nao_reconhecido)
@@ -8769,8 +8372,6 @@ def _processar_download(message, url, status_msg, reserva_download=None):
                 ) = extrair_info_tiktok_com_fallback(url)
             elif is_facebook_reel:
                 info = extrair_info_facebook_com_fallback(url)
-            elif is_shopee:
-                info = extrair_info_shopee_original(url)
             else:
                 with yt_dlp.YoutubeDL(montar_info_opts()) as ydl:
                     info = ydl.extract_info(url, download=False)
@@ -8794,6 +8395,11 @@ def _processar_download(message, url, status_msg, reserva_download=None):
                 "[FACEBOOK_REELS_AUDIO_INFO] "
                 f"audio_disponivel={audio_facebook_esperado}"
             )
+            if audio_facebook_esperado is not True:
+                raise FalhaComponenteDownload(
+                    plataforma,
+                    "FACEBOOK_AUDIO_INDISPONIVEL_PUBLICO",
+                )
 
         duracao = info.get("duration")
         logger.info(
@@ -8858,7 +8464,6 @@ def _processar_download(message, url, status_msg, reserva_download=None):
             is_pinterest=is_pinterest,
             is_rednote=is_rednote,
             is_facebook_reel=is_facebook_reel,
-            is_shopee=is_shopee,
         )
         baixou = False
         ultimo_erro = None
@@ -8883,7 +8488,6 @@ def _processar_download(message, url, status_msg, reserva_download=None):
                 is_tiktok=is_tiktok,
                 tiktok_extractor_args=tiktok_extractor_args_usados,
                 is_facebook_reel=is_facebook_reel,
-                is_shopee=is_shopee,
             )
 
             for fmt in formatos:
@@ -8899,7 +8503,7 @@ def _processar_download(message, url, status_msg, reserva_download=None):
 
                     arquivo_baixado = encontrar_arquivo_baixado(prefix)
                     if arquivo_baixado and os.path.exists(arquivo_baixado):
-                        if is_instagram:
+                        if is_instagram and audio_instagram_esperado is True:
                             info_arquivo_baixado = obter_info_midia(arquivo_baixado)
                             if not arquivo_possui_audio(info_arquivo_baixado):
                                 ultimo_erro = (
@@ -8925,16 +8529,6 @@ def _processar_download(message, url, status_msg, reserva_download=None):
                                     "[FACEBOOK_REELS_AUDIO_RETRY] "
                                     f"audio_esperado={audio_facebook_esperado} "
                                     f"formato={fmt} "
-                                    f"arquivo_ref={referencia_arquivo_log(arquivo_baixado)}"
-                                )
-                                cleanup_prefix(prefix)
-                                continue
-                        if is_shopee:
-                            info_arquivo_baixado = obter_info_midia(arquivo_baixado)
-                            if not arquivo_possui_audio(info_arquivo_baixado):
-                                ultimo_erro = "SHOPEE_AUDIO_AUSENTE_NO_ORIGINAL"
-                                logger.warning(
-                                    "[SHOPEE_AUDIO_AUSENTE] "
                                     f"arquivo_ref={referencia_arquivo_log(arquivo_baixado)}"
                                 )
                                 cleanup_prefix(prefix)
@@ -8981,56 +8575,40 @@ def _processar_download(message, url, status_msg, reserva_download=None):
             MAX_OUTPUT_FILE_BYTES,
             fase="envio",
         )
-        registrar_sucesso_componente("Processamento")
 
-        envio_sem_audio = False
-        if is_instagram or is_facebook_reel or is_shopee:
-            info_arquivo_envio = obter_info_midia(arquivo_envio)
-            envio_sem_audio = not arquivo_possui_audio(info_arquivo_envio)
-            logger.info(
-                f"[AUDIO_ARQUIVO_FINAL] plataforma={plataforma} "
-                f"sem_audio={envio_sem_audio}"
-            )
-            if envio_sem_audio:
-                if is_instagram:
-                    erro_audio = "INSTAGRAM_AUDIO_AUSENTE_NO_ARQUIVO"
-                elif is_facebook_reel:
-                    erro_audio = "FACEBOOK_AUDIO_AUSENTE_NO_ARQUIVO"
-                else:
-                    erro_audio = "SHOPEE_AUDIO_AUSENTE_NO_ORIGINAL"
-                raise FalhaComponenteDownload(
-                    plataforma,
-                    erro_audio,
+        instagram_sem_audio = False
+        if is_instagram:
+            try:
+                instagram_sem_audio = not arquivo_possui_audio(
+                    obter_info_midia(arquivo_envio)
                 )
+            except Exception as e:
+                logger.warning(
+                    "[INSTAGRAM_AUDIO_CHECK] "
+                    f"arquivo_ref={referencia_arquivo_log(arquivo_envio)} "
+                    f"erro={sanitizar_erro_log(e)}"
+                )
+
+        registrar_sucesso_componente("Processamento")
 
         (
             enviado,
             telegram_file_id,
             telegram_media_type,
             bytes_upload,
-        ) = enviar_arquivo_com_fallback(
-            message.chat.id,
-            arquivo_envio,
-            sem_audio=envio_sem_audio,
-        )
+        ) = enviar_arquivo_com_fallback(message.chat.id, arquivo_envio)
         if not enviado:
             raise Exception("Falha ao enviar arquivo ao Telegram")
 
-        if envio_sem_audio:
-            logger.info(
-                f"[CACHE_MIDIA_IGNORADO] plataforma={plataforma} "
-                "motivo=arquivo_sem_audio"
-            )
-        else:
-            salvar_file_id_cache(
-                cache_key,
-                cache_source_id,
-                plataforma,
-                telegram_file_id,
-                telegram_media_type,
-                url_cache_key=url_cache_key,
-                url_normalizada=url_normalizada,
-            )
+        salvar_file_id_cache(
+            cache_key,
+            cache_source_id,
+            plataforma,
+            telegram_file_id,
+            telegram_media_type,
+            url_cache_key=url_cache_key,
+            url_normalizada=url_normalizada,
+        )
 
         registrar_download_diario(
             vip_status,
@@ -9044,6 +8622,17 @@ def _processar_download(message, url, status_msg, reserva_download=None):
                 message.from_user.id,
                 message.chat.id,
                 message.from_user.id,
+            )
+
+        if is_instagram and instagram_sem_audio:
+            logger.warning(
+                "[INSTAGRAM_SEM_AUDIO_ENTREGUE] "
+                f"user_ref={referencia_usuario_log(message.from_user.id)} "
+                f"url_ref={referencia_url_log(url)}"
+            )
+            safe_send_message(
+                message.chat.id,
+                "🔇 Não foi possível incluir o áudio nesta versão.",
             )
 
         if status_msg:
@@ -9083,8 +8672,6 @@ def _processar_download(message, url, status_msg, reserva_download=None):
             plataforma_erro = "tiktok"
         elif "facebook.com" in url_erro or "fb.watch" in url_erro:
             plataforma_erro = "facebook"
-        elif "shp.ee" in url_erro or "shopee.com.br" in url_erro:
-            plataforma_erro = "shopee"
         else:
             plataforma_erro = "geral"
         texto_erro = mapear_falha_componente_download(
@@ -9110,8 +8697,6 @@ def _processar_download(message, url, status_msg, reserva_download=None):
             plataforma_erro = "tiktok"
         elif "facebook.com" in url_erro or "fb.watch" in url_erro:
             plataforma_erro = "facebook"
-        elif "shp.ee" in url_erro or "shopee.com.br" in url_erro:
-            plataforma_erro = "shopee"
         else:
             plataforma_erro = "geral"
         texto_erro = mapear_erro_download(str(e), plataforma=plataforma_erro)
@@ -9587,7 +9172,7 @@ def handle_download(message):
         safe_reply_to(
             message,
             "❌ Link não reconhecido. Envie um link do TikTok, Pinterest, "
-            "Instagram, Facebook Reels, Shopee Vídeos ou RedNote.",
+            "Instagram, Facebook Reels ou RedNote.",
         )
         return
 
@@ -9971,15 +9556,12 @@ if __name__ == "__main__":
     logger.info(
         "[INSTAGRAM_AUDIO_CONFIG] validacao=True "
         f"cache_version={INSTAGRAM_AUDIO_CACHE_VERSION} "
-        "prefer_h264=True audio_obrigatorio=True "
-        "envia_sem_audio=False preserva_aac=True"
+        "prefer_h264=True fallback_com_audio=True"
     )
     logger.info(
         "[FACEBOOK_REELS_CONFIG] publico_somente=True cookies=False "
         "max_duration_compartilhado=True prefer_h264=True "
-        "validacao_audio=True fallback_publico=True "
-        "audio_obrigatorio=True envia_sem_audio=False "
-        "preserva_aac=True cache_sem_audio=False "
+        "validacao_audio=True fallback_publico=True rejeita_sem_audio=True "
         f"cache_version={FACEBOOK_AUDIO_CACHE_VERSION}"
     )
     if TIKTOK_IMPERSONATION_DISPONIVEL:
