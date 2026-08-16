@@ -4296,10 +4296,11 @@ def erro_instagram_permite_fallback(erro):
 
 
 def info_plataforma_indica_audio(info):
-    """Retorna True/False quando os metadados permitem confirmar o áudio.
+    """Retorna True/False/None conforme a certeza dos metadados de áudio.
 
-    None significa que o extrator não informou codecs suficientes. Nesse caso,
-    o download é tratado de forma conservadora e um arquivo mudo é rejeitado.
+    True  = existe ao menos um stream confirmado com áudio.
+    False = todos os formatos observáveis são explicitamente video-only.
+    None  = há formatos com codec desconhecido; o arquivo precisa de ffprobe.
     """
     if not isinstance(info, dict):
         return None
@@ -4312,21 +4313,36 @@ def info_plataforma_indica_audio(info):
         elif isinstance(valor, dict):
             itens.append(valor)
 
-    codec_observado = False
+    viu_sem_audio_explicito = False
+    viu_codec_desconhecido = False
+
     for item in itens:
-        acodec = item.get("acodec")
-        if acodec not in (None, ""):
-            codec_observado = True
-            if str(acodec).strip().lower() not in ("none", "null", "unknown"):
-                return True
+        acodec_raw = item.get("acodec")
+        audio_ext_raw = item.get("audio_ext")
 
-        audio_ext = item.get("audio_ext")
-        if audio_ext not in (None, ""):
-            codec_observado = True
-            if str(audio_ext).strip().lower() not in ("none", "null", "unknown"):
-                return True
+        if acodec_raw in (None, "") and audio_ext_raw in (None, ""):
+            # Formatos progressivos do Instagram costumam aparecer assim.
+            viu_codec_desconhecido = True
+            continue
 
-    return False if codec_observado else None
+        acodec = str(acodec_raw or "").strip().lower()
+        audio_ext = str(audio_ext_raw or "").strip().lower()
+
+        if acodec and acodec not in ("none", "null", "unknown"):
+            return True
+        if audio_ext and audio_ext not in ("none", "null", "unknown"):
+            return True
+
+        if acodec == "unknown" or audio_ext == "unknown":
+            viu_codec_desconhecido = True
+        if acodec in ("none", "null") or audio_ext in ("none", "null"):
+            viu_sem_audio_explicito = True
+
+    if viu_codec_desconhecido:
+        return None
+    if viu_sem_audio_explicito:
+        return False
+    return None
 
 
 def arquivo_possui_audio(info_midia):
@@ -4479,6 +4495,58 @@ def resumir_formatos_instagram(info):
         f"[INSTAGRAM_FORMATOS] total={len(formatos)} "
         f"itens={' '.join(resumo)[:3500]}"
     )
+
+
+def formatos_progressivos_instagram(info):
+    """Retorna MP4s HTTP diretos antes dos DASH video-only.
+
+    O Instagram frequentemente expõe os codecs desses MP4s como desconhecidos
+    (None/unknown), embora o arquivo final possa ser H.264 + AAC. Por isso cada
+    candidato é baixado e confirmado com ffprobe antes de ser aceito.
+    """
+    formatos = (info or {}).get("formats") if isinstance(info, dict) else None
+    if not isinstance(formatos, list):
+        return []
+
+    candidatos = []
+    for item in formatos:
+        if not isinstance(item, dict):
+            continue
+        format_id = str(item.get("format_id") or "").strip()
+        if not format_id or format_id.lower().startswith("dash-"):
+            continue
+        if str(item.get("ext") or "").lower() != "mp4":
+            continue
+        protocolo = str(item.get("protocol") or "").lower()
+        if protocolo and not protocolo.startswith("http"):
+            continue
+
+        # Se o extrator afirma explicitamente que é video-only, não é candidato
+        # progressivo. None/unknown é mantido porque precisa ser verificado no
+        # arquivo real com ffprobe.
+        acodec = str(item.get("acodec") or "").strip().lower()
+        if acodec in ("none", "null"):
+            continue
+
+        largura = item.get("width")
+        altura = item.get("height")
+        try:
+            if largura and int(largura) > 720:
+                continue
+            if altura and int(altura) > 1280:
+                continue
+        except (TypeError, ValueError):
+            pass
+
+        candidatos.append(format_id)
+
+    # Remove duplicados preservando a ordem entregue pelo Instagram.
+    candidatos = list(dict.fromkeys(candidatos))
+    logger.info(
+        f"[INSTAGRAM_PROGRESSIVOS] total={len(candidatos)} "
+        f"ids={','.join(candidatos[:12])}"
+    )
+    return candidatos
 
 
 def extrair_info_instagram_com_fallback(url):
@@ -8545,13 +8613,17 @@ def _processar_download(message, url, status_msg, reserva_download=None):
             informar_download_pausado_por_espaco(message, status_msg)
             return
 
-        formatos = formatos_por_plataforma(
+        formatos_progressivos_ig = (
+            formatos_progressivos_instagram(info) if is_instagram else []
+        )
+        formatos = formatos_progressivos_ig + formatos_por_plataforma(
             is_tiktok=is_tiktok,
             is_instagram=is_instagram,
             is_pinterest=is_pinterest,
             is_rednote=is_rednote,
             is_facebook_reel=is_facebook_reel,
         )
+        formatos = list(dict.fromkeys(formatos))
         baixou = False
         ultimo_erro = None
 
@@ -8590,21 +8662,43 @@ def _processar_download(message, url, status_msg, reserva_download=None):
 
                     arquivo_baixado = encontrar_arquivo_baixado(prefix)
                     if arquivo_baixado and os.path.exists(arquivo_baixado):
-                        if is_instagram and audio_instagram_esperado is True:
+                        if is_instagram:
                             info_arquivo_baixado = obter_info_midia(arquivo_baixado)
-                            if not arquivo_possui_audio(info_arquivo_baixado):
+                            tem_audio_real = arquivo_possui_audio(info_arquivo_baixado)
+                            logger.info(
+                                "[INSTAGRAM_AUDIO_PROBE] "
+                                f"formato={fmt} tem_audio={tem_audio_real} "
+                                f"vcodec={info_arquivo_baixado.get('vcodec')} "
+                                f"acodec={info_arquivo_baixado.get('acodec')}"
+                            )
+                            if not tem_audio_real:
                                 ultimo_erro = (
                                     "INSTAGRAM_AUDIO_AUSENTE_NO_ARQUIVO "
                                     f"metadata={audio_instagram_esperado}"
                                 )
+                                # Os IDs diretos/HTTP são justamente os formatos
+                                # que o yt-dlp marca como codec desconhecido. Testa
+                                # todos eles antes de aceitar o fallback mudo.
+                                if fmt in formatos_progressivos_ig:
+                                    logger.warning(
+                                        "[INSTAGRAM_PROGRESSIVO_SEM_AUDIO] "
+                                        f"formato={fmt} tentando_proximo=True"
+                                    )
+                                    cleanup_prefix(prefix)
+                                    continue
+                                if audio_instagram_esperado is True:
+                                    logger.warning(
+                                        "[INSTAGRAM_AUDIO_RETRY] "
+                                        f"audio_esperado={audio_instagram_esperado} "
+                                        f"formato={fmt} "
+                                        f"arquivo_ref={referencia_arquivo_log(arquivo_baixado)}"
+                                    )
+                                    cleanup_prefix(prefix)
+                                    continue
                                 logger.warning(
-                                    "[INSTAGRAM_AUDIO_RETRY] "
-                                    f"audio_esperado={audio_instagram_esperado} "
-                                    f"formato={fmt} "
-                                    f"arquivo_ref={referencia_arquivo_log(arquivo_baixado)}"
+                                    "[INSTAGRAM_FALLBACK_SEM_AUDIO] "
+                                    f"formato={fmt} metadata={audio_instagram_esperado}"
                                 )
-                                cleanup_prefix(prefix)
-                                continue
                         if is_facebook_reel:
                             info_arquivo_baixado = obter_info_midia(arquivo_baixado)
                             if not arquivo_possui_audio(info_arquivo_baixado):
