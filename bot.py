@@ -215,10 +215,9 @@ MONITOR_SUCCESS_LOG_INTERVAL_SECONDS = 900
 MEDIA_PROFILE_VERSION = (
     f"720x1280_30fps_h264_crf{VIDEO_CRF}_audio{AUDIO_BITRATE}_sem_marca_v2"
 )
-INSTAGRAM_AUDIO_CACHE_VERSION = "instagram_audio_v4"
+INSTAGRAM_AUDIO_CACHE_VERSION = "instagram_audio_v5_nocookies"
 FACEBOOK_AUDIO_CACHE_VERSION = "facebook_audio_v2"
 
-INSTAGRAM_COOKIES_TEXT = os.environ.get("INSTAGRAM_COOKIES_TEXT", "")
 TIKTOK_COOKIES_TEXT = os.environ.get("TIKTOK_COOKIES_TEXT", "")
 TIKTOK_DEVICE_ID_TEXT = os.environ.get("TIKTOK_DEVICE_ID", "")
 TIKWM_API_URL = os.environ.get("TIKWM_API_URL", "https://www.tikwm.com/api/").strip()
@@ -299,7 +298,6 @@ COMPONENT_MONITOR_STATE = {
 }
 
 ARQUIVOS_PERSISTENTES_DOWNLOAD_DIR = {
-    "instagram_cookies.txt",
     "tiktok_cookies.txt",
     "tiktok_device_id.txt",
 }
@@ -3680,55 +3678,6 @@ def autorizar_limite_global_persistente(user_id):
     return True, None
 
 
-def get_instagram_cookiefile():
-    texto = (INSTAGRAM_COOKIES_TEXT or "").strip().lstrip("\ufeff")
-    if not texto:
-        return None
-
-    garantir_estrutura_privada()
-
-    # A Railway pode receber o conteúdo com quebras/tabs reais ou escapados.
-    # Normaliza ambos para o formato Netscape que o yt-dlp espera no Linux.
-    if "\n" not in texto and "\\n" in texto:
-        texto = texto.replace("\\r\\n", "\n").replace("\\n", "\n")
-    if "\t" not in texto and "\\t" in texto:
-        texto = texto.replace("\\t", "\t")
-
-    texto = texto.replace("\r\n", "\n").replace("\r", "\n").strip()
-
-    # O yt-dlp espera o formato Netscape/Mozilla.
-    if not texto.startswith("# Netscape HTTP Cookie File") and not texto.startswith("# HTTP Cookie File"):
-        texto = "# Netscape HTTP Cookie File\n" + texto
-
-    cookie_path = os.path.join(PRIVATE_COOKIES_DIR, "instagram_cookies.txt")
-    escrever_texto_privado(cookie_path, texto + "\n")
-
-    linhas_cookie = []
-    for linha in texto.splitlines():
-        linha = linha.strip("\r\n")
-        if not linha:
-            continue
-        # Linhas #HttpOnly_ são cookies válidos no formato Netscape.
-        if linha.startswith("#HttpOnly_"):
-            linha_parse = linha[len("#HttpOnly_"):]
-        elif linha.startswith("#"):
-            continue
-        else:
-            linha_parse = linha
-
-        partes = linha_parse.split("\t")
-        if len(partes) >= 7:
-            linhas_cookie.append(partes)
-
-    tem_sessionid = any(partes[5] == "sessionid" for partes in linhas_cookie)
-    tem_csrftoken = any(partes[5] == "csrftoken" for partes in linhas_cookie)
-    logger.info(
-        f"[INSTAGRAM_COOKIES] arquivo_criado=True linhas={len(linhas_cookie)} "
-        f"tem_sessionid={tem_sessionid} tem_csrftoken={tem_csrftoken}"
-    )
-    return cookie_path
-
-
 def normalizar_tiktok_cookies_text(texto):
     texto = (texto or "").strip().lstrip("\ufeff")
     if not texto:
@@ -4169,7 +4118,6 @@ def montar_info_opts(
     usar_cookies=True,
     is_tiktok=False,
     tiktok_extractor_args=None,
-    instagram_extractor_args=None,
     is_facebook_reel=False,
 ):
     opts = {
@@ -4183,14 +4131,9 @@ def montar_info_opts(
     }
 
     if is_instagram:
-        # O extrator do yt-dlp configura os cabeçalhos e a impersonação.
-        # Cabeçalhos manuais podem ficar incompatíveis quando o Instagram muda.
-        if usar_cookies:
-            cookiefile = get_instagram_cookiefile()
-            if cookiefile:
-                opts["cookiefile"] = cookiefile
-        if instagram_extractor_args:
-            opts["extractor_args"] = instagram_extractor_args
+        # Instagram funciona apenas em modo público/anônimo.
+        # Nenhuma sessão, cookie ou credencial de conta é enviada.
+        pass
     elif is_pinterest:
         opts["http_headers"] = PINTEREST_HEADERS
     elif is_tiktok:
@@ -4251,15 +4194,9 @@ def montar_download_opts(
 
     if is_instagram:
         opts.pop("http_headers", None)
-        # Desde a reestruturação recente do extrator do Instagram, o próprio
-        # yt-dlp define os cabeçalhos e a impersonação necessários. Não
-        # forçamos format_sort aqui: formatos válidos podem desaparecer se a
-        # seleção for restringida antes de o extrator terminar de montá-los.
+        # Instagram funciona apenas em modo público/anônimo.
+        # O yt-dlp define os cabeçalhos/impersonação e nenhuma sessão é usada.
         opts["extractor_retries"] = 3
-        if usar_cookies:
-            cookiefile = get_instagram_cookiefile()
-            if cookiefile:
-                opts["cookiefile"] = cookiefile
     elif is_pinterest:
         opts["http_headers"] = PINTEREST_HEADERS
     elif is_tiktok:
@@ -4550,98 +4487,36 @@ def formatos_progressivos_instagram(info):
 
 
 def extrair_info_instagram_com_fallback(url):
-    """Consulta o Instagram por três rotas, priorizando sessão autenticada.
+    """Consulta o Instagram somente em modo público/anônimo.
 
-    1) API web padrão do yt-dlp com cookies.
-    2) API iOS oficial suportada pelo extrator do yt-dlp, com os mesmos cookies.
-    3) Acesso público/anônimo como último recurso.
+    Cookies e credenciais de conta do Instagram ficam deliberadamente
+    desativados para evitar qualquer dependência de uma sessão pessoal.
     """
-    tem_cookies = bool(INSTAGRAM_COOKIES_TEXT.strip())
-    tentativas = []
+    logger.info(
+        "[INSTAGRAM_INFO] modo=anonima usar_cookies=False "
+        f"url_ref={referencia_url_log(url)}"
+    )
+    try:
+        opts = montar_info_opts(is_instagram=True, usar_cookies=False)
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
 
-    if tem_cookies:
-        tentativas.extend([
-            {
-                "usar_cookies": True,
-                "modo": "cookies_web",
-                "extractor_args": {"instagram": {"app_id": ["web"]}},
-            },
-            {
-                "usar_cookies": True,
-                "modo": "cookies_ios",
-                "extractor_args": {"instagram": {"app_id": ["ios"]}},
-            },
-        ])
-
-    tentativas.append({
-        "usar_cookies": False,
-        "modo": "anonima",
-        "extractor_args": None,
-    })
-
-    ultimo_erro = None
-    for indice, tentativa in enumerate(tentativas):
-        usar_cookies = tentativa["usar_cookies"]
-        modo = tentativa["modo"]
-        extractor_args = tentativa["extractor_args"]
-
-        try:
-            logger.info(
-                f"[INSTAGRAM_INFO] modo={modo} "
-                f"usar_cookies={usar_cookies} "
-                f"url_ref={referencia_url_log(url)}"
-            )
-            opts = montar_info_opts(
-                is_instagram=True,
-                usar_cookies=usar_cookies,
-                instagram_extractor_args=extractor_args,
-            )
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=False)
-
-            audio_disponivel = info_plataforma_indica_audio(info)
-            logger.info(
-                "[INSTAGRAM_INFO_OK] "
-                f"modo={modo} "
-                f"audio_disponivel={audio_disponivel}"
-            )
-            resumir_formatos_instagram(info)
-
-            # Se uma API autenticada respondeu, mas só expôs vídeo mudo,
-            # tenta a outra API autenticada antes do acesso anônimo.
-            if audio_disponivel is not True and indice + 1 < len(tentativas):
-                proximo = tentativas[indice + 1]["modo"]
-                if usar_cookies:
-                    logger.warning(
-                        "[INSTAGRAM_INFO_SEM_AUDIO] "
-                        f"modo={modo} audio_disponivel={audio_disponivel} "
-                        f"proxima_tentativa={proximo}"
-                    )
-                    continue
-
-            return info, usar_cookies
-
-        except FalhaComponenteDownload:
-            raise
-        except Exception as e:
-            ultimo_erro = e
-            logger.warning(
-                f"[INSTAGRAM_INFO_FALHA] modo={modo} "
-                f"usar_cookies={usar_cookies} "
-                f"url_ref={referencia_url_log(url)} "
-                f"erro={sanitizar_erro_log(e)}"
-            )
-
-            if indice + 1 < len(tentativas):
-                logger.warning(
-                    "[INSTAGRAM_INFO_FALLBACK] "
-                    f"modo={modo} falhou=True "
-                    f"proxima_tentativa={tentativas[indice + 1]['modo']}"
-                )
-                continue
-            raise
-
-    raise ultimo_erro or Exception("Falha ao consultar o Instagram")
+        audio_disponivel = info_plataforma_indica_audio(info)
+        logger.info(
+            "[INSTAGRAM_INFO_OK] "
+            f"modo=anonima audio_disponivel={audio_disponivel}"
+        )
+        resumir_formatos_instagram(info)
+        return info, False
+    except FalhaComponenteDownload:
+        raise
+    except Exception as e:
+        logger.warning(
+            "[INSTAGRAM_INFO_FALHA] modo=anonima usar_cookies=False "
+            f"url_ref={referencia_url_log(url)} "
+            f"erro={sanitizar_erro_log(e)}"
+        )
+        raise
 
 def erro_tiktok_permite_nova_tentativa(erro):
     texto = str(erro or "").lower()
@@ -4819,7 +4694,7 @@ def mapear_erro_download(err_text, plataforma="geral"):
                 "deste Reel. Tente novamente em alguns instantes."
             )
         if "login required" in err or "requested content is not available" in err or "rate-limit reached" in err:
-            return "❌ O Instagram bloqueou esse link no momento. Para Reels assim, o bot precisa de cookies válidos da conta logada no Instagram."
+            return "❌ Esse conteúdo do Instagram não está disponível pelo acesso público no momento."
         if "private" in err:
             return "❌ Esse conteúdo do Instagram é privado."
         if "403" in err:
@@ -6384,11 +6259,7 @@ def montar_relatorio_diagnostico():
         linhas.append("⚠️ TikTok sem marca: pausa automática temporária")
         problemas.append("Circuito TikTok temporariamente pausado")
 
-    linhas.append(
-        "✅ Cookies do Instagram: configurados"
-        if INSTAGRAM_COOKIES_TEXT.strip()
-        else "ℹ️ Cookies do Instagram: não configurados (opcional)"
-    )
+    linhas.append("✅ Instagram: modo público/anônimo, sem cookies")
     linhas.append(
         "✅ Cookies do TikTok: configurados"
         if TIKTOK_COOKIES_TEXT.strip()
@@ -8628,9 +8499,7 @@ def _processar_download(message, url, status_msg, reserva_download=None):
         ultimo_erro = None
 
         if is_instagram:
-            modos_cookie = [usar_cookies_plataforma]
-            if usar_cookies_plataforma and INSTAGRAM_COOKIES_TEXT.strip():
-                modos_cookie.append(False)
+            modos_cookie = [False]
         elif is_tiktok:
             modos_cookie = [usar_cookies_plataforma]
             if usar_cookies_plataforma:
