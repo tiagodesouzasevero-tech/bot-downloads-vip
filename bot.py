@@ -3681,15 +3681,18 @@ def autorizar_limite_global_persistente(user_id):
 
 
 def get_instagram_cookiefile():
-    texto = (INSTAGRAM_COOKIES_TEXT or "").strip()
+    texto = (INSTAGRAM_COOKIES_TEXT or "").strip().lstrip("\ufeff")
     if not texto:
         return None
 
     garantir_estrutura_privada()
 
-    # Algumas plataformas salvam quebras de linha como os caracteres \n.
+    # A Railway pode receber o conteúdo com quebras/tabs reais ou escapados.
+    # Normaliza ambos para o formato Netscape que o yt-dlp espera no Linux.
     if "\n" not in texto and "\\n" in texto:
         texto = texto.replace("\\r\\n", "\n").replace("\\n", "\n")
+    if "\t" not in texto and "\\t" in texto:
+        texto = texto.replace("\\t", "\t")
 
     texto = texto.replace("\r\n", "\n").replace("\r", "\n").strip()
 
@@ -3700,14 +3703,28 @@ def get_instagram_cookiefile():
     cookie_path = os.path.join(PRIVATE_COOKIES_DIR, "instagram_cookies.txt")
     escrever_texto_privado(cookie_path, texto + "\n")
 
-    linhas = [linha for linha in texto.splitlines() if linha and not linha.startswith("#")]
-    tem_sessionid = any(
-        len(partes := linha.split("\t")) >= 7 and partes[5] == "sessionid"
-        for linha in linhas
-    )
+    linhas_cookie = []
+    for linha in texto.splitlines():
+        linha = linha.strip("\r\n")
+        if not linha:
+            continue
+        # Linhas #HttpOnly_ são cookies válidos no formato Netscape.
+        if linha.startswith("#HttpOnly_"):
+            linha_parse = linha[len("#HttpOnly_"):]
+        elif linha.startswith("#"):
+            continue
+        else:
+            linha_parse = linha
+
+        partes = linha_parse.split("\t")
+        if len(partes) >= 7:
+            linhas_cookie.append(partes)
+
+    tem_sessionid = any(partes[5] == "sessionid" for partes in linhas_cookie)
+    tem_csrftoken = any(partes[5] == "csrftoken" for partes in linhas_cookie)
     logger.info(
-        f"[INSTAGRAM_COOKIES] arquivo_criado=True linhas={len(linhas)} "
-        f"tem_sessionid={tem_sessionid}"
+        f"[INSTAGRAM_COOKIES] arquivo_criado=True linhas={len(linhas_cookie)} "
+        f"tem_sessionid={tem_sessionid} tem_csrftoken={tem_csrftoken}"
     )
     return cookie_path
 
@@ -4152,6 +4169,7 @@ def montar_info_opts(
     usar_cookies=True,
     is_tiktok=False,
     tiktok_extractor_args=None,
+    instagram_extractor_args=None,
     is_facebook_reel=False,
 ):
     opts = {
@@ -4171,6 +4189,8 @@ def montar_info_opts(
             cookiefile = get_instagram_cookiefile()
             if cookiefile:
                 opts["cookiefile"] = cookiefile
+        if instagram_extractor_args:
+            opts["extractor_args"] = instagram_extractor_args
     elif is_pinterest:
         opts["http_headers"] = PINTEREST_HEADERS
     elif is_tiktok:
@@ -4431,22 +4451,72 @@ def extrair_info_facebook_com_fallback(url):
     raise RuntimeError("FACEBOOK_AUDIO_INDISPONIVEL_PUBLICO")
 
 
-def extrair_info_instagram_com_fallback(url):
-    """Consulta o Instagram com o extrator oficial do yt-dlp.
+def resumir_formatos_instagram(info):
+    """Registra codecs/formats sem expor URLs assinadas do Instagram."""
+    formatos = (info or {}).get("formats") if isinstance(info, dict) else None
+    if not isinstance(formatos, list):
+        logger.info("[INSTAGRAM_FORMATOS] total=0")
+        return
 
-    Se houver cookies configurados, eles são usados primeiro. Para conteúdo
-    público, uma falha da sessão autenticada cai para acesso anônimo. A
-    impersonação fica totalmente a cargo do yt-dlp/curl-cffi; desativá-la
-    manualmente quebra o fluxo público usado pelas versões atuais do extrator.
+    resumo = []
+    for item in formatos[:20]:
+        if not isinstance(item, dict):
+            continue
+        resumo.append(
+            "{id=%s ext=%s v=%s a=%s %sx%s fps=%s proto=%s}" % (
+                item.get("format_id"),
+                item.get("ext"),
+                item.get("vcodec"),
+                item.get("acodec"),
+                item.get("width"),
+                item.get("height"),
+                item.get("fps"),
+                item.get("protocol"),
+            )
+        )
+
+    logger.info(
+        f"[INSTAGRAM_FORMATOS] total={len(formatos)} "
+        f"itens={' '.join(resumo)[:3500]}"
+    )
+
+
+def extrair_info_instagram_com_fallback(url):
+    """Consulta o Instagram por três rotas, priorizando sessão autenticada.
+
+    1) API web padrão do yt-dlp com cookies.
+    2) API iOS oficial suportada pelo extrator do yt-dlp, com os mesmos cookies.
+    3) Acesso público/anônimo como último recurso.
     """
     tem_cookies = bool(INSTAGRAM_COOKIES_TEXT.strip())
     tentativas = []
+
     if tem_cookies:
-        tentativas.append((True, "cookies"))
-    tentativas.append((False, "anonima"))
+        tentativas.extend([
+            {
+                "usar_cookies": True,
+                "modo": "cookies_web",
+                "extractor_args": {"instagram": {"app_id": ["web"]}},
+            },
+            {
+                "usar_cookies": True,
+                "modo": "cookies_ios",
+                "extractor_args": {"instagram": {"app_id": ["ios"]}},
+            },
+        ])
+
+    tentativas.append({
+        "usar_cookies": False,
+        "modo": "anonima",
+        "extractor_args": None,
+    })
 
     ultimo_erro = None
-    for indice, (usar_cookies, modo) in enumerate(tentativas):
+    for indice, tentativa in enumerate(tentativas):
+        usar_cookies = tentativa["usar_cookies"]
+        modo = tentativa["modo"]
+        extractor_args = tentativa["extractor_args"]
+
         try:
             logger.info(
                 f"[INSTAGRAM_INFO] modo={modo} "
@@ -4456,16 +4526,33 @@ def extrair_info_instagram_com_fallback(url):
             opts = montar_info_opts(
                 is_instagram=True,
                 usar_cookies=usar_cookies,
+                instagram_extractor_args=extractor_args,
             )
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=False)
 
+            audio_disponivel = info_plataforma_indica_audio(info)
             logger.info(
                 "[INSTAGRAM_INFO_OK] "
                 f"modo={modo} "
-                f"audio_disponivel={info_plataforma_indica_audio(info)}"
+                f"audio_disponivel={audio_disponivel}"
             )
+            resumir_formatos_instagram(info)
+
+            # Se uma API autenticada respondeu, mas só expôs vídeo mudo,
+            # tenta a outra API autenticada antes do acesso anônimo.
+            if audio_disponivel is not True and indice + 1 < len(tentativas):
+                proximo = tentativas[indice + 1]["modo"]
+                if usar_cookies:
+                    logger.warning(
+                        "[INSTAGRAM_INFO_SEM_AUDIO] "
+                        f"modo={modo} audio_disponivel={audio_disponivel} "
+                        f"proxima_tentativa={proximo}"
+                    )
+                    continue
+
             return info, usar_cookies
+
         except FalhaComponenteDownload:
             raise
         except Exception as e:
@@ -4481,7 +4568,7 @@ def extrair_info_instagram_com_fallback(url):
                 logger.warning(
                     "[INSTAGRAM_INFO_FALLBACK] "
                     f"modo={modo} falhou=True "
-                    f"proxima_tentativa={tentativas[indice + 1][1]}"
+                    f"proxima_tentativa={tentativas[indice + 1]['modo']}"
                 )
                 continue
             raise
