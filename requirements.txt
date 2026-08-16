@@ -1,4 +1,4 @@
 pyTelegramBotAPI
-yt-dlp[default,curl-cffi]==2026.8.4.234419.dev0
+yt-dlp[default,curl-cffi]==2026.7.4
 pymongo[srv]
 requests
