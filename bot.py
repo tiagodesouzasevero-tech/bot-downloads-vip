@@ -215,8 +215,8 @@ MONITOR_SUCCESS_LOG_INTERVAL_SECONDS = 900
 MEDIA_PROFILE_VERSION = (
     f"720x1280_30fps_h264_crf{VIDEO_CRF}_audio{AUDIO_BITRATE}_sem_marca_v2"
 )
-INSTAGRAM_AUDIO_CACHE_VERSION = "instagram_audio_v3"
-FACEBOOK_AUDIO_CACHE_VERSION = "facebook_audio_v2"
+INSTAGRAM_AUDIO_CACHE_VERSION = "instagram_audio_v4"
+FACEBOOK_AUDIO_CACHE_VERSION = "facebook_audio_v3"
 
 INSTAGRAM_COOKIES_TEXT = os.environ.get("INSTAGRAM_COOKIES_TEXT", "")
 TIKTOK_COOKIES_TEXT = os.environ.get("TIKTOK_COOKIES_TEXT", "")
@@ -2538,12 +2538,23 @@ def classificar_erro_envio_arquivo(erro):
     return "inconclusivo"
 
 
-def _enviar_video_local_telegram(chat_id, arquivo):
+def legenda_download_concluido(sem_audio=False, tipo="video"):
+    if sem_audio:
+        return (
+            "✅ Download concluído\n"
+            "🔇 Não foi possível incluir o áudio nesta versão."
+        )
+    if tipo == "arquivo":
+        return "👉 Download concluído! Aqui está seu arquivo 👊"
+    return "👉 Download concluído! Aqui está seu vídeo 👊"
+
+
+def _enviar_video_local_telegram(chat_id, arquivo, sem_audio=False):
     with open(arquivo, "rb") as f:
         return bot.send_video(
             chat_id,
             f,
-            caption="👉 Download concluído! Aqui está seu vídeo 👊",
+            caption=legenda_download_concluido(sem_audio=sem_audio),
         )
 
 
@@ -2560,12 +2571,16 @@ def obter_tamanho_arquivo_para_metrica(arquivo):
         return 0
 
 
-def enviar_arquivo_com_fallback(chat_id, arquivo):
+def enviar_arquivo_com_fallback(chat_id, arquivo, sem_audio=False):
     atualizar_heartbeat_worker("enviando_telegram")
     erro_video = None
     classificacao_video = None
     try:
-        mensagem = _enviar_video_local_telegram(chat_id, arquivo)
+        mensagem = _enviar_video_local_telegram(
+            chat_id,
+            arquivo,
+            sem_audio=sem_audio,
+        )
         telegram_file_id, telegram_media_type = extrair_dados_midia_telegram(mensagem)
         registrar_sucesso_componente("Telegram")
         return (
@@ -2599,7 +2614,11 @@ def enviar_arquivo_com_fallback(chat_id, arquivo):
         time.sleep(espera)
         atualizar_heartbeat_worker("reenviando_telegram")
         try:
-            mensagem = _enviar_video_local_telegram(chat_id, arquivo)
+            mensagem = _enviar_video_local_telegram(
+                chat_id,
+                arquivo,
+                sem_audio=sem_audio,
+            )
             telegram_file_id, telegram_media_type = extrair_dados_midia_telegram(
                 mensagem
             )
@@ -2655,7 +2674,11 @@ def enviar_arquivo_com_fallback(chat_id, arquivo):
             )
             arquivo_fallback = candidato_fallback
 
-            mensagem = _enviar_video_local_telegram(chat_id, arquivo_fallback)
+            mensagem = _enviar_video_local_telegram(
+                chat_id,
+                arquivo_fallback,
+                sem_audio=sem_audio,
+            )
 
             logger.info(
                 "[SEND_VIDEO] Fallback H.264 enviado com sucesso | "
@@ -2693,7 +2716,10 @@ def enviar_arquivo_com_fallback(chat_id, arquivo):
             mensagem = bot.send_document(
                 chat_id,
                 f,
-                caption="👉 Download concluído! Aqui está seu arquivo 👊",
+                caption=legenda_download_concluido(
+                    sem_audio=sem_audio,
+                    tipo="arquivo",
+                ),
             )
         telegram_file_id, telegram_media_type = extrair_dados_midia_telegram(mensagem)
         registrar_sucesso_componente("Telegram")
@@ -4276,8 +4302,8 @@ def erro_instagram_permite_fallback(erro):
 def info_plataforma_indica_audio(info):
     """Retorna True/False quando os metadados permitem confirmar o áudio.
 
-    None significa que o extrator não informou codecs suficientes. Nesse caso,
-    o download é tratado de forma conservadora e um arquivo mudo é rejeitado.
+    None significa que o extrator não informou codecs suficientes. A decisão
+    final é feita depois do download, inspecionando o arquivo que será enviado.
     """
     if not isinstance(info, dict):
         return None
@@ -4342,7 +4368,7 @@ def extrair_id_facebook_para_fallback(info, url):
 
 
 def extrair_info_facebook_com_fallback(url):
-    """Exige áudio e tenta uma segunda página pública oficial quando necessário."""
+    """Prioriza áudio e preserva a melhor resposta pública como último recurso."""
     primeiro_info = None
     ultimo_erro = None
 
@@ -4378,7 +4404,7 @@ def extrair_info_facebook_com_fallback(url):
         )
         if primeiro_info is None and ultimo_erro is not None:
             raise ultimo_erro
-        raise RuntimeError("FACEBOOK_AUDIO_INDISPONIVEL_PUBLICO")
+        return primeiro_info
 
     url_alternativa = (
         "https://www.facebook.com/photo.php?"
@@ -4411,7 +4437,13 @@ def extrair_info_facebook_com_fallback(url):
             f"url_ref={referencia_url_log(url_alternativa)} "
             f"erro={sanitizar_erro_log(e)}"
         )
-        raise RuntimeError("FACEBOOK_AUDIO_INDISPONIVEL_PUBLICO") from e
+        if primeiro_info is not None:
+            logger.warning(
+                "[FACEBOOK_REELS_INFO_FALLBACK] "
+                "preservando_primeira_resposta=True"
+            )
+            return primeiro_info
+        raise
 
     audio_alternativo = info_plataforma_indica_audio(info_alternativa)
     if audio_alternativo is True:
@@ -4426,7 +4458,7 @@ def extrair_info_facebook_com_fallback(url):
         "modo=pagina_publica_alternativa "
         f"audio_disponivel={audio_alternativo} fallback_disponivel=False"
     )
-    raise RuntimeError("FACEBOOK_AUDIO_INDISPONIVEL_PUBLICO")
+    return primeiro_info or info_alternativa
 
 
 class InstagramYoutubeDLSemImpersonacao(yt_dlp.YoutubeDL):
@@ -4693,10 +4725,7 @@ def mapear_erro_download(err_text, plataforma="geral"):
 
     if plataforma == "instagram":
         if "instagram_audio_ausente_no_arquivo" in err:
-            return (
-                "❌ O Instagram não forneceu uma versão completa com áudio "
-                "deste Reel. Tente novamente em alguns instantes."
-            )
+            return "❌ Não consegui concluir esse download agora."
         if "login required" in err or "requested content is not available" in err or "rate-limit reached" in err:
             return "❌ O Instagram bloqueou esse link no momento. Para Reels assim, o bot precisa de cookies válidos da conta logada no Instagram."
         if "private" in err:
@@ -4747,10 +4776,7 @@ def mapear_erro_download(err_text, plataforma="geral"):
             "facebook_audio_ausente_no_arquivo" in err
             or "facebook_audio_indisponivel_publico" in err
         ):
-            return (
-                "❌ O Facebook não forneceu uma versão completa com áudio "
-                "deste Reel. Tente novamente em alguns instantes."
-            )
+            return "❌ Não consegui concluir esse download agora."
         if "private" in err or "login required" in err:
             return "❌ Esse Facebook Reel é privado ou exige login."
         if "403" in err or "429" in err:
@@ -8074,6 +8100,7 @@ def formatos_por_plataforma(
 def _processar_download(message, url, status_msg, reserva_download=None):
     atualizar_heartbeat_worker("preparando")
     prefix = None
+    prefix_sem_audio = None
     plataforma = nome_plataforma(*detectar_plataforma(url))
 
     try:
@@ -8429,11 +8456,6 @@ def _processar_download(message, url, status_msg, reserva_download=None):
                 "[FACEBOOK_REELS_AUDIO_INFO] "
                 f"audio_disponivel={audio_facebook_esperado}"
             )
-            if audio_facebook_esperado is not True:
-                raise FalhaComponenteDownload(
-                    plataforma,
-                    "FACEBOOK_AUDIO_INDISPONIVEL_PUBLICO",
-                )
 
         duracao = info.get("duration")
         logger.info(
@@ -8501,6 +8523,12 @@ def _processar_download(message, url, status_msg, reserva_download=None):
         )
         baixou = False
         ultimo_erro = None
+        arquivo_sem_audio_fallback = None
+        if is_instagram or is_facebook_reel:
+            prefix_sem_audio = os.path.join(
+                DOWNLOAD_DIR,
+                f"mudo_{uuid.uuid4().hex}",
+            )
 
         if is_instagram:
             modos_cookie = [usar_cookies_plataforma]
@@ -8537,7 +8565,7 @@ def _processar_download(message, url, status_msg, reserva_download=None):
 
                     arquivo_baixado = encontrar_arquivo_baixado(prefix)
                     if arquivo_baixado and os.path.exists(arquivo_baixado):
-                        if is_instagram and audio_instagram_esperado is not False:
+                        if is_instagram:
                             info_arquivo_baixado = obter_info_midia(arquivo_baixado)
                             if not arquivo_possui_audio(info_arquivo_baixado):
                                 ultimo_erro = (
@@ -8550,6 +8578,15 @@ def _processar_download(message, url, status_msg, reserva_download=None):
                                     f"formato={fmt} "
                                     f"arquivo_ref={referencia_arquivo_log(arquivo_baixado)}"
                                 )
+                                if arquivo_sem_audio_fallback is None:
+                                    extensao = os.path.splitext(arquivo_baixado)[1] or ".mp4"
+                                    arquivo_sem_audio_fallback = (
+                                        f"{prefix_sem_audio}{extensao}"
+                                    )
+                                    os.replace(
+                                        arquivo_baixado,
+                                        arquivo_sem_audio_fallback,
+                                    )
                                 cleanup_prefix(prefix)
                                 continue
                         if is_facebook_reel:
@@ -8565,6 +8602,15 @@ def _processar_download(message, url, status_msg, reserva_download=None):
                                     f"formato={fmt} "
                                     f"arquivo_ref={referencia_arquivo_log(arquivo_baixado)}"
                                 )
+                                if arquivo_sem_audio_fallback is None:
+                                    extensao = os.path.splitext(arquivo_baixado)[1] or ".mp4"
+                                    arquivo_sem_audio_fallback = (
+                                        f"{prefix_sem_audio}{extensao}"
+                                    )
+                                    os.replace(
+                                        arquivo_baixado,
+                                        arquivo_sem_audio_fallback,
+                                    )
                                 cleanup_prefix(prefix)
                                 continue
                         baixou = True
@@ -8582,6 +8628,21 @@ def _processar_download(message, url, status_msg, reserva_download=None):
 
             if baixou:
                 break
+
+        if not baixou and arquivo_sem_audio_fallback:
+            extensao = os.path.splitext(arquivo_sem_audio_fallback)[1] or ".mp4"
+            arquivo_destino_sem_audio = f"{prefix}{extensao}"
+            cleanup_prefix(prefix)
+            os.replace(
+                arquivo_sem_audio_fallback,
+                arquivo_destino_sem_audio,
+            )
+            arquivo_sem_audio_fallback = None
+            baixou = True
+            logger.warning(
+                f"[AUDIO_FALLBACK_SEM_AUDIO] plataforma={plataforma} "
+                f"arquivo_ref={referencia_arquivo_log(arquivo_destino_sem_audio)}"
+            )
 
         if not baixou:
             raise FalhaComponenteDownload(
@@ -8611,24 +8672,43 @@ def _processar_download(message, url, status_msg, reserva_download=None):
         )
         registrar_sucesso_componente("Processamento")
 
+        envio_sem_audio = False
+        if is_instagram or is_facebook_reel:
+            info_arquivo_envio = obter_info_midia(arquivo_envio)
+            envio_sem_audio = not arquivo_possui_audio(info_arquivo_envio)
+            logger.info(
+                f"[AUDIO_ARQUIVO_FINAL] plataforma={plataforma} "
+                f"sem_audio={envio_sem_audio}"
+            )
+
         (
             enviado,
             telegram_file_id,
             telegram_media_type,
             bytes_upload,
-        ) = enviar_arquivo_com_fallback(message.chat.id, arquivo_envio)
+        ) = enviar_arquivo_com_fallback(
+            message.chat.id,
+            arquivo_envio,
+            sem_audio=envio_sem_audio,
+        )
         if not enviado:
             raise Exception("Falha ao enviar arquivo ao Telegram")
 
-        salvar_file_id_cache(
-            cache_key,
-            cache_source_id,
-            plataforma,
-            telegram_file_id,
-            telegram_media_type,
-            url_cache_key=url_cache_key,
-            url_normalizada=url_normalizada,
-        )
+        if envio_sem_audio:
+            logger.info(
+                f"[CACHE_MIDIA_IGNORADO] plataforma={plataforma} "
+                "motivo=arquivo_sem_audio"
+            )
+        else:
+            salvar_file_id_cache(
+                cache_key,
+                cache_source_id,
+                plataforma,
+                telegram_file_id,
+                telegram_media_type,
+                url_cache_key=url_cache_key,
+                url_normalizada=url_normalizada,
+            )
 
         registrar_download_diario(
             vip_status,
@@ -8718,6 +8798,8 @@ def _processar_download(message, url, status_msg, reserva_download=None):
     finally:
         if prefix:
             cleanup_prefix(prefix)
+        if prefix_sem_audio:
+            cleanup_prefix(prefix_sem_audio)
 
 
 def registrar_trabalho_fila_persistente(user_id):
@@ -9570,7 +9652,8 @@ if __name__ == "__main__":
     logger.info(
         "[FACEBOOK_REELS_CONFIG] publico_somente=True cookies=False "
         "max_duration_compartilhado=True prefer_h264=True "
-        "validacao_audio=True fallback_publico=True rejeita_sem_audio=True "
+        "validacao_audio=True fallback_publico=True "
+        "envia_sem_audio_com_aviso=True cache_sem_audio=False "
         f"cache_version={FACEBOOK_AUDIO_CACHE_VERSION}"
     )
     if TIKTOK_IMPERSONATION_DISPONIVEL:
