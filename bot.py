@@ -215,7 +215,7 @@ MONITOR_SUCCESS_LOG_INTERVAL_SECONDS = 900
 MEDIA_PROFILE_VERSION = (
     f"720x1280_30fps_h264_crf{VIDEO_CRF}_audio{AUDIO_BITRATE}_sem_marca_v2"
 )
-INSTAGRAM_AUDIO_CACHE_VERSION = "instagram_audio_v3"
+INSTAGRAM_AUDIO_CACHE_VERSION = "instagram_audio_v4"
 FACEBOOK_AUDIO_CACHE_VERSION = "facebook_audio_v2"
 
 INSTAGRAM_COOKIES_TEXT = os.environ.get("INSTAGRAM_COOKIES_TEXT", "")
@@ -8687,15 +8687,24 @@ def _processar_download(message, url, status_msg, reserva_download=None):
         if not enviado:
             raise Exception("Falha ao enviar arquivo ao Telegram")
 
-        salvar_file_id_cache(
-            cache_key,
-            cache_source_id,
-            plataforma,
-            telegram_file_id,
-            telegram_media_type,
-            url_cache_key=url_cache_key,
-            url_normalizada=url_normalizada,
-        )
+        # Nunca guarda no cache um Reel do Instagram que chegou sem áudio.
+        # Além de evitar repetir um arquivo defeituoso, isso permite que uma
+        # tentativa futura use novamente as rotas web/iOS do extrator.
+        if is_instagram and instagram_sem_audio:
+            logger.warning(
+                "[INSTAGRAM_CACHE_IGNORADO_SEM_AUDIO] "
+                f"url_ref={referencia_url_log(url)}"
+            )
+        else:
+            salvar_file_id_cache(
+                cache_key,
+                cache_source_id,
+                plataforma,
+                telegram_file_id,
+                telegram_media_type,
+                url_cache_key=url_cache_key,
+                url_normalizada=url_normalizada,
+            )
 
         registrar_download_diario(
             vip_status,
