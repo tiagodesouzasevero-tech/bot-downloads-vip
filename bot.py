@@ -216,6 +216,7 @@ MEDIA_PROFILE_VERSION = (
     f"720x1280_30fps_h264_crf{VIDEO_CRF}_audio{AUDIO_BITRATE}_sem_marca_v2"
 )
 INSTAGRAM_AUDIO_CACHE_VERSION = "instagram_audio_v3"
+FACEBOOK_AUDIO_CACHE_VERSION = "facebook_audio_v2"
 
 INSTAGRAM_COOKIES_TEXT = os.environ.get("INSTAGRAM_COOKIES_TEXT", "")
 TIKTOK_COOKIES_TEXT = os.environ.get("TIKTOK_COOKIES_TEXT", "")
@@ -2713,8 +2714,11 @@ def enviar_arquivo_com_fallback(chat_id, arquivo):
 
 def perfil_cache_plataforma(plataforma):
     perfil = MEDIA_PROFILE_VERSION
-    if str(plataforma or "").strip().lower() == "instagram":
+    plataforma_normalizada = str(plataforma or "").strip().lower()
+    if plataforma_normalizada == "instagram":
         perfil = f"{perfil}|{INSTAGRAM_AUDIO_CACHE_VERSION}"
+    elif plataforma_normalizada in ("facebook", "facebook reels", "facebook_reels"):
+        perfil = f"{perfil}|{FACEBOOK_AUDIO_CACHE_VERSION}"
     return perfil
 
 
@@ -4308,6 +4312,123 @@ def arquivo_possui_audio(info_midia):
     return acodec not in ("", "none", "null", "unknown")
 
 
+def extrair_id_facebook_para_fallback(info, url):
+    """Obtém somente um ID numérico para montar páginas oficiais alternativas."""
+    candidatos = [
+        (info or {}).get("id") if isinstance(info, dict) else None,
+        (info or {}).get("display_id") if isinstance(info, dict) else None,
+    ]
+
+    try:
+        parsed = urlparse(str(url or "").strip())
+        match_path = re.search(
+            r"/(?:reel|reels)/(\d+)(?:/|$)",
+            parsed.path or "",
+            flags=re.IGNORECASE,
+        )
+        if match_path:
+            candidatos.append(match_path.group(1))
+
+        parametros = dict(parse_qsl(parsed.query, keep_blank_values=True))
+        candidatos.extend([parametros.get("v"), parametros.get("fbid")])
+    except Exception:
+        pass
+
+    for candidato in candidatos:
+        candidato = str(candidato or "").strip()
+        if re.fullmatch(r"\d{5,30}", candidato):
+            return candidato
+    return None
+
+
+def extrair_info_facebook_com_fallback(url):
+    """Exige áudio e tenta uma segunda página pública oficial quando necessário."""
+    primeiro_info = None
+    ultimo_erro = None
+
+    try:
+        logger.info(
+            "[FACEBOOK_REELS_INFO] modo=reel_publico "
+            f"url_ref={referencia_url_log(url)}"
+        )
+        with yt_dlp.YoutubeDL(
+            montar_info_opts(is_facebook_reel=True)
+        ) as ydl:
+            primeiro_info = ydl.extract_info(url, download=False)
+    except FalhaComponenteDownload:
+        raise
+    except Exception as e:
+        ultimo_erro = e
+        logger.warning(
+            "[FACEBOOK_REELS_INFO_FALHA] modo=reel_publico "
+            f"url_ref={referencia_url_log(url)} "
+            f"erro={sanitizar_erro_log(e)}"
+        )
+
+    audio_primeira_consulta = info_plataforma_indica_audio(primeiro_info)
+    if audio_primeira_consulta is True:
+        return primeiro_info
+
+    video_id = extrair_id_facebook_para_fallback(primeiro_info, url)
+    if not video_id:
+        logger.warning(
+            "[FACEBOOK_REELS_INFO_SEM_AUDIO] modo=reel_publico "
+            f"audio_disponivel={audio_primeira_consulta} "
+            "fallback_disponivel=False"
+        )
+        if primeiro_info is None and ultimo_erro is not None:
+            raise ultimo_erro
+        raise RuntimeError("FACEBOOK_AUDIO_INDISPONIVEL_PUBLICO")
+
+    url_alternativa = (
+        "https://www.facebook.com/photo.php?"
+        f"{urlencode({'fbid': video_id})}"
+    )
+    logger.warning(
+        "[FACEBOOK_REELS_INFO_SEM_AUDIO] modo=reel_publico "
+        f"audio_disponivel={audio_primeira_consulta} "
+        "proxima_tentativa=pagina_publica_alternativa"
+    )
+
+    try:
+        logger.info(
+            "[FACEBOOK_REELS_INFO] modo=pagina_publica_alternativa "
+            f"url_ref={referencia_url_log(url_alternativa)}"
+        )
+        with yt_dlp.YoutubeDL(
+            montar_info_opts(is_facebook_reel=True)
+        ) as ydl:
+            info_alternativa = ydl.extract_info(
+                url_alternativa,
+                download=False,
+            )
+    except FalhaComponenteDownload:
+        raise
+    except Exception as e:
+        logger.warning(
+            "[FACEBOOK_REELS_INFO_FALHA] "
+            "modo=pagina_publica_alternativa "
+            f"url_ref={referencia_url_log(url_alternativa)} "
+            f"erro={sanitizar_erro_log(e)}"
+        )
+        raise RuntimeError("FACEBOOK_AUDIO_INDISPONIVEL_PUBLICO") from e
+
+    audio_alternativo = info_plataforma_indica_audio(info_alternativa)
+    if audio_alternativo is True:
+        logger.info(
+            "[FACEBOOK_REELS_INFO_FALLBACK_OK] "
+            "modo=pagina_publica_alternativa audio_disponivel=True"
+        )
+        return info_alternativa
+
+    logger.warning(
+        "[FACEBOOK_REELS_INFO_SEM_AUDIO] "
+        "modo=pagina_publica_alternativa "
+        f"audio_disponivel={audio_alternativo} fallback_disponivel=False"
+    )
+    raise RuntimeError("FACEBOOK_AUDIO_INDISPONIVEL_PUBLICO")
+
+
 class InstagramYoutubeDLSemImpersonacao(yt_dlp.YoutubeDL):
     """Força o extrator do Instagram a consultar a página pública comum."""
 
@@ -4622,7 +4743,10 @@ def mapear_erro_download(err_text, plataforma="geral"):
                 "Vídeos comuns, lives, grupos e conteúdos privados não são "
                 "suportados."
             )
-        if "facebook_audio_ausente_no_arquivo" in err:
+        if (
+            "facebook_audio_ausente_no_arquivo" in err
+            or "facebook_audio_indisponivel_publico" in err
+        ):
             return (
                 "❌ O Facebook não forneceu uma versão completa com áudio "
                 "deste Reel. Tente novamente em alguns instantes."
@@ -8281,10 +8405,7 @@ def _processar_download(message, url, status_msg, reserva_download=None):
                     tiktok_extractor_args_usados,
                 ) = extrair_info_tiktok_com_fallback(url)
             elif is_facebook_reel:
-                with yt_dlp.YoutubeDL(
-                    montar_info_opts(is_facebook_reel=True)
-                ) as ydl:
-                    info = ydl.extract_info(url, download=False)
+                info = extrair_info_facebook_com_fallback(url)
             else:
                 with yt_dlp.YoutubeDL(montar_info_opts()) as ydl:
                     info = ydl.extract_info(url, download=False)
@@ -8308,6 +8429,11 @@ def _processar_download(message, url, status_msg, reserva_download=None):
                 "[FACEBOOK_REELS_AUDIO_INFO] "
                 f"audio_disponivel={audio_facebook_esperado}"
             )
+            if audio_facebook_esperado is not True:
+                raise FalhaComponenteDownload(
+                    plataforma,
+                    "FACEBOOK_AUDIO_INDISPONIVEL_PUBLICO",
+                )
 
         duracao = info.get("duration")
         logger.info(
@@ -8426,7 +8552,7 @@ def _processar_download(message, url, status_msg, reserva_download=None):
                                 )
                                 cleanup_prefix(prefix)
                                 continue
-                        if is_facebook_reel and audio_facebook_esperado is not False:
+                        if is_facebook_reel:
                             info_arquivo_baixado = obter_info_midia(arquivo_baixado)
                             if not arquivo_possui_audio(info_arquivo_baixado):
                                 ultimo_erro = (
@@ -9444,7 +9570,8 @@ if __name__ == "__main__":
     logger.info(
         "[FACEBOOK_REELS_CONFIG] publico_somente=True cookies=False "
         "max_duration_compartilhado=True prefer_h264=True "
-        "validacao_audio=True"
+        "validacao_audio=True fallback_publico=True rejeita_sem_audio=True "
+        f"cache_version={FACEBOOK_AUDIO_CACHE_VERSION}"
     )
     if TIKTOK_IMPERSONATION_DISPONIVEL:
         logger.info(f"[TIKTOK_DEPENDENCIAS] curl_cffi={CURL_CFFI_VERSION}")
