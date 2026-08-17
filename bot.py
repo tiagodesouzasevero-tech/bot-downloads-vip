@@ -6641,7 +6641,13 @@ def montar_relatorio_diagnostico():
         if TIKTOK_COOKIES_TEXT.strip()
         else "ℹ️ Cookies do TikTok: não configurados (opcional)"
     )
+    linhas.append("✅ Pinterest: suporte ativo")
     linhas.append("✅ Facebook Reels: links públicos, sem cookies")
+    linhas.append("✅ Shopee Vídeo: suporte ativo")
+    linhas.append(
+        "✅ Mercado Livre Clips: HLS público, sem login, cookies ou token"
+    )
+    linhas.append("✅ RedNote: suporte ativo")
 
     resumo_monitor = obter_resumo_monitoramento()
     alertas_ativos = [
@@ -11177,7 +11183,7 @@ def encerrar_healthcheck():
 # MAIN
 # =========================================
 if __name__ == "__main__":
-    logger.info("[BOT_BUILD] bot_downloads_v4_ml_clips_v6_quality720")
+    logger.info("[BOT_BUILD] bot_downloads_v4_ml_clips_v7_diagnostico_plataformas")
     logger.info("[ML_CLIPS_CONFIG] enabled=True login=False cookies=False token=False source=public_mobile_html_hls dns_guard=host_allowlist")
     logger.info(f"[YT_DLP] versao={YT_DLP_VERSION}")
     logger.info(
