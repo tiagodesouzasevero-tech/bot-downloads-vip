@@ -8605,11 +8605,20 @@ def _get_manifesto_ml_clips(url, referer):
     resposta = None
     try:
         for _ in range(5):
-            if (
-                not _host_midia_mercado_livre_clips_permitido(atual)
-                or not validar_url_http_publica(atual, resolver_dns=False)
-            ):
+            if not _host_midia_mercado_livre_clips_permitido(atual):
+                parsed_guard = urlparse(str(atual or "").strip())
+                logger.warning(
+                    "[ML_CLIPS_HLS_GUARD_FALHA] "
+                    f"scheme={parsed_guard.scheme} "
+                    f"host={str(parsed_guard.hostname or '').lower()} "
+                    f"porta={parsed_guard.port} "
+                    f"path_ref={hashlib.sha256(str(parsed_guard.path or '').encode()).hexdigest()[:12]}"
+                )
                 raise RuntimeError("ML_CLIPS_HLS_HOST_INVALIDO")
+            logger.info(
+                "[ML_CLIPS_HLS_GUARD_OK] "
+                "host_mlstatic=True https=True porta_padrao=True path_short_api=True"
+            )
             headers = {
                 "User-Agent": MERCADO_LIVRE_CLIPS_HEADERS["User-Agent"],
                 "Accept": "application/vnd.apple.mpegurl,application/x-mpegURL,*/*;q=0.8",
@@ -8692,7 +8701,7 @@ def baixar_hls_mercado_livre_clips(url_hls, destino, referer):
     url_hls = validar_manifestos_mercado_livre_clips(url_hls, referer)
     logger.info(
         "[ML_CLIPS_HLS_VALIDADO] host_mlstatic=True referencias_oficiais=True "
-        "dns_guard=host_allowlist"
+        "dns_guard=host_allowlist_v2"
     )
 
     headers_ffmpeg = (
@@ -10965,7 +10974,7 @@ def encerrar_healthcheck():
 # MAIN
 # =========================================
 if __name__ == "__main__":
-    logger.info("[BOT_BUILD] bot_downloads_v4_ml_clips_v3")
+    logger.info("[BOT_BUILD] bot_downloads_v4_ml_clips_v4")
     logger.info("[ML_CLIPS_CONFIG] enabled=True login=False cookies=False token=False source=public_mobile_html_hls dns_guard=host_allowlist")
     logger.info(f"[YT_DLP] versao={YT_DLP_VERSION}")
     logger.info(
