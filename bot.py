@@ -8452,6 +8452,30 @@ def _host_midia_mercado_livre_clips_permitido(url):
         return False
 
 
+def _host_playlist_derivada_ml_clips_permitido(url):
+    """
+    Permite playlists HLS filhas servidas pela CDN oficial MLStatic.
+
+    A URL inicial continua sendo validada de forma estrita por
+    _host_midia_mercado_livre_clips_permitido(). Esta função só é usada
+    depois que uma playlist oficial já foi obtida e referenciou outra .m3u8.
+    """
+    try:
+        parsed = urlparse(str(url or "").strip())
+        host = (parsed.hostname or "").lower().rstrip(".")
+        caminho = parsed.path or ""
+        return (
+            parsed.scheme == "https"
+            and not parsed.username
+            and not parsed.password
+            and parsed.port in (None, 443)
+            and hostname_permitido(host, "mlstatic.com")
+            and caminho.lower().endswith(".m3u8")
+        )
+    except (ValueError, TypeError):
+        return False
+
+
 def extrair_video_mercado_livre_clips(texto, short_id):
     """Extrai somente o videoUrl HLS do short_id solicitado."""
     bruto = str(texto or "")
@@ -8600,15 +8624,21 @@ def obter_video_mercado_livre_clips(url):
     )
 
 
-def _get_manifesto_ml_clips(url, referer):
+def _get_manifesto_ml_clips(url, referer, permitir_cdn_derivada=False):
     atual = str(url or "").strip()
     resposta = None
     try:
         for _ in range(5):
-            if not _host_midia_mercado_livre_clips_permitido(atual):
+            guard_ok = (
+                _host_playlist_derivada_ml_clips_permitido(atual)
+                if permitir_cdn_derivada
+                else _host_midia_mercado_livre_clips_permitido(atual)
+            )
+            if not guard_ok:
                 parsed_guard = urlparse(str(atual or "").strip())
                 logger.warning(
                     "[ML_CLIPS_HLS_GUARD_FALHA] "
+                    f"tipo={'cdn_derivada' if permitir_cdn_derivada else 'master'} "
                     f"scheme={parsed_guard.scheme} "
                     f"host={str(parsed_guard.hostname or '').lower()} "
                     f"porta={parsed_guard.port} "
@@ -8617,7 +8647,8 @@ def _get_manifesto_ml_clips(url, referer):
                 raise RuntimeError("ML_CLIPS_HLS_HOST_INVALIDO")
             logger.info(
                 "[ML_CLIPS_HLS_GUARD_OK] "
-                "host_mlstatic=True https=True porta_padrao=True path_short_api=True"
+                f"tipo={'cdn_derivada' if permitir_cdn_derivada else 'master'} "
+                "host_mlstatic=True https=True porta_padrao=True"
             )
             headers = {
                 "User-Agent": MERCADO_LIVRE_CLIPS_HEADERS["User-Agent"],
@@ -8635,7 +8666,12 @@ def _get_manifesto_ml_clips(url, referer):
                 proxima = urljoin(atual, resposta.headers.get("Location") or "")
                 resposta.close()
                 resposta = None
-                if not _host_midia_mercado_livre_clips_permitido(proxima):
+                redirect_ok = (
+                    _host_playlist_derivada_ml_clips_permitido(proxima)
+                    if permitir_cdn_derivada
+                    else _host_midia_mercado_livre_clips_permitido(proxima)
+                )
+                if not redirect_ok:
                     raise RuntimeError("ML_CLIPS_HLS_REDIRECIONAMENTO_INVALIDO")
                 atual = proxima
                 continue
@@ -8659,7 +8695,11 @@ def validar_manifestos_mercado_livre_clips(url, referer, profundidade=0, visitad
         return url
     visitados.add(url)
 
-    texto, final_url = _get_manifesto_ml_clips(url, referer)
+    texto, final_url = _get_manifesto_ml_clips(
+        url,
+        referer,
+        permitir_cdn_derivada=profundidade > 0,
+    )
     filhos_m3u8 = []
     for linha in texto.splitlines():
         linha = linha.strip()
@@ -8701,7 +8741,7 @@ def baixar_hls_mercado_livre_clips(url_hls, destino, referer):
     url_hls = validar_manifestos_mercado_livre_clips(url_hls, referer)
     logger.info(
         "[ML_CLIPS_HLS_VALIDADO] host_mlstatic=True referencias_oficiais=True "
-        "dns_guard=host_allowlist_v2"
+        "dns_guard=master_strict_child_mlstatic_v3"
     )
 
     headers_ffmpeg = (
@@ -10974,7 +11014,7 @@ def encerrar_healthcheck():
 # MAIN
 # =========================================
 if __name__ == "__main__":
-    logger.info("[BOT_BUILD] bot_downloads_v4_ml_clips_v4")
+    logger.info("[BOT_BUILD] bot_downloads_v4_ml_clips_v5")
     logger.info("[ML_CLIPS_CONFIG] enabled=True login=False cookies=False token=False source=public_mobile_html_hls dns_guard=host_allowlist")
     logger.info(f"[YT_DLP] versao={YT_DLP_VERSION}")
     logger.info(
