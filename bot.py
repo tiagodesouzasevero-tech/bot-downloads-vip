@@ -1,3 +1,4 @@
+# BUILD_FILE: ML_CLIPS_V1_20260817
 import os
 import re
 import glob
@@ -19,7 +20,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from queue import Empty, Full, PriorityQueue
 from threading import Event, Lock, Thread
 from datetime import datetime, timedelta, timezone
-from urllib.parse import parse_qsl, urlencode, urljoin, urlparse
+from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlparse
 from zoneinfo import ZoneInfo
 
 import requests
@@ -215,10 +216,9 @@ MONITOR_SUCCESS_LOG_INTERVAL_SECONDS = 900
 MEDIA_PROFILE_VERSION = (
     f"720x1280_30fps_h264_crf{VIDEO_CRF}_audio{AUDIO_BITRATE}_sem_marca_v2"
 )
-INSTAGRAM_AUDIO_CACHE_VERSION = "instagram_audio_v3"
+INSTAGRAM_AUDIO_CACHE_VERSION = "instagram_audio_v5_nocookies"
 FACEBOOK_AUDIO_CACHE_VERSION = "facebook_audio_v2"
 
-INSTAGRAM_COOKIES_TEXT = os.environ.get("INSTAGRAM_COOKIES_TEXT", "")
 TIKTOK_COOKIES_TEXT = os.environ.get("TIKTOK_COOKIES_TEXT", "")
 TIKTOK_DEVICE_ID_TEXT = os.environ.get("TIKTOK_DEVICE_ID", "")
 TIKWM_API_URL = os.environ.get("TIKWM_API_URL", "https://www.tikwm.com/api/").strip()
@@ -278,6 +278,8 @@ COMPONENTES_PLATAFORMA = (
     "Pinterest",
     "RedNote",
     "Facebook Reels",
+    "Shopee Video",
+    "Mercado Livre Clips",
 )
 COMPONENTES_INTERNOS = (
     "Telegram",
@@ -299,7 +301,6 @@ COMPONENT_MONITOR_STATE = {
 }
 
 ARQUIVOS_PERSISTENTES_DOWNLOAD_DIR = {
-    "instagram_cookies.txt",
     "tiktok_cookies.txt",
     "tiktok_device_id.txt",
 }
@@ -826,7 +827,7 @@ def detectar_plataforma_url(url):
     try:
         parsed = urlparse(url)
     except Exception:
-        return False, False, False, False, False
+        return False, False, False, False, False, False, False
 
     if (
         parsed.scheme not in ("http", "https")
@@ -834,13 +835,13 @@ def detectar_plataforma_url(url):
         or parsed.username
         or parsed.password
     ):
-        return False, False, False, False, False
+        return False, False, False, False, False, False, False
 
     try:
         if parsed.port not in (None, 80, 443):
-            return False, False, False, False, False
+            return False, False, False, False, False, False, False
     except ValueError:
-        return False, False, False, False, False
+        return False, False, False, False, False, False, False
 
     host = parsed.hostname.lower().rstrip(".")
     is_pinterest = hostname_permitido(host, "pinterest.com") or host == "pin.it"
@@ -867,14 +868,32 @@ def detectar_plataforma_url(url):
         "www.rednote.com",
     }
     is_facebook_reel = eh_url_facebook_reel_ou_compartilhada(url)
+    # O compartilhamento de Shopee Video usa br.shp.ee e páginas oficiais
+    # em shopee.com.br (incluindo sv.shopee.com.br/share-video). A validação
+    # específica do vídeo é feita depois da resolução do link curto.
+    is_shopee = host == "br.shp.ee" or hostname_permitido(host, "shopee.com.br")
+
+    # Mercado Livre Clips: aceite somente as rotas públicas de Clips que
+    # carregam um short_id explícito. Outros links do marketplace continuam
+    # fora do downloader.
+    caminho_ml = re.sub(r"/{2,}", "/", parsed.path or "/").rstrip("/") or "/"
+    parametros_ml = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    short_id_ml = str(parametros_ml.get("short_id") or "").strip()
+    is_mercado_livre_clips = (
+        hostname_permitido(host, "mercadolivre.com.br")
+        and caminho_ml in ("/clips", "/live/videos")
+        and bool(re.fullmatch(r"[A-Za-z0-9_-]{3,64}", short_id_ml))
+    )
+
     return (
         is_pinterest,
         is_tiktok,
         is_instagram,
         is_rednote,
         is_facebook_reel,
+        is_shopee,
+        is_mercado_livre_clips,
     )
-
 
 def resolver_url_compartilhada(url):
     """Resolve links curtos sem permitir que escapem da plataforma original."""
@@ -893,6 +912,7 @@ def resolver_url_compartilhada(url):
         "www.xhslink.com",
         "fb.watch",
         "www.fb.watch",
+        "br.shp.ee",
     }
     caminho = (urlparse(url).path or "").lower()
     compartilhamento_facebook = (
@@ -1685,6 +1705,12 @@ def normalizar_plataforma_monitoramento(plataforma):
         "facebook": "Facebook Reels",
         "facebook reel": "Facebook Reels",
         "facebook reels": "Facebook Reels",
+        "shopee": "Shopee Video",
+        "shopee video": "Shopee Video",
+        "mercado livre": "Mercado Livre Clips",
+        "mercado livre clips": "Mercado Livre Clips",
+        "mercadolivre": "Mercado Livre Clips",
+        "ml clips": "Mercado Livre Clips",
     }
     return mapa.get(str(plataforma or "").strip().lower())
 
@@ -3063,6 +3089,8 @@ def nome_plataforma(
     is_instagram,
     is_rednote,
     is_facebook_reel,
+    is_shopee=False,
+    is_mercado_livre_clips=False,
 ):
     if is_pinterest:
         return "Pinterest"
@@ -3074,6 +3102,10 @@ def nome_plataforma(
         return "RedNote"
     if is_facebook_reel:
         return "Facebook Reels"
+    if is_shopee:
+        return "Shopee Video"
+    if is_mercado_livre_clips:
+        return "Mercado Livre Clips"
     return "Desconhecida"
 
 
@@ -3680,38 +3712,6 @@ def autorizar_limite_global_persistente(user_id):
     return True, None
 
 
-def get_instagram_cookiefile():
-    texto = (INSTAGRAM_COOKIES_TEXT or "").strip()
-    if not texto:
-        return None
-
-    garantir_estrutura_privada()
-
-    # Algumas plataformas salvam quebras de linha como os caracteres \n.
-    if "\n" not in texto and "\\n" in texto:
-        texto = texto.replace("\\r\\n", "\n").replace("\\n", "\n")
-
-    texto = texto.replace("\r\n", "\n").replace("\r", "\n").strip()
-
-    # O yt-dlp espera o formato Netscape/Mozilla.
-    if not texto.startswith("# Netscape HTTP Cookie File") and not texto.startswith("# HTTP Cookie File"):
-        texto = "# Netscape HTTP Cookie File\n" + texto
-
-    cookie_path = os.path.join(PRIVATE_COOKIES_DIR, "instagram_cookies.txt")
-    escrever_texto_privado(cookie_path, texto + "\n")
-
-    linhas = [linha for linha in texto.splitlines() if linha and not linha.startswith("#")]
-    tem_sessionid = any(
-        len(partes := linha.split("\t")) >= 7 and partes[5] == "sessionid"
-        for linha in linhas
-    )
-    logger.info(
-        f"[INSTAGRAM_COOKIES] arquivo_criado=True linhas={len(linhas)} "
-        f"tem_sessionid={tem_sessionid}"
-    )
-    return cookie_path
-
-
 def normalizar_tiktok_cookies_text(texto):
     texto = (texto or "").strip().lstrip("\ufeff")
     if not texto:
@@ -4165,12 +4165,9 @@ def montar_info_opts(
     }
 
     if is_instagram:
-        # O extrator do yt-dlp configura os cabeçalhos e a impersonação.
-        # Cabeçalhos manuais podem ficar incompatíveis quando o Instagram muda.
-        if usar_cookies:
-            cookiefile = get_instagram_cookiefile()
-            if cookiefile:
-                opts["cookiefile"] = cookiefile
+        # Instagram funciona apenas em modo público/anônimo.
+        # Nenhuma sessão, cookie ou credencial de conta é enviada.
+        pass
     elif is_pinterest:
         opts["http_headers"] = PINTEREST_HEADERS
     elif is_tiktok:
@@ -4231,15 +4228,9 @@ def montar_download_opts(
 
     if is_instagram:
         opts.pop("http_headers", None)
-        # Desde a reestruturação recente do extrator do Instagram, o próprio
-        # yt-dlp define os cabeçalhos e a impersonação necessários. Não
-        # forçamos format_sort aqui: formatos válidos podem desaparecer se a
-        # seleção for restringida antes de o extrator terminar de montá-los.
+        # Instagram funciona apenas em modo público/anônimo.
+        # O yt-dlp define os cabeçalhos/impersonação e nenhuma sessão é usada.
         opts["extractor_retries"] = 3
-        if usar_cookies:
-            cookiefile = get_instagram_cookiefile()
-            if cookiefile:
-                opts["cookiefile"] = cookiefile
     elif is_pinterest:
         opts["http_headers"] = PINTEREST_HEADERS
     elif is_tiktok:
@@ -4276,10 +4267,11 @@ def erro_instagram_permite_fallback(erro):
 
 
 def info_plataforma_indica_audio(info):
-    """Retorna True/False quando os metadados permitem confirmar o áudio.
+    """Retorna True/False/None conforme a certeza dos metadados de áudio.
 
-    None significa que o extrator não informou codecs suficientes. Nesse caso,
-    o download é tratado de forma conservadora e um arquivo mudo é rejeitado.
+    True  = existe ao menos um stream confirmado com áudio.
+    False = todos os formatos observáveis são explicitamente video-only.
+    None  = há formatos com codec desconhecido; o arquivo precisa de ffprobe.
     """
     if not isinstance(info, dict):
         return None
@@ -4292,21 +4284,36 @@ def info_plataforma_indica_audio(info):
         elif isinstance(valor, dict):
             itens.append(valor)
 
-    codec_observado = False
+    viu_sem_audio_explicito = False
+    viu_codec_desconhecido = False
+
     for item in itens:
-        acodec = item.get("acodec")
-        if acodec not in (None, ""):
-            codec_observado = True
-            if str(acodec).strip().lower() not in ("none", "null", "unknown"):
-                return True
+        acodec_raw = item.get("acodec")
+        audio_ext_raw = item.get("audio_ext")
 
-        audio_ext = item.get("audio_ext")
-        if audio_ext not in (None, ""):
-            codec_observado = True
-            if str(audio_ext).strip().lower() not in ("none", "null", "unknown"):
-                return True
+        if acodec_raw in (None, "") and audio_ext_raw in (None, ""):
+            # Formatos progressivos do Instagram costumam aparecer assim.
+            viu_codec_desconhecido = True
+            continue
 
-    return False if codec_observado else None
+        acodec = str(acodec_raw or "").strip().lower()
+        audio_ext = str(audio_ext_raw or "").strip().lower()
+
+        if acodec and acodec not in ("none", "null", "unknown"):
+            return True
+        if audio_ext and audio_ext not in ("none", "null", "unknown"):
+            return True
+
+        if acodec == "unknown" or audio_ext == "unknown":
+            viu_codec_desconhecido = True
+        if acodec in ("none", "null") or audio_ext in ("none", "null"):
+            viu_sem_audio_explicito = True
+
+    if viu_codec_desconhecido:
+        return None
+    if viu_sem_audio_explicito:
+        return False
+    return None
 
 
 def arquivo_possui_audio(info_midia):
@@ -4431,62 +4438,419 @@ def extrair_info_facebook_com_fallback(url):
     raise RuntimeError("FACEBOOK_AUDIO_INDISPONIVEL_PUBLICO")
 
 
-def extrair_info_instagram_com_fallback(url):
-    """Consulta o Instagram com o extrator oficial do yt-dlp.
+def resumir_formatos_instagram(info):
+    """Registra codecs/formats sem expor URLs assinadas do Instagram."""
+    formatos = (info or {}).get("formats") if isinstance(info, dict) else None
+    if not isinstance(formatos, list):
+        logger.info("[INSTAGRAM_FORMATOS] total=0")
+        return
 
-    Se houver cookies configurados, eles são usados primeiro. Para conteúdo
-    público, uma falha da sessão autenticada cai para acesso anônimo. A
-    impersonação fica totalmente a cargo do yt-dlp/curl-cffi; desativá-la
-    manualmente quebra o fluxo público usado pelas versões atuais do extrator.
+    resumo = []
+    for item in formatos[:20]:
+        if not isinstance(item, dict):
+            continue
+        resumo.append(
+            "{id=%s ext=%s v=%s a=%s %sx%s fps=%s proto=%s}" % (
+                item.get("format_id"),
+                item.get("ext"),
+                item.get("vcodec"),
+                item.get("acodec"),
+                item.get("width"),
+                item.get("height"),
+                item.get("fps"),
+                item.get("protocol"),
+            )
+        )
+
+    logger.info(
+        f"[INSTAGRAM_FORMATOS] total={len(formatos)} "
+        f"itens={' '.join(resumo)[:3500]}"
+    )
+
+
+def formatos_progressivos_instagram(info):
+    """Retorna MP4s HTTP diretos antes dos DASH video-only.
+
+    O Instagram frequentemente expõe os codecs desses MP4s como desconhecidos
+    (None/unknown), embora o arquivo final possa ser H.264 + AAC. Por isso cada
+    candidato é baixado e confirmado com ffprobe antes de ser aceito.
     """
-    tem_cookies = bool(INSTAGRAM_COOKIES_TEXT.strip())
-    tentativas = []
-    if tem_cookies:
-        tentativas.append((True, "cookies"))
-    tentativas.append((False, "anonima"))
+    formatos = (info or {}).get("formats") if isinstance(info, dict) else None
+    if not isinstance(formatos, list):
+        return []
 
-    ultimo_erro = None
-    for indice, (usar_cookies, modo) in enumerate(tentativas):
+    candidatos = []
+    for item in formatos:
+        if not isinstance(item, dict):
+            continue
+        format_id = str(item.get("format_id") or "").strip()
+        if not format_id or format_id.lower().startswith("dash-"):
+            continue
+        if str(item.get("ext") or "").lower() != "mp4":
+            continue
+        protocolo = str(item.get("protocol") or "").lower()
+        if protocolo and not protocolo.startswith("http"):
+            continue
+
+        # Mesmo quando o Instagram informa acodec=none, ainda vale testar os
+        # MP4 HTTP diretos. O campo has_audio da resposta pública pode não
+        # descrever corretamente o arquivo progressivo entregue pelo CDN.
+        # A decisão final é sempre feita com ffprobe no arquivo real.
+        largura = item.get("width")
+        altura = item.get("height")
+        try:
+            if largura and int(largura) > 720:
+                continue
+            if altura and int(altura) > 1280:
+                continue
+        except (TypeError, ValueError):
+            pass
+
+        candidatos.append(format_id)
+
+    # Remove duplicados preservando a ordem entregue pelo Instagram.
+    candidatos = list(dict.fromkeys(candidatos))
+    logger.info(
+        f"[INSTAGRAM_PROGRESSIVOS] total={len(candidatos)} "
+        f"ids={','.join(candidatos[:12])}"
+    )
+    return candidatos
+
+
+
+def extrair_shortcode_instagram(url):
+    match = re.search(
+        r"https?://(?:www\.)?instagram\.com/(?:[^/?#]+/)?(?:p|reels?|tv)/([^/?#&]+)",
+        str(url or ""),
+        flags=re.IGNORECASE,
+    )
+    return match.group(1) if match else None
+
+
+def _normalizar_url_escapada_instagram(valor):
+    """Converte URLs escapadas de JSON/HTML sem aceitar esquemas arbitrários."""
+    texto = html.unescape(str(valor or "").strip())
+    if not texto:
+        return None
+
+    # Campos JSON do Instagram costumam usar \/ e escapes unicode.
+    texto = texto.replace(r"\/", "/")
+    texto = re.sub(
+        r"\\u([0-9a-fA-F]{4})",
+        lambda m: chr(int(m.group(1), 16)),
+        texto,
+    )
+    texto = texto.replace(r"\\&", "&")
+
+    if texto.startswith("//"):
+        texto = "https:" + texto
+    if not texto.startswith(("http://", "https://")):
+        return None
+    return texto
+
+
+def _host_midia_instagram_permitido(url):
+    try:
+        parsed = urlparse(str(url or "").strip())
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            return False
+        host = parsed.hostname.lower().rstrip(".")
+        return any(
+            hostname_permitido(host, dominio)
+            for dominio in ("cdninstagram.com", "fbcdn.net", "instagram.com")
+        )
+    except Exception:
+        return False
+
+
+def extrair_urls_midia_instagram_html(webpage):
+    """Coleta apenas URLs de vídeo de dados públicos da página/embeds."""
+    texto = str(webpage or "")
+    if not texto:
+        return []
+
+    candidatos = []
+
+    # Metadados HTML comuns. Em algumas respostas públicas, og:video aponta
+    # para um MP4 progressivo diferente da lista DASH da API.
+    for padrao in (
+        r'<meta[^>]+property=["\']og:video(?::url|:secure_url)?["\'][^>]+content=["\']([^"\']+)',
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:video(?::url|:secure_url)?["\']',
+        r'<meta[^>]+name=["\']twitter:player:stream["\'][^>]+content=["\']([^"\']+)',
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']twitter:player:stream["\']',
+    ):
+        candidatos.extend(re.findall(padrao, texto, flags=re.IGNORECASE))
+
+    # JSON-LD e dados serializados do React/Relay.
+    for chave in ("video_url", "videoUrl", "contentUrl", "content_url"):
+        padrao = rf'["\']{re.escape(chave)}["\']\s*:\s*["\']((?:\\.|[^"\'])+)["\']'
+        candidatos.extend(re.findall(padrao, texto, flags=re.IGNORECASE))
+
+    # Último recurso: URLs CDN explicitamente terminadas em mp4 dentro do HTML.
+    # Limita-se a domínios de mídia do ecossistema Instagram/Meta.
+    candidatos.extend(re.findall(
+        r'(https?:\\?/\\?/(?:[^"\'<>\\\s]+\.)?(?:cdninstagram\.com|fbcdn\.net)/[^"\'<>\\\s]+?\.mp4(?:\?[^"\'<>\\\s]*)?)',
+        texto,
+        flags=re.IGNORECASE,
+    ))
+
+    resultado = []
+    vistos = set()
+    for bruto in candidatos:
+        url = _normalizar_url_escapada_instagram(bruto)
+        if not url or url in vistos:
+            continue
+        if not _host_midia_instagram_permitido(url):
+            continue
+        # Não faz DNS aqui para não multiplicar consultas; cada download valida
+        # novamente o destino e seus redirects antes de transferir bytes.
+        if not validar_url_http_publica(url, resolver_dns=False):
+            continue
+        vistos.add(url)
+        resultado.append(url)
+        if len(resultado) >= 16:
+            break
+    return resultado
+
+
+def _obter_pagina_publica_instagram(url):
+    """Busca página pública sem cookies, preferindo fingerprint de navegador."""
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/151.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
+    if not validar_url_http_publica(url):
+        raise RuntimeError("INSTAGRAM_PAGINA_DESTINO_NAO_PUBLICO")
+
+    if curl_requests is not None:
+        resposta = curl_requests.get(
+            url,
+            impersonate="chrome",
+            timeout=20,
+            headers=headers,
+            allow_redirects=True,
+        )
+        final_url = str(getattr(resposta, "url", url) or url)
+        if not detectar_plataforma_url(final_url)[2]:
+            raise RuntimeError("INSTAGRAM_PAGINA_REDIRECIONOU_FORA")
+        if int(getattr(resposta, "status_code", 0) or 0) >= 400:
+            raise RuntimeError(
+                f"INSTAGRAM_PAGINA_HTTP_{getattr(resposta, 'status_code', 0)}"
+            )
+        return str(getattr(resposta, "text", "") or "")
+
+    resposta, final_url = seguir_redirecionamentos_seguros(url, headers=headers)
+    try:
+        if not detectar_plataforma_url(final_url)[2]:
+            raise RuntimeError("INSTAGRAM_PAGINA_REDIRECIONOU_FORA")
+        return resposta.text
+    finally:
+        resposta.close()
+
+
+def coletar_urls_publicas_instagram(url):
+    """Tenta página canônica e embeds oficiais, sem cookies/credenciais."""
+    shortcode = extrair_shortcode_instagram(url)
+    if not shortcode:
+        return []
+
+    parsed = urlparse(normalizar_url_instagram(url))
+    tipo = "reel" if "/reel/" in (parsed.path or "").lower() else "p"
+    paginas = [
+        f"https://www.instagram.com/{tipo}/{shortcode}/",
+        f"https://www.instagram.com/{tipo}/{shortcode}/embed/",
+        f"https://www.instagram.com/{tipo}/{shortcode}/embed/captioned/",
+        f"https://www.instagram.com/p/{shortcode}/",
+        f"https://www.instagram.com/p/{shortcode}/embed/",
+    ]
+    paginas = list(dict.fromkeys(paginas))
+
+    urls = []
+    vistos = set()
+    for indice, pagina in enumerate(paginas, start=1):
         try:
             logger.info(
-                f"[INSTAGRAM_INFO] modo={modo} "
-                f"usar_cookies={usar_cookies} "
-                f"url_ref={referencia_url_log(url)}"
+                f"[INSTAGRAM_HTML_PAGINA] tentativa={indice}/{len(paginas)} "
+                f"url_ref={referencia_url_log(pagina)}"
             )
-            opts = montar_info_opts(
-                is_instagram=True,
-                usar_cookies=usar_cookies,
-            )
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=False)
-
+            webpage = _obter_pagina_publica_instagram(pagina)
+            encontrados = extrair_urls_midia_instagram_html(webpage)
             logger.info(
-                "[INSTAGRAM_INFO_OK] "
-                f"modo={modo} "
-                f"audio_disponivel={info_plataforma_indica_audio(info)}"
+                f"[INSTAGRAM_HTML_CANDIDATOS] pagina={indice} "
+                f"total={len(encontrados)}"
             )
-            return info, usar_cookies
+            for candidato in encontrados:
+                if candidato in vistos:
+                    continue
+                vistos.add(candidato)
+                urls.append(candidato)
+                if len(urls) >= 16:
+                    return urls
+        except Exception as e:
+            logger.warning(
+                f"[INSTAGRAM_HTML_PAGINA_FALHA] pagina={indice} "
+                f"erro={sanitizar_erro_log(e)}"
+            )
+    return urls
+
+
+def baixar_url_midia_instagram_publica(url_midia, destino, referer):
+    """Baixa um candidato CDN com limite de tamanho e redirects validados."""
+    atual = str(url_midia or "").strip()
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/151.0.0.0 Safari/537.36"
+        ),
+        "Accept": "video/av,video/mp4,video/*;q=0.9,*/*;q=0.8",
+        "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+        "Referer": referer,
+    }
+
+    resposta = None
+    total = 0
+    try:
+        for _ in range(6):
+            if not _host_midia_instagram_permitido(atual):
+                raise RuntimeError("INSTAGRAM_MIDIA_HOST_NAO_PERMITIDO")
+            if not validar_url_http_publica(atual):
+                raise RuntimeError("INSTAGRAM_MIDIA_DESTINO_NAO_PUBLICO")
+
+            resposta = requests.get(
+                atual,
+                headers=headers,
+                stream=True,
+                allow_redirects=False,
+                timeout=(7, 25),
+            )
+            if resposta.status_code in (301, 302, 303, 307, 308):
+                destino_redirect = urljoin(
+                    atual, resposta.headers.get("Location") or ""
+                )
+                resposta.close()
+                resposta = None
+                if not destino_redirect or destino_redirect == atual:
+                    raise RuntimeError("INSTAGRAM_MIDIA_REDIRECT_INVALIDO")
+                atual = destino_redirect
+                continue
+
+            resposta.raise_for_status()
+            tamanho_header = resposta.headers.get("Content-Length")
+            if tamanho_header:
+                try:
+                    if int(tamanho_header) > MAX_SOURCE_FILE_BYTES:
+                        raise RuntimeError("ARQUIVO_MIDIA_MUITO_GRANDE fase=instagram_html")
+                except ValueError:
+                    pass
+
+            with open(destino, "wb") as arquivo:
+                for chunk in resposta.iter_content(chunk_size=256 * 1024):
+                    atualizar_heartbeat_worker("baixando_instagram_html")
+                    if not chunk:
+                        continue
+                    total += len(chunk)
+                    if total > MAX_SOURCE_FILE_BYTES:
+                        raise RuntimeError("ARQUIVO_MIDIA_MUITO_GRANDE fase=instagram_html")
+                    arquivo.write(chunk)
+            return total
+
+        raise RuntimeError("INSTAGRAM_MIDIA_MUITOS_REDIRECTS")
+    finally:
+        if resposta is not None:
+            resposta.close()
+
+
+def baixar_instagram_publico_com_audio(url, prefix):
+    """Fallback público: procura MP4 oficial no HTML e só aceita áudio real."""
+    candidatos = coletar_urls_publicas_instagram(url)
+    logger.info(
+        f"[INSTAGRAM_HTML_FALLBACK] candidatos={len(candidatos)} "
+        f"url_ref={referencia_url_log(url)}"
+    )
+    if not candidatos:
+        return None
+
+    ultimo_erro = None
+    for indice, candidato in enumerate(candidatos[:12], start=1):
+        try:
+            cleanup_prefix(prefix)
+            destino = f"{prefix}.igpublic.mp4"
+            tamanho = baixar_url_midia_instagram_publica(
+                candidato,
+                destino,
+                referer=normalizar_url_instagram(url),
+            )
+            info_midia = obter_info_midia(destino)
+            tem_audio = arquivo_possui_audio(info_midia)
+            logger.info(
+                f"[INSTAGRAM_HTML_PROBE] candidato={indice}/{min(len(candidatos), 12)} "
+                f"bytes={tamanho} tem_audio={tem_audio} "
+                f"vcodec={info_midia.get('vcodec')} acodec={info_midia.get('acodec')}"
+            )
+            if tem_audio:
+                logger.info(
+                    f"[INSTAGRAM_HTML_AUDIO_OK] candidato={indice} "
+                    f"arquivo_ref={referencia_arquivo_log(destino)}"
+                )
+                return destino
+            ultimo_erro = "INSTAGRAM_HTML_CANDIDATO_SEM_AUDIO"
         except FalhaComponenteDownload:
             raise
         except Exception as e:
             ultimo_erro = e
             logger.warning(
-                f"[INSTAGRAM_INFO_FALHA] modo={modo} "
-                f"usar_cookies={usar_cookies} "
-                f"url_ref={referencia_url_log(url)} "
+                f"[INSTAGRAM_HTML_TENTATIVA_FALHA] candidato={indice} "
                 f"erro={sanitizar_erro_log(e)}"
             )
 
-            if indice + 1 < len(tentativas):
-                logger.warning(
-                    "[INSTAGRAM_INFO_FALLBACK] "
-                    f"modo={modo} falhou=True "
-                    f"proxima_tentativa={tentativas[indice + 1][1]}"
-                )
-                continue
-            raise
+    cleanup_prefix(prefix)
+    logger.warning(
+        "[INSTAGRAM_HTML_SEM_AUDIO] "
+        f"tentativas={min(len(candidatos), 12)} "
+        f"erro={sanitizar_erro_log(ultimo_erro)}"
+    )
+    return None
 
-    raise ultimo_erro or Exception("Falha ao consultar o Instagram")
+
+def extrair_info_instagram_com_fallback(url):
+    """Consulta o Instagram somente em modo público/anônimo.
+
+    Cookies e credenciais de conta do Instagram ficam deliberadamente
+    desativados para evitar qualquer dependência de uma sessão pessoal.
+    """
+    logger.info(
+        "[INSTAGRAM_INFO] modo=anonima usar_cookies=False "
+        f"url_ref={referencia_url_log(url)}"
+    )
+    try:
+        opts = montar_info_opts(is_instagram=True, usar_cookies=False)
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+
+        audio_disponivel = info_plataforma_indica_audio(info)
+        logger.info(
+            "[INSTAGRAM_INFO_OK] "
+            f"modo=anonima audio_disponivel={audio_disponivel}"
+        )
+        resumir_formatos_instagram(info)
+        return info, False
+    except FalhaComponenteDownload:
+        raise
+    except Exception as e:
+        logger.warning(
+            "[INSTAGRAM_INFO_FALHA] modo=anonima usar_cookies=False "
+            f"url_ref={referencia_url_log(url)} "
+            f"erro={sanitizar_erro_log(e)}"
+        )
+        raise
 
 def erro_tiktok_permite_nova_tentativa(erro):
     texto = str(erro or "").lower()
@@ -4664,7 +5028,7 @@ def mapear_erro_download(err_text, plataforma="geral"):
                 "deste Reel. Tente novamente em alguns instantes."
             )
         if "login required" in err or "requested content is not available" in err or "rate-limit reached" in err:
-            return "❌ O Instagram bloqueou esse link no momento. Para Reels assim, o bot precisa de cookies válidos da conta logada no Instagram."
+            return "❌ Esse conteúdo do Instagram não está disponível pelo acesso público no momento."
         if "private" in err:
             return "❌ Esse conteúdo do Instagram é privado."
         if "403" in err:
@@ -4697,6 +5061,41 @@ def mapear_erro_download(err_text, plataforma="geral"):
         if "timed out" in err or "timeout" in err:
             return "❌ O TikTok demorou para responder. Tente novamente."
         return "❌ Não consegui baixar esse link do TikTok agora."
+
+    if plataforma in ("shopee", "shopee_video"):
+        if "watermark_video_url_nao_encontrada" in err or "original_nao_derivado" in err:
+            return (
+                "❌ Não consegui localizar o vídeo original sem marca d'água "
+                "nesse link da Shopee Video. Tente outro vídeo."
+            )
+        if "audio_ausente" in err:
+            return "❌ A Shopee não forneceu o vídeo original com áudio nesse link."
+        if "403" in err or "429" in err:
+            return "❌ A Shopee bloqueou temporariamente esse acesso. Tente novamente em instantes."
+        if "404" in err:
+            return "❌ Esse vídeo da Shopee não está mais disponível."
+        if "timeout" in err or "timed out" in err:
+            return "❌ A Shopee demorou para responder. Tente novamente."
+        if "redirecionamento_fora_da_plataforma" in err:
+            return "❌ Envie um link válido de Shopee Video."
+        return "❌ Não consegui baixar esse vídeo da Shopee agora."
+
+    if plataforma in ("mercado_livre_clips", "mercado livre clips", "mercadolivre", "ml_clips"):
+        if "video_url_nao_encontrada" in err or "short_nao_encontrado" in err:
+            return "❌ Não consegui localizar esse Mercado Livre Clip. Tente outro link."
+        if "audio_ausente" in err:
+            return "❌ O Mercado Livre não forneceu esse Clip com áudio."
+        if "video_muito_longo" in err:
+            return f"⚠️ Clip muito longo. O limite é de {MAX_DURATION_SECONDS} segundos."
+        if "403" in err or "429" in err:
+            return "❌ O Mercado Livre bloqueou temporariamente esse acesso. Tente novamente em instantes."
+        if "404" in err:
+            return "❌ Esse Mercado Livre Clip não está mais disponível."
+        if "timeout" in err or "timed out" in err:
+            return "❌ O Mercado Livre demorou para responder. Tente novamente."
+        if "host_invalido" in err or "redirecionamento" in err:
+            return "❌ Envie um link válido de Mercado Livre Clips."
+        return "❌ Não consegui baixar esse Mercado Livre Clip agora."
 
     if plataforma in ("facebook", "facebook_reels"):
         if (
@@ -6229,11 +6628,7 @@ def montar_relatorio_diagnostico():
         linhas.append("⚠️ TikTok sem marca: pausa automática temporária")
         problemas.append("Circuito TikTok temporariamente pausado")
 
-    linhas.append(
-        "✅ Cookies do Instagram: configurados"
-        if INSTAGRAM_COOKIES_TEXT.strip()
-        else "ℹ️ Cookies do Instagram: não configurados (opcional)"
-    )
+    linhas.append("✅ Instagram: modo público/anônimo, sem cookies")
     linhas.append(
         "✅ Cookies do TikTok: configurados"
         if TIKTOK_COOKIES_TEXT.strip()
@@ -7039,7 +7434,7 @@ def start(message):
 
     texto = (
         "📥 *Baixar Vídeos HD*\n\n"
-        "Baixe vídeos do TikTok, Pinterest, Instagram, Facebook Reels e RedNote.\n\n"
+        "Baixe vídeos do TikTok, Pinterest, Instagram, Facebook Reels, Shopee Video, Mercado Livre Clips e RedNote.\n\n"
         "• Qualidade: até 720×1280\n"
         f"• Duração máxima: {MAX_DURATION_SECONDS} segundos\n"
         f"• ID de usuário: `{message.from_user.id}`\n\n"
@@ -7971,6 +8366,976 @@ def revisar_comprovante_pix(call):
         safe_answer_callback(call.id, text="Erro ao revisar o pagamento.", show_alert=True)
 
 
+
+# =========================================
+# MERCADO LIVRE CLIPS
+# =========================================
+MERCADO_LIVRE_CLIPS_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Linux; Android 15; SM-S911B) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/151.0.0.0 Mobile Safari/537.36"
+    ),
+    "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+}
+
+
+def extrair_ids_mercado_livre_clips(url):
+    try:
+        parsed = urlparse(str(url or "").strip())
+        parametros = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    except Exception:
+        return None, None
+
+    short_id = str(parametros.get("short_id") or "").strip()
+    item_id = str(parametros.get("item_id") or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{3,64}", short_id):
+        return None, None
+    if item_id and not re.fullmatch(r"MLB\d{5,30}", item_id, flags=re.IGNORECASE):
+        item_id = ""
+    return short_id, item_id or None
+
+
+def normalizar_url_mercado_livre_clips(url):
+    short_id, _item_id = extrair_ids_mercado_livre_clips(url)
+    if not short_id:
+        return url
+    return (
+        "https://www.mercadolivre.com.br/clips/"
+        f"?shortsparams=true&type=short&short_id={urlencode({'v': short_id})[2:]}"
+    )
+
+
+def _decodificar_url_mercado_livre_clips(valor):
+    valor = str(valor or "").strip()
+    if not valor:
+        return None
+    for _ in range(4):
+        anterior = valor
+        valor = html.unescape(valor)
+        valor = (
+            valor.replace("\\u002F", "/")
+            .replace("\\u002f", "/")
+            .replace("\\/", "/")
+            .replace("\\u003A", ":")
+            .replace("\\u003a", ":")
+            .replace("\\u0026", "&")
+            .replace("\\u003D", "=")
+            .replace("\\u003d", "=")
+        )
+        if valor == anterior:
+            break
+    valor = valor.strip().strip('"\'')
+    if valor.startswith("//"):
+        valor = "https:" + valor
+    return valor if valor.startswith("https://") else None
+
+
+def _host_midia_mercado_livre_clips_permitido(url):
+    try:
+        parsed = urlparse(str(url or "").strip())
+        host = (parsed.hostname or "").lower().rstrip(".")
+        caminho = parsed.path or ""
+        return (
+            parsed.scheme == "https"
+            and not parsed.username
+            and not parsed.password
+            and parsed.port in (None, 443)
+            and hostname_permitido(host, "mlstatic.com")
+            and caminho.startswith("/storage/shorts-api/")
+            and caminho.lower().endswith(".m3u8")
+        )
+    except (ValueError, TypeError):
+        return False
+
+
+def extrair_video_mercado_livre_clips(texto, short_id):
+    """Extrai somente o videoUrl HLS do short_id solicitado."""
+    bruto = str(texto or "")
+    if not bruto or not short_id:
+        return None, None
+
+    short_re = re.escape(str(short_id))
+    candidatos = []
+
+    # Primeiro, associe explicitamente id -> videoUrl para não pegar outro Clip
+    # do feed pré-carregado na mesma página.
+    padrao_objeto = re.compile(
+        rf'"id"\s*:\s*"{short_re}".{{0,5000}}?'
+        r'"videoUrl"\s*:\s*"([^"]+)"'
+        r'.{0,1200}?"duration"\s*:\s*(\d+(?:\.\d+)?)',
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    for match in padrao_objeto.finditer(bruto):
+        candidatos.append((match.group(1), match.group(2)))
+
+    # Algumas versões podem posicionar duration antes/depois ou omiti-la.
+    if not candidatos:
+        padrao_sem_duracao = re.compile(
+            rf'"id"\s*:\s*"{short_re}".{{0,5000}}?'
+            r'"videoUrl"\s*:\s*"([^"]+)"',
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        for match in padrao_sem_duracao.finditer(bruto):
+            candidatos.append((match.group(1), None))
+
+    # Fallback estrito: prefira qualquer videoUrl cujo nome termine no short_id.
+    if not candidatos:
+        for match in re.finditer(
+            r'"videoUrl"\s*:\s*"([^"]+\.m3u8(?:\?[^"]*)?)"',
+            bruto,
+            flags=re.IGNORECASE,
+        ):
+            candidatos.append((match.group(1), None))
+
+    for valor, duracao_valor in candidatos:
+        video_url = _decodificar_url_mercado_livre_clips(valor)
+        if not video_url or not _host_midia_mercado_livre_clips_permitido(video_url):
+            continue
+        nome = os.path.basename(urlparse(video_url).path or "")
+        if not nome.lower().startswith(str(short_id).lower() + "."):
+            continue
+        try:
+            duracao = float(duracao_valor) if duracao_valor is not None else None
+        except (TypeError, ValueError):
+            duracao = None
+        return video_url, duracao
+
+    return None, None
+
+
+def _get_mercado_livre_publico(url, headers, max_redirects=4):
+    atual = str(url or "").strip()
+    resposta = None
+    try:
+        for _ in range(max_redirects + 1):
+            parsed = urlparse(atual)
+            host = (parsed.hostname or "").lower().rstrip(".")
+            if (
+                parsed.scheme != "https"
+                or not hostname_permitido(host, "mercadolivre.com.br")
+                or parsed.username
+                or parsed.password
+                or parsed.port not in (None, 443)
+                or not validar_url_http_publica(atual)
+            ):
+                raise RuntimeError("ML_CLIPS_PAGINA_HOST_INVALIDO")
+
+            resposta = requests.get(
+                atual,
+                headers=headers,
+                allow_redirects=False,
+                timeout=(5, 25),
+            )
+            if resposta.status_code in (301, 302, 303, 307, 308):
+                proxima = urljoin(atual, resposta.headers.get("Location") or "")
+                resposta.close()
+                resposta = None
+                if not proxima or proxima == atual:
+                    raise RuntimeError("ML_CLIPS_REDIRECIONAMENTO_INVALIDO")
+                atual = proxima
+                continue
+
+            resposta.raise_for_status()
+            return resposta, atual
+        raise RuntimeError("ML_CLIPS_REDIRECIONAMENTOS_DEMAIS")
+    except Exception:
+        if resposta is not None:
+            resposta.close()
+        raise
+
+
+def obter_video_mercado_livre_clips(url):
+    """Consulta apenas páginas públicas mobile e obtém o HLS oficial do Clip."""
+    short_id, item_id = extrair_ids_mercado_livre_clips(url)
+    if not short_id:
+        raise RuntimeError("ML_CLIPS_SHORT_NAO_ENCONTRADO")
+
+    short_q = urlencode({"short_id": short_id})
+    paginas = [
+        f"https://www.mercadolivre.com.br/clips/?shortsparams=true&type=short&{short_q}",
+        f"https://www.mercadolivre.com.br/live/videos?type=short&{short_q}",
+    ]
+    ultimo_erro = None
+    for indice, pagina in enumerate(paginas, start=1):
+        resposta = None
+        try:
+            atualizar_heartbeat_worker("ml_clips_consultando_pagina")
+            logger.info(
+                f"[ML_CLIPS_PAGINA_TENTATIVA] tentativa={indice}/{len(paginas)} "
+                "modo=publico_mobile login=False cookies=False token=False"
+            )
+            resposta, pagina_final = _get_mercado_livre_publico(
+                pagina,
+                MERCADO_LIVRE_CLIPS_HEADERS,
+            )
+            texto = resposta.text
+            video_url, duracao = extrair_video_mercado_livre_clips(texto, short_id)
+            logger.info(
+                f"[ML_CLIPS_PAGINA_OK] tentativa={indice} status={resposta.status_code} "
+                f"hls_encontrado={bool(video_url)} item_id_presente={bool(item_id)}"
+            )
+            if not video_url:
+                raise RuntimeError("ML_CLIPS_VIDEO_URL_NAO_ENCONTRADA")
+            if duracao and duracao > MAX_DURATION_SECONDS + 0.5:
+                raise RuntimeError(
+                    f"VIDEO_MUITO_LONGO duracao={duracao:.2f} limite={MAX_DURATION_SECONDS}"
+                )
+            return pagina_final, short_id, item_id, video_url, duracao
+        except Exception as e:
+            ultimo_erro = e
+            logger.warning(
+                f"[ML_CLIPS_PAGINA_FALHA] tentativa={indice} "
+                f"erro={sanitizar_erro_log(e)}"
+            )
+        finally:
+            if resposta is not None:
+                resposta.close()
+
+    raise RuntimeError(
+        f"ML_CLIPS_VIDEO_URL_NAO_ENCONTRADA: {ultimo_erro or 'sem fonte publica'}"
+    )
+
+
+def _get_manifesto_ml_clips(url, referer):
+    atual = str(url or "").strip()
+    resposta = None
+    try:
+        for _ in range(5):
+            if (
+                not _host_midia_mercado_livre_clips_permitido(atual)
+                or not validar_url_http_publica(atual)
+            ):
+                raise RuntimeError("ML_CLIPS_HLS_HOST_INVALIDO")
+            headers = {
+                "User-Agent": MERCADO_LIVRE_CLIPS_HEADERS["User-Agent"],
+                "Accept": "application/vnd.apple.mpegurl,application/x-mpegURL,*/*;q=0.8",
+                "Accept-Language": MERCADO_LIVRE_CLIPS_HEADERS["Accept-Language"],
+                "Referer": referer,
+            }
+            resposta = requests.get(
+                atual,
+                headers=headers,
+                allow_redirects=False,
+                timeout=(5, 20),
+            )
+            if resposta.status_code in (301, 302, 303, 307, 308):
+                proxima = urljoin(atual, resposta.headers.get("Location") or "")
+                resposta.close()
+                resposta = None
+                if not _host_midia_mercado_livre_clips_permitido(proxima):
+                    raise RuntimeError("ML_CLIPS_HLS_REDIRECIONAMENTO_INVALIDO")
+                atual = proxima
+                continue
+            resposta.raise_for_status()
+            texto = resposta.text
+            if "#EXTM3U" not in texto[:500].upper():
+                raise RuntimeError("ML_CLIPS_HLS_MANIFESTO_INVALIDO")
+            return texto, atual
+        raise RuntimeError("ML_CLIPS_HLS_REDIRECIONAMENTOS_DEMAIS")
+    finally:
+        if resposta is not None:
+            resposta.close()
+
+
+def validar_manifestos_mercado_livre_clips(url, referer, profundidade=0, visitados=None):
+    """Valida playlists HLS e bloqueia referências absolutas fora do MLStatic."""
+    if profundidade > 2:
+        return url
+    visitados = visitados if visitados is not None else set()
+    if url in visitados:
+        return url
+    visitados.add(url)
+
+    texto, final_url = _get_manifesto_ml_clips(url, referer)
+    filhos_m3u8 = []
+    for linha in texto.splitlines():
+        linha = linha.strip()
+        if not linha:
+            continue
+        uris = []
+        if not linha.startswith("#"):
+            uris.append(linha)
+        for match in re.finditer(r'URI=["\']([^"\']+)["\']', linha, flags=re.IGNORECASE):
+            uris.append(match.group(1))
+        for uri in uris:
+            absoluto = urljoin(final_url, uri)
+            parsed = urlparse(absoluto)
+            host = (parsed.hostname or "").lower().rstrip(".")
+            if (
+                parsed.scheme != "https"
+                or not hostname_permitido(host, "mlstatic.com")
+                or parsed.username
+                or parsed.password
+                or parsed.port not in (None, 443)
+            ):
+                raise RuntimeError("ML_CLIPS_HLS_REFERENCIA_FORA_DO_MLSTATIC")
+            if (parsed.path or "").lower().endswith(".m3u8"):
+                filhos_m3u8.append(absoluto)
+
+    for filho in filhos_m3u8[:8]:
+        validar_manifestos_mercado_livre_clips(
+            filho,
+            referer,
+            profundidade=profundidade + 1,
+            visitados=visitados,
+        )
+    return final_url
+
+
+def baixar_hls_mercado_livre_clips(url_hls, destino, referer):
+    """Remuxa HLS público do MLStatic para MP4 com áudio obrigatório."""
+    atualizar_heartbeat_worker("ml_clips_validando_hls")
+    url_hls = validar_manifestos_mercado_livre_clips(url_hls, referer)
+    logger.info("[ML_CLIPS_HLS_VALIDADO] host_mlstatic=True referencias_oficiais=True")
+
+    headers_ffmpeg = (
+        f"Referer: {referer}\\r\\n"
+        f"Accept-Language: {MERCADO_LIVRE_CLIPS_HEADERS['Accept-Language']}\\r\\n"
+    )
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-v", "error",
+        "-user_agent", MERCADO_LIVRE_CLIPS_HEADERS["User-Agent"],
+        "-headers", headers_ffmpeg,
+        "-i", url_hls,
+        "-map", "0:v:0",
+        "-map", "0:a:0",
+        "-c", "copy",
+        "-movflags", "+faststart",
+        destino,
+    ]
+    atualizar_heartbeat_worker("ml_clips_baixando_hls")
+    try:
+        resultado = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=FFMPEG_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as e:
+        raise FalhaComponenteDownload(
+            "Processamento",
+            f"FFMPEG_TIMEOUT ml_clips timeout={FFMPEG_TIMEOUT_SECONDS}s",
+        ) from e
+
+    if resultado.returncode != 0 or not os.path.isfile(destino):
+        raise FalhaComponenteDownload(
+            "Processamento",
+            f"ML_CLIPS_FFMPEG_FALHOU codigo={resultado.returncode} "
+            f"detalhe={sanitizar_erro_log(resultado.stderr[-500:])}",
+        )
+    return destino
+
+
+def processar_download_mercado_livre_clips(
+    message,
+    url,
+    status_msg,
+    vip_status,
+    reserva_download=None,
+):
+    """Pipeline público de Mercado Livre Clips sem login/cookies/token."""
+    prefix = os.path.join(DOWNLOAD_DIR, f"mlclips_{uuid.uuid4().hex}")
+    plataforma = "Mercado Livre Clips"
+    try:
+        url = normalizar_url_mercado_livre_clips(url)
+        url_cache_key, url_normalizada = montar_chave_cache_url(plataforma, url)
+        entrada_cache_url = obter_entrada_cache(url_cache_key)
+        tipo_cache_url = (
+            enviar_midia_cacheada(message.chat.id, url_cache_key, entrada_cache_url)
+            if entrada_cache_url
+            else None
+        )
+        if tipo_cache_url:
+            registrar_download_diario(
+                vip_status,
+                tipo_entrega="cache_url",
+                admin_status=message.from_user.id == ADMIN_ID,
+            )
+            if reserva_download:
+                confirmar_download_gratis(
+                    reserva_download,
+                    message.from_user.id,
+                    message.chat.id,
+                    message.from_user.id,
+                )
+            if status_msg:
+                safe_delete_message(message.chat.id, status_msg.message_id)
+            logger.info("[ML_CLIPS_CACHE_HIT] tipo=url")
+            return True
+
+        espaco_ok, _ = garantir_espaco_para_novo_download()
+        if not espaco_ok:
+            informar_download_pausado_por_espaco(message, status_msg)
+            return False
+
+        pagina_final, short_id, item_id, video_url, duracao = obter_video_mercado_livre_clips(url)
+        logger.info(
+            "[ML_CLIPS_VIDEO_URL] encontrado=True hls=True host_mlstatic=True "
+            f"duracao={duracao if duracao is not None else 'desconhecida'} "
+            "login=False cookies=False token=False"
+        )
+
+        info_cache = {
+            "id": short_id,
+            "display_id": short_id,
+            "webpage_url": pagina_final,
+        }
+        cache_key, cache_source_id = montar_chave_cache_midia(
+            plataforma,
+            info_cache,
+            pagina_final,
+        )
+        entrada_cache = obter_entrada_cache(cache_key)
+        tipo_cache = (
+            enviar_midia_cacheada(message.chat.id, cache_key, entrada_cache)
+            if entrada_cache
+            else None
+        )
+        if tipo_cache:
+            salvar_file_id_cache(
+                cache_key,
+                cache_source_id,
+                plataforma,
+                entrada_cache["telegram_file_id"],
+                tipo_cache,
+                url_cache_key=url_cache_key,
+                url_normalizada=url_normalizada,
+            )
+            registrar_download_diario(
+                vip_status,
+                tipo_entrega="cache_midia",
+                admin_status=message.from_user.id == ADMIN_ID,
+            )
+            if reserva_download:
+                confirmar_download_gratis(
+                    reserva_download,
+                    message.from_user.id,
+                    message.chat.id,
+                    message.from_user.id,
+                )
+            if status_msg:
+                safe_delete_message(message.chat.id, status_msg.message_id)
+            logger.info("[ML_CLIPS_CACHE_HIT] tipo=midia")
+            return True
+
+        arquivo_baixado = f"{prefix}.mp4"
+        baixar_hls_mercado_livre_clips(video_url, arquivo_baixado, pagina_final)
+        info_baixada = validar_arquivo_midia(
+            arquivo_baixado,
+            MAX_SOURCE_FILE_BYTES,
+            fase="ml_clips_hls",
+        )
+        if not arquivo_possui_audio(info_baixada):
+            raise RuntimeError("ML_CLIPS_AUDIO_AUSENTE_NO_HLS")
+
+        logger.info(
+            "[ML_CLIPS_HLS_OK] "
+            f"width={info_baixada.get('width')} height={info_baixada.get('height')} "
+            f"fps={info_baixada.get('fps')} vcodec={info_baixada.get('vcodec')} "
+            f"acodec={info_baixada.get('acodec')}"
+        )
+
+        if os.path.getsize(arquivo_baixado) > MAX_OUTPUT_FILE_BYTES:
+            logger.info(
+                "[ML_CLIPS_COMPACTACAO] necessaria=True "
+                f"limite_mb={MAX_OUTPUT_FILE_MB}"
+            )
+            arquivo_envio = converter_para_720x1280_30fps(arquivo_baixado)
+        else:
+            arquivo_envio = preparar_arquivo_para_envio(
+                arquivo_baixado,
+                plataforma=plataforma,
+            )
+
+        info_envio = validar_arquivo_midia(
+            arquivo_envio,
+            MAX_OUTPUT_FILE_BYTES,
+            fase="ml_clips_envio",
+        )
+        if not arquivo_possui_audio(info_envio):
+            raise RuntimeError("ML_CLIPS_AUDIO_AUSENTE_APOS_PROCESSAMENTO")
+
+        enviado, telegram_file_id, telegram_media_type, bytes_upload = (
+            enviar_arquivo_com_fallback(message.chat.id, arquivo_envio)
+        )
+        if not enviado:
+            raise RuntimeError("ML_CLIPS_FALHA_ENVIO_TELEGRAM")
+
+        salvar_file_id_cache(
+            cache_key,
+            cache_source_id,
+            plataforma,
+            telegram_file_id,
+            telegram_media_type,
+            url_cache_key=url_cache_key,
+            url_normalizada=url_normalizada,
+        )
+        registrar_download_diario(
+            vip_status,
+            tipo_entrega="upload",
+            bytes_upload=bytes_upload,
+            admin_status=message.from_user.id == ADMIN_ID,
+        )
+        if reserva_download:
+            confirmar_download_gratis(
+                reserva_download,
+                message.from_user.id,
+                message.chat.id,
+                message.from_user.id,
+            )
+        registrar_sucesso_plataforma(plataforma)
+        registrar_sucesso_componente("Processamento")
+        registrar_sucesso_componente("Interno")
+        if status_msg:
+            safe_delete_message(message.chat.id, status_msg.message_id)
+        logger.info(
+            "[ML_CLIPS_DOWNLOAD_OK] audio=True cache_salvo=True "
+            "login=False cookies=False token=False"
+        )
+        return True
+    finally:
+        cleanup_prefix(prefix)
+
+
+# =========================================
+# SHOPEE VIDEO
+# =========================================
+SHOPEE_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/136.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+}
+
+
+def _normalizar_url_extraida_shopee(valor):
+    valor = str(valor or "").strip()
+    if not valor:
+        return None
+
+    # A URL pode aparecer como JSON, HTML ou query string e pode estar
+    # escapada mais de uma vez dentro do estado inicial da página.
+    for _ in range(3):
+        anterior = valor
+        valor = html.unescape(valor)
+        try:
+            valor = unquote(valor)
+        except Exception:
+            pass
+        valor = (
+            valor.replace("\\u002F", "/")
+            .replace("\\u002f", "/")
+            .replace("\\/", "/")
+            .replace("\\u0026", "&")
+            .replace("\\u003D", "=")
+            .replace("\\u003d", "=")
+        )
+        if valor == anterior:
+            break
+
+    valor = valor.strip().strip('"\'')
+    if valor.startswith("//"):
+        valor = "https:" + valor
+    return valor if valor.startswith("https://") else None
+
+
+def _host_midia_shopee_permitido(url):
+    try:
+        parsed = urlparse(str(url or "").strip())
+        return (
+            parsed.scheme == "https"
+            and parsed.hostname
+            and hostname_permitido(parsed.hostname, "susercontent.com")
+            and not parsed.username
+            and not parsed.password
+            and parsed.port in (None, 443)
+        )
+    except (ValueError, TypeError):
+        return False
+
+
+def extrair_urls_watermark_shopee(texto):
+    """Localiza somente URLs oficiais declaradas como watermarkVideoUrl."""
+    if not texto:
+        return []
+
+    bruto = str(texto)
+    variantes = [bruto]
+    decodificado = html.unescape(bruto)
+    try:
+        decodificado = unquote(decodificado)
+    except Exception:
+        pass
+    if decodificado not in variantes:
+        variantes.append(decodificado)
+
+    # Cria também uma variante com escapes comuns de JSON/JS já resolvidos.
+    # Isso permite localizar o valor mesmo quando a página usa https:\/\/ ou
+    # https:\u002F\u002F dentro de um bloco serializado.
+    normalizado = decodificado
+    for _ in range(3):
+        anterior = normalizado
+        normalizado = (
+            normalizado.replace("\\u002F", "/")
+            .replace("\\u002f", "/")
+            .replace("\\/", "/")
+            .replace("\\u0026", "&")
+            .replace("\\u003D", "=")
+            .replace("\\u003d", "=")
+        )
+        if normalizado == anterior:
+            break
+    if normalizado not in variantes:
+        variantes.append(normalizado)
+
+    padroes = (
+        r'["\\\']watermarkVideoUrl["\\\']\s*:\s*["\\\']([^"\\\']+)',
+        r'watermarkVideoUrl.{0,120}?(https?://[^"\\\'<>\s]+?\.mp4(?:\?[^"\\\'<>\s]*)?)',
+    )
+    encontrados = []
+    for variante in variantes:
+        for padrao in padroes:
+            for match in re.finditer(padrao, variante, flags=re.IGNORECASE | re.DOTALL):
+                candidato = _normalizar_url_extraida_shopee(match.group(1))
+                if candidato and _host_midia_shopee_permitido(candidato) and candidato not in encontrados:
+                    encontrados.append(candidato)
+    return encontrados
+
+
+def derivar_url_original_shopee(url_watermark):
+    """Remove somente o sufixo de marca d'água do nome oficial do MP4."""
+    if not _host_midia_shopee_permitido(url_watermark):
+        raise RuntimeError("SHOPEE_WATERMARK_HOST_INVALIDO")
+
+    parsed = urlparse(url_watermark)
+    caminho = parsed.path or ""
+    diretorio, _, nome = caminho.rpartition("/")
+
+    # Exemplo observado na fonte oficial:
+    #   ID.16003551782243289.6072.mp4 -> ID.mp4
+    match = re.fullmatch(
+        r'(.+?)\.\d{10,}\.\d+\.mp4',
+        nome,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        raise RuntimeError("SHOPEE_PADRAO_WATERMARK_DESCONHECIDO")
+
+    nome_original = match.group(1) + ".mp4"
+    novo_caminho = f"{diretorio}/{nome_original}" if diretorio else f"/{nome_original}"
+    original = parsed._replace(path=novo_caminho, query="", fragment="").geturl()
+    if not _host_midia_shopee_permitido(original):
+        raise RuntimeError("SHOPEE_ORIGINAL_HOST_INVALIDO")
+    return original
+
+
+def obter_originais_shopee(url):
+    """Obtém candidatos originais sem marca apenas da página oficial da Shopee."""
+    atualizar_heartbeat_worker("shopee_consultando_pagina")
+    resposta, url_final = seguir_redirecionamentos_seguros(
+        url,
+        headers=SHOPEE_HEADERS,
+        max_redirects=6,
+    )
+    try:
+        host_final = (urlparse(url_final).hostname or "").lower().rstrip(".")
+        if not hostname_permitido(host_final, "shopee.com.br"):
+            raise RuntimeError("SHOPEE_REDIRECIONAMENTO_FORA_DA_PLATAFORMA")
+
+        texto = resposta.text
+    finally:
+        resposta.close()
+
+    watermarks = extrair_urls_watermark_shopee(texto)
+    logger.info(
+        f"[SHOPEE_WATERMARKS] total={len(watermarks)} "
+        f"url_ref={referencia_url_log(url_final)}"
+    )
+    if not watermarks:
+        raise RuntimeError("SHOPEE_WATERMARK_VIDEO_URL_NAO_ENCONTRADA")
+
+    originais = []
+    erros = []
+    for watermark in watermarks:
+        try:
+            original = derivar_url_original_shopee(watermark)
+            if original not in originais:
+                originais.append(original)
+        except Exception as e:
+            erros.append(str(e))
+
+    if not originais:
+        detalhe = erros[-1] if erros else "sem_candidatos"
+        raise RuntimeError(f"SHOPEE_ORIGINAL_NAO_DERIVADO: {detalhe}")
+
+    logger.info(
+        f"[SHOPEE_ORIGINAIS] total={len(originais)} "
+        "somente_susercontent=True sem_watermark=True"
+    )
+    return url_final, originais
+
+
+def baixar_url_original_shopee(url_midia, destino, referer):
+    """Baixa um MP4 oficial sem permitir redirecionamento fora do CDN Shopee."""
+    atual = str(url_midia or "").strip()
+    resposta = None
+    try:
+        for _ in range(6):
+            if not _host_midia_shopee_permitido(atual) or not validar_url_http_publica(atual):
+                raise RuntimeError("SHOPEE_CDN_URL_NAO_PERMITIDA")
+
+            headers = {
+                **SHOPEE_HEADERS,
+                "Accept": "video/mp4,video/*;q=0.9,*/*;q=0.8",
+                "Referer": referer,
+            }
+            resposta = requests.get(
+                atual,
+                headers=headers,
+                stream=True,
+                allow_redirects=False,
+                timeout=(5, 25),
+            )
+
+            if resposta.status_code in (301, 302, 303, 307, 308):
+                destino_redirect = urljoin(atual, resposta.headers.get("Location") or "")
+                resposta.close()
+                resposta = None
+                if not destino_redirect or destino_redirect == atual:
+                    raise RuntimeError("SHOPEE_CDN_REDIRECIONAMENTO_INVALIDO")
+                atual = destino_redirect
+                continue
+
+            resposta.raise_for_status()
+            tamanho_declarado = int(resposta.headers.get("Content-Length") or 0)
+            if tamanho_declarado > MAX_SOURCE_FILE_BYTES:
+                raise RuntimeError(
+                    f"ARQUIVO_MIDIA_MUITO_GRANDE fase=download "
+                    f"tamanho={tamanho_declarado} limite={MAX_SOURCE_FILE_BYTES}"
+                )
+
+            total = 0
+            with open(destino, "wb") as arquivo:
+                for chunk in resposta.iter_content(chunk_size=256 * 1024):
+                    if not chunk:
+                        continue
+                    total += len(chunk)
+                    if total > MAX_SOURCE_FILE_BYTES:
+                        raise RuntimeError(
+                            f"ARQUIVO_MIDIA_MUITO_GRANDE fase=download "
+                            f"tamanho={total} limite={MAX_SOURCE_FILE_BYTES}"
+                        )
+                    arquivo.write(chunk)
+                    atualizar_heartbeat_worker("shopee_baixando")
+            if total <= 0:
+                raise RuntimeError("SHOPEE_ARQUIVO_VAZIO")
+            return atual
+
+        raise RuntimeError("SHOPEE_CDN_MUITOS_REDIRECIONAMENTOS")
+    finally:
+        if resposta is not None:
+            resposta.close()
+
+
+def processar_download_shopee(message, url, status_msg, vip_status, reserva_download=None):
+    """Pipeline Shopee Video: original oficial, áudio obrigatório e cache Telegram."""
+    prefix = os.path.join(DOWNLOAD_DIR, f"shopee_{uuid.uuid4().hex}")
+    plataforma = "Shopee Video"
+    try:
+        url_cache_key, url_normalizada = montar_chave_cache_url(plataforma, url)
+        entrada_cache_url = obter_entrada_cache(url_cache_key)
+        tipo_cache_url = (
+            enviar_midia_cacheada(message.chat.id, url_cache_key, entrada_cache_url)
+            if entrada_cache_url
+            else None
+        )
+        if tipo_cache_url:
+            registrar_download_diario(
+                vip_status,
+                tipo_entrega="cache_url",
+                admin_status=message.from_user.id == ADMIN_ID,
+            )
+            if reserva_download:
+                confirmar_download_gratis(
+                    reserva_download,
+                    message.from_user.id,
+                    message.chat.id,
+                    message.from_user.id,
+                )
+            if status_msg:
+                safe_delete_message(message.chat.id, status_msg.message_id)
+            logger.info("[SHOPEE_CACHE_HIT] tipo=url")
+            return True
+
+        espaco_ok, _ = garantir_espaco_para_novo_download()
+        if not espaco_ok:
+            informar_download_pausado_por_espaco(message, status_msg)
+            return False
+
+        pagina_final, originais = obter_originais_shopee(url)
+
+        # A URL original já contém um identificador estável da mídia. Consulte
+        # o cache do Telegram antes de baixar o MP4 novamente do CDN da Shopee.
+        original_base = originais[0]
+        media_id_base = os.path.basename(
+            urlparse(original_base).path or ""
+        ).rsplit(".", 1)[0]
+        info_cache = {
+            "id": media_id_base
+            or hashlib.sha256(original_base.encode()).hexdigest()[:24],
+            "display_id": media_id_base,
+            "webpage_url": pagina_final,
+        }
+        cache_key, cache_source_id = montar_chave_cache_midia(
+            plataforma,
+            info_cache,
+            pagina_final,
+        )
+        entrada_cache = obter_entrada_cache(cache_key)
+        tipo_cache = (
+            enviar_midia_cacheada(message.chat.id, cache_key, entrada_cache)
+            if entrada_cache
+            else None
+        )
+        if tipo_cache:
+            salvar_file_id_cache(
+                cache_key,
+                cache_source_id,
+                plataforma,
+                entrada_cache["telegram_file_id"],
+                tipo_cache,
+                url_cache_key=url_cache_key,
+                url_normalizada=url_normalizada,
+            )
+            registrar_download_diario(
+                vip_status,
+                tipo_entrega="cache_midia",
+                admin_status=message.from_user.id == ADMIN_ID,
+            )
+            if reserva_download:
+                confirmar_download_gratis(
+                    reserva_download,
+                    message.from_user.id,
+                    message.chat.id,
+                    message.from_user.id,
+                )
+            if status_msg:
+                safe_delete_message(message.chat.id, status_msg.message_id)
+            logger.info("[SHOPEE_CACHE_HIT] tipo=midia")
+            return True
+
+        ultimo_erro = None
+        arquivo_baixado = None
+        info_baixada = None
+        original_usada = None
+
+        for indice, original in enumerate(originais, start=1):
+            cleanup_prefix(prefix)
+            destino = f"{prefix}.mp4"
+            try:
+                logger.info(
+                    f"[SHOPEE_DOWNLOAD_TENTATIVA] candidato={indice}/{len(originais)} "
+                    "host_oficial=True sem_watermark=True"
+                )
+                baixar_url_original_shopee(original, destino, pagina_final)
+                info = validar_arquivo_midia(
+                    destino,
+                    MAX_SOURCE_FILE_BYTES,
+                    fase="shopee_original",
+                )
+                if not arquivo_possui_audio(info):
+                    raise RuntimeError("SHOPEE_AUDIO_AUSENTE_NO_ORIGINAL")
+                arquivo_baixado = destino
+                info_baixada = info
+                original_usada = original
+                break
+            except Exception as e:
+                ultimo_erro = e
+                logger.warning(
+                    f"[SHOPEE_DOWNLOAD_TENTATIVA_FALHA] candidato={indice} "
+                    f"erro={sanitizar_erro_log(e)}"
+                )
+
+        if not arquivo_baixado:
+            raise RuntimeError(
+                f"SHOPEE_ORIGINAL_FALHOU: {ultimo_erro or 'nenhum candidato funcionou'}"
+            )
+
+        logger.info(
+            "[SHOPEE_ORIGINAL_OK] "
+            f"width={info_baixada.get('width')} height={info_baixada.get('height')} "
+            f"fps={info_baixada.get('fps')} vcodec={info_baixada.get('vcodec')} "
+            f"acodec={info_baixada.get('acodec')} sem_watermark=True"
+        )
+
+        if os.path.getsize(arquivo_baixado) > MAX_OUTPUT_FILE_BYTES:
+            logger.info(
+                "[SHOPEE_COMPACTACAO] necessaria=True "
+                f"limite_mb={MAX_OUTPUT_FILE_MB}"
+            )
+            arquivo_envio = converter_para_720x1280_30fps(arquivo_baixado)
+        else:
+            arquivo_envio = preparar_arquivo_para_envio(
+                arquivo_baixado,
+                plataforma=plataforma,
+            )
+        info_envio = validar_arquivo_midia(
+            arquivo_envio,
+            MAX_OUTPUT_FILE_BYTES,
+            fase="shopee_envio",
+        )
+        if not arquivo_possui_audio(info_envio):
+            raise RuntimeError("SHOPEE_AUDIO_AUSENTE_APOS_PROCESSAMENTO")
+
+        enviado, telegram_file_id, telegram_media_type, bytes_upload = (
+            enviar_arquivo_com_fallback(message.chat.id, arquivo_envio)
+        )
+        if not enviado:
+            raise RuntimeError("SHOPEE_FALHA_ENVIO_TELEGRAM")
+
+        salvar_file_id_cache(
+            cache_key,
+            cache_source_id,
+            plataforma,
+            telegram_file_id,
+            telegram_media_type,
+            url_cache_key=url_cache_key,
+            url_normalizada=url_normalizada,
+        )
+        registrar_download_diario(
+            vip_status,
+            tipo_entrega="upload",
+            bytes_upload=bytes_upload,
+            admin_status=message.from_user.id == ADMIN_ID,
+        )
+        if reserva_download:
+            confirmar_download_gratis(
+                reserva_download,
+                message.from_user.id,
+                message.chat.id,
+                message.from_user.id,
+            )
+        registrar_sucesso_plataforma(plataforma)
+        registrar_sucesso_componente("Processamento")
+        registrar_sucesso_componente("Interno")
+        if status_msg:
+            safe_delete_message(message.chat.id, status_msg.message_id)
+        logger.info("[SHOPEE_DOWNLOAD_OK] audio=True sem_watermark=True cache_salvo=True")
+        return True
+    finally:
+        cleanup_prefix(prefix)
+
+
 # =========================================
 # DOWNLOAD
 # =========================================
@@ -8071,6 +9436,8 @@ def _processar_download(message, url, status_msg, reserva_download=None):
             is_instagram,
             is_rednote,
             is_facebook_reel,
+            is_shopee,
+            is_mercado_livre_clips,
         ) = detectar_plataforma(url)
         plataforma = nome_plataforma(
             is_pinterest,
@@ -8078,12 +9445,16 @@ def _processar_download(message, url, status_msg, reserva_download=None):
             is_instagram,
             is_rednote,
             is_facebook_reel,
+            is_shopee,
+            is_mercado_livre_clips,
         )
 
         if is_instagram:
             url = normalizar_url_instagram(url)
         elif is_facebook_reel:
             url = normalizar_url_facebook_reel(url)
+        elif is_mercado_livre_clips:
+            url = normalizar_url_mercado_livre_clips(url)
 
         logger.info(
             f"[DOWNLOAD_INICIO] user_ref={referencia_usuario_log(message.from_user.id)} "
@@ -8096,15 +9467,37 @@ def _processar_download(message, url, status_msg, reserva_download=None):
             or is_instagram
             or is_rednote
             or is_facebook_reel
+            or is_shopee
+            or is_mercado_livre_clips
         ):
             texto_nao_reconhecido = (
                 "❌ Link não reconhecido. Envie um link do TikTok, Pinterest, "
-                "Instagram, Facebook Reels ou RedNote."
+                "Instagram, Facebook Reels, Shopee Video, Mercado Livre Clips ou RedNote."
             )
             if status_msg:
                 safe_edit_message(message.chat.id, status_msg.message_id, texto_nao_reconhecido)
             else:
                 safe_send_message(message.chat.id, texto_nao_reconhecido)
+            return
+
+        if is_shopee:
+            processar_download_shopee(
+                message,
+                url,
+                status_msg,
+                vip_status,
+                reserva_download=reserva_download,
+            )
+            return
+
+        if is_mercado_livre_clips:
+            processar_download_mercado_livre_clips(
+                message,
+                url,
+                status_msg,
+                vip_status,
+                reserva_download=reserva_download,
+            )
             return
 
         if is_pinterest:
@@ -8458,20 +9851,56 @@ def _processar_download(message, url, status_msg, reserva_download=None):
             informar_download_pausado_por_espaco(message, status_msg)
             return
 
-        formatos = formatos_por_plataforma(
+        formatos_progressivos_ig = (
+            formatos_progressivos_instagram(info) if is_instagram else []
+        )
+        formatos = formatos_progressivos_ig + formatos_por_plataforma(
             is_tiktok=is_tiktok,
             is_instagram=is_instagram,
             is_pinterest=is_pinterest,
             is_rednote=is_rednote,
             is_facebook_reel=is_facebook_reel,
         )
+        formatos = list(dict.fromkeys(formatos))
         baixou = False
         ultimo_erro = None
+        instagram_html_fallback_tentado = False
+
+        # Se os metadados públicos já informam que o Reel veio sem áudio,
+        # tenta o fallback da página pública IMEDIATAMENTE, antes de qualquer
+        # seletor normal do yt-dlp. Isso evita que um MP4/DASH mudo seja aceito
+        # antes que o fallback tenha a chance de procurar uma origem completa.
+        if is_instagram and audio_instagram_esperado is False:
+            instagram_html_fallback_tentado = True
+            logger.info(
+                "[INSTAGRAM_HTML_INICIO] motivo=metadata_sem_audio "
+                f"url_ref={referencia_url_log(url)}"
+            )
+            try:
+                arquivo_html = baixar_instagram_publico_com_audio(url, prefix)
+                if arquivo_html and os.path.exists(arquivo_html):
+                    info_html = obter_info_midia(arquivo_html)
+                    tem_audio_html = arquivo_possui_audio(info_html)
+                    logger.info(
+                        "[INSTAGRAM_HTML_RESULTADO] "
+                        f"tem_audio={tem_audio_html} "
+                        f"vcodec={info_html.get('vcodec')} "
+                        f"acodec={info_html.get('acodec')}"
+                    )
+                    if tem_audio_html:
+                        baixou = True
+                    else:
+                        cleanup_prefix(prefix)
+            except Exception as e:
+                logger.warning(
+                    "[INSTAGRAM_HTML_FALLBACK_FALHA] "
+                    f"url_ref={referencia_url_log(url)} "
+                    f"erro={sanitizar_erro_log(e)}"
+                )
+                cleanup_prefix(prefix)
 
         if is_instagram:
-            modos_cookie = [usar_cookies_plataforma]
-            if usar_cookies_plataforma and INSTAGRAM_COOKIES_TEXT.strip():
-                modos_cookie.append(False)
+            modos_cookie = [False]
         elif is_tiktok:
             modos_cookie = [usar_cookies_plataforma]
             if usar_cookies_plataforma:
@@ -8479,7 +9908,7 @@ def _processar_download(message, url, status_msg, reserva_download=None):
         else:
             modos_cookie = [False]
 
-        for usar_cookies in modos_cookie:
+        for usar_cookies in ([] if baixou else modos_cookie):
             atualizar_heartbeat_worker("baixando")
             common_opts = montar_download_opts(
                 prefix,
@@ -8492,6 +9921,24 @@ def _processar_download(message, url, status_msg, reserva_download=None):
 
             for fmt in formatos:
                 try:
+                    # Primeiro testa todos os MP4 diretos já encontrados pelo
+                    # yt-dlp. Se nenhum deles tiver áudio, antes dos seletores
+                    # DASH/gerais consulta as páginas públicas/embeds oficiais.
+                    if (
+                        is_instagram
+                        and not instagram_html_fallback_tentado
+                        and fmt not in formatos_progressivos_ig
+                    ):
+                        instagram_html_fallback_tentado = True
+                        logger.info(
+                            "[INSTAGRAM_HTML_INICIO] motivo=progressivos_sem_audio "
+                            f"url_ref={referencia_url_log(url)}"
+                        )
+                        arquivo_html = baixar_instagram_publico_com_audio(url, prefix)
+                        if arquivo_html and os.path.exists(arquivo_html):
+                            baixou = True
+                            break
+
                     cleanup_prefix(prefix)
 
                     opts = common_opts.copy()
@@ -8503,21 +9950,43 @@ def _processar_download(message, url, status_msg, reserva_download=None):
 
                     arquivo_baixado = encontrar_arquivo_baixado(prefix)
                     if arquivo_baixado and os.path.exists(arquivo_baixado):
-                        if is_instagram and audio_instagram_esperado is True:
+                        if is_instagram:
                             info_arquivo_baixado = obter_info_midia(arquivo_baixado)
-                            if not arquivo_possui_audio(info_arquivo_baixado):
+                            tem_audio_real = arquivo_possui_audio(info_arquivo_baixado)
+                            logger.info(
+                                "[INSTAGRAM_AUDIO_PROBE] "
+                                f"formato={fmt} tem_audio={tem_audio_real} "
+                                f"vcodec={info_arquivo_baixado.get('vcodec')} "
+                                f"acodec={info_arquivo_baixado.get('acodec')}"
+                            )
+                            if not tem_audio_real:
                                 ultimo_erro = (
                                     "INSTAGRAM_AUDIO_AUSENTE_NO_ARQUIVO "
                                     f"metadata={audio_instagram_esperado}"
                                 )
+                                # Os IDs diretos/HTTP são justamente os formatos
+                                # que o yt-dlp marca como codec desconhecido. Testa
+                                # todos eles antes de aceitar o fallback mudo.
+                                if fmt in formatos_progressivos_ig:
+                                    logger.warning(
+                                        "[INSTAGRAM_PROGRESSIVO_SEM_AUDIO] "
+                                        f"formato={fmt} tentando_proximo=True"
+                                    )
+                                    cleanup_prefix(prefix)
+                                    continue
+                                if audio_instagram_esperado is True:
+                                    logger.warning(
+                                        "[INSTAGRAM_AUDIO_RETRY] "
+                                        f"audio_esperado={audio_instagram_esperado} "
+                                        f"formato={fmt} "
+                                        f"arquivo_ref={referencia_arquivo_log(arquivo_baixado)}"
+                                    )
+                                    cleanup_prefix(prefix)
+                                    continue
                                 logger.warning(
-                                    "[INSTAGRAM_AUDIO_RETRY] "
-                                    f"audio_esperado={audio_instagram_esperado} "
-                                    f"formato={fmt} "
-                                    f"arquivo_ref={referencia_arquivo_log(arquivo_baixado)}"
+                                    "[INSTAGRAM_FALLBACK_SEM_AUDIO] "
+                                    f"formato={fmt} metadata={audio_instagram_esperado}"
                                 )
-                                cleanup_prefix(prefix)
-                                continue
                         if is_facebook_reel:
                             info_arquivo_baixado = obter_info_midia(arquivo_baixado)
                             if not arquivo_possui_audio(info_arquivo_baixado):
@@ -8600,15 +10069,24 @@ def _processar_download(message, url, status_msg, reserva_download=None):
         if not enviado:
             raise Exception("Falha ao enviar arquivo ao Telegram")
 
-        salvar_file_id_cache(
-            cache_key,
-            cache_source_id,
-            plataforma,
-            telegram_file_id,
-            telegram_media_type,
-            url_cache_key=url_cache_key,
-            url_normalizada=url_normalizada,
-        )
+        # Nunca guarda no cache um Reel do Instagram que chegou sem áudio.
+        # Além de evitar repetir um arquivo defeituoso, isso permite que uma
+        # tentativa futura use novamente as rotas web/iOS do extrator.
+        if is_instagram and instagram_sem_audio:
+            logger.warning(
+                "[INSTAGRAM_CACHE_IGNORADO_SEM_AUDIO] "
+                f"url_ref={referencia_url_log(url)}"
+            )
+        else:
+            salvar_file_id_cache(
+                cache_key,
+                cache_source_id,
+                plataforma,
+                telegram_file_id,
+                telegram_media_type,
+                url_cache_key=url_cache_key,
+                url_normalizada=url_normalizada,
+            )
 
         registrar_download_diario(
             vip_status,
@@ -8672,6 +10150,10 @@ def _processar_download(message, url, status_msg, reserva_download=None):
             plataforma_erro = "tiktok"
         elif "facebook.com" in url_erro or "fb.watch" in url_erro:
             plataforma_erro = "facebook"
+        elif "shopee.com.br" in url_erro or "shp.ee" in url_erro:
+            plataforma_erro = "shopee"
+        elif "mercadolivre.com.br" in url_erro and ("/clips" in url_erro or "/live/videos" in url_erro):
+            plataforma_erro = "mercado_livre_clips"
         else:
             plataforma_erro = "geral"
         texto_erro = mapear_falha_componente_download(
@@ -8697,6 +10179,10 @@ def _processar_download(message, url, status_msg, reserva_download=None):
             plataforma_erro = "tiktok"
         elif "facebook.com" in url_erro or "fb.watch" in url_erro:
             plataforma_erro = "facebook"
+        elif "shopee.com.br" in url_erro or "shp.ee" in url_erro:
+            plataforma_erro = "shopee"
+        elif "mercadolivre.com.br" in url_erro and ("/clips" in url_erro or "/live/videos" in url_erro):
+            plataforma_erro = "mercado_livre_clips"
         else:
             plataforma_erro = "geral"
         texto_erro = mapear_erro_download(str(e), plataforma=plataforma_erro)
@@ -9172,7 +10658,7 @@ def handle_download(message):
         safe_reply_to(
             message,
             "❌ Link não reconhecido. Envie um link do TikTok, Pinterest, "
-            "Instagram, Facebook Reels ou RedNote.",
+            "Instagram, Facebook Reels, Shopee Video, Mercado Livre Clips ou RedNote.",
         )
         return
 
@@ -9476,6 +10962,8 @@ def encerrar_healthcheck():
 # MAIN
 # =========================================
 if __name__ == "__main__":
+    logger.info("[BOT_BUILD] bot_downloads_v4_ml_clips_v2")
+    logger.info("[ML_CLIPS_CONFIG] enabled=True login=False cookies=False token=False source=public_mobile_html_hls")
     logger.info(f"[YT_DLP] versao={YT_DLP_VERSION}")
     logger.info(
         f"[MIDIA_CONFIG] profile={MEDIA_PROFILE_VERSION} "
