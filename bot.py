@@ -537,12 +537,17 @@ PINTEREST_HEADERS = {
 }
 
 PLANOS = {
+    # Plano disponível para novas compras.
     "10.00": {
         "nome": "VIP Mensal",
         "preco_centavos": 1000,
         "dias": 30,
         "descricao": "VIP Mensal 30 dias"
     },
+
+    # Compatibilidade histórica: NÃO é oferecido para novas compras.
+    # Mantido para que pedidos anuais antigos continuem podendo ser
+    # consultados, aprovados ou recuperados sem quebrar o histórico.
     "79.90": {
         "nome": "VIP Anual",
         "preco_centavos": 7990,
@@ -550,6 +555,8 @@ PLANOS = {
         "descricao": "VIP Anual 365 dias"
     }
 }
+
+PLANOS_VENDA_ATIVOS = frozenset({"10.00"})
 
 # =========================================
 # FUNÇÕES AUXILIARES
@@ -5637,7 +5644,14 @@ def gerar_order_nsu(user_id):
 
 
 def obter_plano_por_callback(valor_str):
-    return PLANOS.get(valor_str)
+    valor = str(valor_str or "").strip()
+    if valor not in PLANOS_VENDA_ATIVOS:
+        logger.info(
+            "[PLANO_NAO_DISPONIVEL_NOVA_COMPRA] "
+            f"plano_key={valor[:20] or 'vazio'}"
+        )
+        return None
+    return PLANOS.get(valor)
 
 
 def calcular_nova_data_vip(user, dias):
@@ -6222,6 +6236,178 @@ def recuperar_aprovacoes_pix_interrompidas():
 
 
 # =========================================
+# AQUISIÇÃO / ORIGEM
+# =========================================
+def _normalizar_codigo_tracking(valor, limite=24):
+    valor = str(valor or "").strip().lower()
+    valor = re.sub(r"[^a-z0-9-]+", "-", valor)
+    valor = re.sub(r"-+", "-", valor).strip("-")
+    return valor[:limite]
+
+
+def _extrair_payload_start(message):
+    texto = str(getattr(message, "text", "") or "").strip()
+    if not texto.lower().startswith("/start"):
+        return ""
+
+    partes = texto.split(maxsplit=1)
+    if len(partes) < 2:
+        return ""
+
+    payload = partes[1].strip()
+    # O Telegram limita start parameters; mantemos apenas caracteres seguros.
+    payload = re.sub(r"[^A-Za-z0-9_-]+", "", payload)
+    return payload[:64]
+
+
+def _parsear_payload_aquisicao(payload):
+    bruto = str(payload or "").strip()
+    if not bruto:
+        return {
+            "origem": "organico",
+            "campanha": None,
+            "anuncio": None,
+            "start_payload": None,
+        }
+
+    partes = [p for p in bruto.lower().split("_") if p]
+    prefixo = partes[0] if partes else ""
+
+    mapa_origem = {
+        "fbads": "facebook_ads",
+        "facebook": "facebook_ads",
+        "meta": "facebook_ads",
+        "igads": "instagram_ads",
+        "instagram": "instagram",
+        "yt": "youtube",
+        "youtube": "youtube",
+        "tiktok": "tiktok",
+        "kwai": "kwai",
+        "ref": "indicacao",
+        "indicacao": "indicacao",
+        "organico": "organico",
+    }
+    origem = mapa_origem.get(prefixo, "outro_deeplink")
+
+    campanha = _normalizar_codigo_tracking(
+        partes[1] if len(partes) >= 2 else None,
+        24,
+    ) or None
+    anuncio = _normalizar_codigo_tracking(
+        "-".join(partes[2:]) if len(partes) >= 3 else None,
+        32,
+    ) or None
+
+    return {
+        "origem": origem,
+        "campanha": campanha,
+        "anuncio": anuncio,
+        "start_payload": bruto[:64],
+    }
+
+
+def registrar_inicio_e_origem(user_id, payload=""):
+    """Registra origem somente na primeira aquisição conhecida.
+
+    Usuários antigos sem origem só recebem atribuição se chegarem por um
+    deep-link rastreável. A origem já registrada nunca é sobrescrita.
+    """
+    uid = str(user_id)
+    agora = agora_tz()
+    hoje = hoje_str()
+    atribuicao = _parsear_payload_aquisicao(payload)
+
+    documento_novo = {
+        "_id": uid,
+        "vip_ate": None,
+        "downloads_hoje": 0,
+        "ultima_data": hoje,
+        "primeiro_acesso": agora,
+        "ultimo_acesso": agora,
+        "origem": atribuicao["origem"],
+        "origem_registrada_em": agora,
+    }
+    if atribuicao.get("campanha"):
+        documento_novo["campanha"] = atribuicao["campanha"]
+    if atribuicao.get("anuncio"):
+        documento_novo["anuncio"] = atribuicao["anuncio"]
+    if atribuicao.get("start_payload"):
+        documento_novo["start_payload"] = atribuicao["start_payload"]
+
+    # Cria novos usuários já com origem correta (inclusive orgânico).
+    usuarios_col.update_one(
+        {"_id": uid},
+        {
+            "$setOnInsert": documento_novo,
+            "$set": {"ultimo_acesso": agora},
+        },
+        upsert=True,
+    )
+
+    # Para usuários legados, um deep-link rastreável pode preencher a origem
+    # ausente; uma visita orgânica posterior não apaga nem inventa atribuição.
+    if payload:
+        filtro_sem_origem = {
+            "_id": uid,
+            "$or": [
+                {"origem": {"$exists": False}},
+                {"origem": None},
+                {"origem": ""},
+            ],
+        }
+        campos = {
+            "origem": atribuicao["origem"],
+            "origem_registrada_em": agora,
+            "start_payload": atribuicao["start_payload"],
+        }
+        if atribuicao.get("campanha"):
+            campos["campanha"] = atribuicao["campanha"]
+        if atribuicao.get("anuncio"):
+            campos["anuncio"] = atribuicao["anuncio"]
+
+        resultado = usuarios_col.update_one(
+            filtro_sem_origem,
+            {"$set": campos},
+        )
+        if resultado.modified_count:
+            logger.info(
+                "[AQUISICAO_REGISTRADA] "
+                f"user_ref={referencia_usuario_log(uid)} "
+                f"origem={atribuicao['origem']} "
+                f"campanha={atribuicao.get('campanha') or 'na'} "
+                f"anuncio={atribuicao.get('anuncio') or 'na'}"
+            )
+
+    return atribuicao
+
+
+def atualizar_ultimo_acesso_usuario(user_id, forcar=False):
+    """Atualiza último acesso sem gerar uma escrita a cada download.
+
+    Por padrão, grava no máximo uma vez por dia, aproveitando o campo
+    ultima_data já usado pelo controle diário do bot.
+    """
+    uid = str(user_id)
+    agora = agora_tz()
+    hoje = hoje_str()
+    filtro = {"_id": uid}
+    if not forcar:
+        filtro["ultima_data"] = {"$ne": hoje}
+
+    try:
+        usuarios_col.update_one(
+            filtro,
+            {"$set": {"ultimo_acesso": agora}},
+        )
+    except Exception as e:
+        logger.warning(
+            "[ULTIMO_ACESSO] "
+            f"user_ref={referencia_usuario_log(uid)} "
+            f"erro={sanitizar_erro_log(e)}"
+        )
+
+
+# =========================================
 # USUÁRIO / VIP
 # =========================================
 def _obter_usuario_db(user_id):
@@ -6230,11 +6416,16 @@ def _obter_usuario_db(user_id):
     hoje = hoje_str()
 
     if not user:
+        agora = agora_tz()
         user = {
             "_id": uid,
             "vip_ate": None,
             "downloads_hoje": 0,
-            "ultima_data": hoje
+            "ultima_data": hoje,
+            "primeiro_acesso": agora,
+            "ultimo_acesso": agora,
+            "origem": "organico",
+            "origem_registrada_em": agora,
         }
         usuarios_col.insert_one(user)
         return user
@@ -6252,6 +6443,10 @@ def _obter_usuario_db(user_id):
         alteracoes["vip_ate"] = None
         user["vip_ate"] = None
 
+    if "ultimo_acesso" not in user:
+        alteracoes["ultimo_acesso"] = agora_tz()
+        user["ultimo_acesso"] = alteracoes["ultimo_acesso"]
+
     if alteracoes:
         usuarios_col.update_one({"_id": uid}, {"$set": alteracoes})
 
@@ -6259,7 +6454,11 @@ def _obter_usuario_db(user_id):
         usuarios_col.update_one(
             {"_id": uid},
             {
-                "$set": {"downloads_hoje": 0, "ultima_data": hoje},
+                "$set": {
+                    "downloads_hoje": 0,
+                    "ultima_data": hoje,
+                    "ultimo_acesso": agora_tz(),
+                },
                 "$unset": {"download_reserva": ""},
             },
         )
@@ -6348,11 +6547,7 @@ def notificar_vips_com_vencimento_proximo():
             types.InlineKeyboardButton(
                 "💠 Renovar VIP Mensal - R$ 10,00",
                 callback_data="pay_10.00",
-            ),
-            types.InlineKeyboardButton(
-                "💠 Renovar VIP Anual - R$ 79,90",
-                callback_data="pay_79.90",
-            ),
+            )
         )
         mensagem = (
             "⚠️ *Seu acesso VIP termina amanhã*\n\n"
@@ -6505,8 +6700,12 @@ def configurar_menu_comandos():
         types.BotCommand("zerar", "Zerar o limite de um usuário"),
         types.BotCommand("avisogeral", "Enviar comunicado aos usuários"),
         types.BotCommand("diagnostico", "Verificar a saúde do bot"),
+        types.BotCommand("syncvip", "Sincronizar pagamentos e VIPs"),
+        types.BotCommand("linkads", "Gerar link rastreável para anúncio"),
+        types.BotCommand("origens", "Ver origem e conversão dos usuários"),
         types.BotCommand("backupvips", "Gerar backup dos VIPs ativos"),
         types.BotCommand("backupgeral", "Gerar backup completo"),
+        types.BotCommand("verificarbackup", "Testar backup sem alterar produção"),
     ]
 
     try:
@@ -6537,16 +6736,19 @@ def configurar_menu_comandos():
 def mostrar_planos_chat(chat_id, user_id):
     markup = types.InlineKeyboardMarkup(row_width=1)
     markup.add(
-        types.InlineKeyboardButton("💠 VIP Mensal - R$ 10,00 via Pix", callback_data="pay_10.00"),
-        types.InlineKeyboardButton("💠 VIP Anual - R$ 79,90 via Pix", callback_data="pay_79.90")
+        types.InlineKeyboardButton(
+            "💠 VIP Mensal - R$ 10,00 via Pix",
+            callback_data="pay_10.00",
+        )
     )
 
     texto = (
         "🚀 *LIBERAR ACESSO VIP*\n\n"
-        "Escolha o plano ideal para baixar sem limite diário.\n\n"
+        "VIP Mensal por *R$ 10,00* com 30 dias de acesso.\n\n"
         "✅ Sem limite diário\n"
         "✅ Prioridade no processamento\n"
-        "✅ Uso liberado para TikTok, Pinterest, Instagram, Facebook Reels e RedNote\n"
+        "✅ TikTok, Pinterest, Instagram, Facebook Reels, Shopee Video, "
+        "Mercado Livre Clips e RedNote\n"
         "✅ Pagamento exclusivamente via Pix\n"
         "✅ Liberação após conferência do pagamento\n\n"
         f"Sua ID: `{user_id}`"
@@ -6578,6 +6780,7 @@ def serializar_para_json(valor):
 def construir_payload_backup(nome, documentos):
     docs_serializados = [serializar_para_json(doc) for doc in documentos]
     return {
+        "schema_version": 2,
         "generated_at": agora_tz().isoformat(),
         "service": SERVICE_NAME,
         "environment": ENVIRONMENT_NAME,
@@ -6617,18 +6820,10 @@ def consultar_docs_backup(tipo):
     hoje = hoje_str()
 
     if tipo == "usuarios":
+        # Backup de restauração: documento completo para não perder campos
+        # adicionados em versões novas (origem, sincronização VIP, etc.).
         docs = list(
-            usuarios_col.find(
-                {},
-                {
-                    "_id": 1,
-                    "vip_ate": 1,
-                    "downloads_hoje": 1,
-                    "ultima_data": 1,
-                    "vip_orders_aplicados": 1,
-                    "pix_order_aguardando_comprovante": 1,
-                }
-            ).sort("_id", 1)
+            usuarios_col.find({}).sort("_id", 1)
         )
         return docs, "backup_usuarios", "📦 Backup de usuários gerado"
 
@@ -6640,14 +6835,6 @@ def consultar_docs_backup(tipo):
                         {"vip_ate": "Vitalício"},
                         {"vip_ate": {"$gte": hoje}}
                     ]
-                },
-                {
-                    "_id": 1,
-                    "vip_ate": 1,
-                    "downloads_hoje": 1,
-                    "ultima_data": 1,
-                    "vip_orders_aplicados": 1,
-                    "pix_order_aguardando_comprovante": 1,
                 }
             ).sort("vip_ate", -1)
         )
@@ -6655,62 +6842,13 @@ def consultar_docs_backup(tipo):
 
     if tipo == "pedidos":
         docs = list(
-            pedidos_col.find(
-                {},
-                {
-                    "_id": 0,
-                    "order_nsu": 1,
-                    "user_id": 1,
-                    "plano_key": 1,
-                    "plano_nome": 1,
-                    "valor_centavos": 1,
-                    "status": 1,
-                    "created_at": 1,
-                    "paid_at": 1,
-                    "capture_method": 1,
-                    "vip_liberado_ate": 1,
-                    "vip_aplicado_nesta_chamada": 1,
-                    "paid_amount": 1,
-                    "payment_verification_status": 1,
-                    "expires_at": 1,
-                    "expired_at": 1,
-                    "cancelled_at": 1,
-                    "delivery_failed_at": 1,
-                    "receipt_requested_at": 1,
-                    "receipt_submitted_at": 1,
-                    "receipt_telegram_file_id": 1,
-                    "receipt_telegram_type": 1,
-                    "receipt_source_chat_id": 1,
-                    "receipt_source_message_id": 1,
-                    "admin_review_message_id": 1,
-                    "receipt_rejected_at": 1,
-                    "receipt_rejected_by": 1,
-                    "approval_started_at": 1,
-                    "approval_completed_at": 1,
-                    "last_reopened_at": 1,
-                    "last_reopened_by": 1,
-                    "receipt_reopen_count": 1,
-                    "manual_verified_at": 1,
-                    "manual_verified_by": 1,
-                    "vip_aplicado_ao_pedido": 1,
-                }
-            ).sort("created_at", -1)
+            pedidos_col.find({}).sort("created_at", -1)
         )
         return docs, "backup_pedidos", "🧾 Backup de pedidos gerado"
 
     if tipo == "geral":
         usuarios_docs = list(
-            usuarios_col.find(
-                {},
-                {
-                    "_id": 1,
-                    "vip_ate": 1,
-                    "downloads_hoje": 1,
-                    "ultima_data": 1,
-                    "vip_orders_aplicados": 1,
-                    "pix_order_aguardando_comprovante": 1,
-                }
-            ).sort("_id", 1)
+            usuarios_col.find({}).sort("_id", 1)
         )
         vips_docs = list(
             usuarios_col.find(
@@ -6719,58 +6857,11 @@ def consultar_docs_backup(tipo):
                         {"vip_ate": "Vitalício"},
                         {"vip_ate": {"$gte": hoje}}
                     ]
-                },
-                {
-                    "_id": 1,
-                    "vip_ate": 1,
-                    "downloads_hoje": 1,
-                    "ultima_data": 1,
-                    "vip_orders_aplicados": 1,
-                    "pix_order_aguardando_comprovante": 1,
                 }
             ).sort("vip_ate", -1)
         )
         pedidos_docs = list(
-            pedidos_col.find(
-                {},
-                {
-                    "_id": 0,
-                    "order_nsu": 1,
-                    "user_id": 1,
-                    "plano_key": 1,
-                    "plano_nome": 1,
-                    "valor_centavos": 1,
-                    "status": 1,
-                    "created_at": 1,
-                    "paid_at": 1,
-                    "capture_method": 1,
-                    "vip_liberado_ate": 1,
-                    "vip_aplicado_nesta_chamada": 1,
-                    "paid_amount": 1,
-                    "payment_verification_status": 1,
-                    "expires_at": 1,
-                    "expired_at": 1,
-                    "cancelled_at": 1,
-                    "delivery_failed_at": 1,
-                    "receipt_requested_at": 1,
-                    "receipt_submitted_at": 1,
-                    "receipt_telegram_file_id": 1,
-                    "receipt_telegram_type": 1,
-                    "receipt_source_chat_id": 1,
-                    "receipt_source_message_id": 1,
-                    "admin_review_message_id": 1,
-                    "receipt_rejected_at": 1,
-                    "receipt_rejected_by": 1,
-                    "approval_started_at": 1,
-                    "approval_completed_at": 1,
-                    "last_reopened_at": 1,
-                    "last_reopened_by": 1,
-                    "receipt_reopen_count": 1,
-                    "manual_verified_at": 1,
-                    "manual_verified_by": 1,
-                    "vip_aplicado_ao_pedido": 1,
-                }
-            ).sort("created_at", -1)
+            pedidos_col.find({}).sort("created_at", -1)
         )
         metricas_docs = list(
             metricas_col.find({}).sort("_id", -1)
@@ -6781,7 +6872,9 @@ def consultar_docs_backup(tipo):
         auditoria_sistema_docs = list(
             auditoria_sistema_col.find({}).sort("created_at", -1)
         )
+
         payload = {
+            "schema_version": 2,
             "generated_at": agora_tz().isoformat(),
             "service": SERVICE_NAME,
             "environment": ENVIRONMENT_NAME,
@@ -6828,6 +6921,7 @@ def processar_backup_admin(tipo, origem_chat_id=None):
                 + int(payload.get("pedidos_count", 0))
                 + int(payload.get("metricas_diarias_count", 0))
                 + int(payload.get("auditoria_admin_count", 0))
+                + int(payload.get("auditoria_sistema_count", 0))
             )
         else:
             documentos = resultado
@@ -6860,6 +6954,367 @@ def processar_backup_admin(tipo, origem_chat_id=None):
                     f"erro={sanitizar_erro_log(e)}"
                 )
         BACKUP_ADMIN_LOCK.release()
+
+
+
+def _vip_backup_ativo(vip_ate, hoje=None):
+    hoje = hoje or agora_tz().date()
+    if vip_ate == "Vitalício":
+        return True
+    try:
+        return datetime.strptime(str(vip_ate or ""), "%Y-%m-%d").date() >= hoje
+    except Exception:
+        return False
+
+
+def _vip_backup_cobre(vip_usuario, vip_esperado):
+    """Retorna True se o VIP do usuário cobre a validade esperada."""
+    if vip_usuario == "Vitalício":
+        return True
+    if vip_esperado == "Vitalício":
+        return vip_usuario == "Vitalício"
+    try:
+        atual = datetime.strptime(str(vip_usuario or ""), "%Y-%m-%d").date()
+        esperado = datetime.strptime(str(vip_esperado or ""), "%Y-%m-%d").date()
+        return atual >= esperado
+    except Exception:
+        return False
+
+
+def validar_payload_backup_geral(payload):
+    """Valida um backup geral sem escrever nada no MongoDB.
+
+    A 'restauração' é simulada em estruturas temporárias na memória.
+    """
+    erros = []
+    avisos = []
+
+    if not isinstance(payload, dict):
+        return {
+            "ok": False,
+            "erros": ["payload_nao_e_objeto"],
+            "avisos": [],
+            "contagens": {},
+            "dry_run": False,
+        }
+
+    if payload.get("backup_type") != "geral":
+        erros.append("backup_type_invalido")
+
+    secoes = {
+        "usuarios": "usuarios_count",
+        "vips_ativos": "vips_ativos_count",
+        "pedidos": "pedidos_count",
+        "metricas_diarias": "metricas_diarias_count",
+        "auditoria_admin": "auditoria_admin_count",
+        "auditoria_sistema": "auditoria_sistema_count",
+    }
+
+    contagens = {}
+    for nome, campo_count in secoes.items():
+        docs = payload.get(nome)
+        if not isinstance(docs, list):
+            erros.append(f"{nome}_nao_e_lista")
+            docs = []
+        esperado = payload.get(campo_count)
+        try:
+            esperado = int(esperado)
+        except Exception:
+            erros.append(f"{campo_count}_invalido")
+            esperado = -1
+
+        real = len(docs)
+        contagens[nome] = real
+        if esperado != real:
+            erros.append(f"{campo_count}_diverge_{esperado}_{real}")
+
+    usuarios = payload.get("usuarios") if isinstance(payload.get("usuarios"), list) else []
+    vips = payload.get("vips_ativos") if isinstance(payload.get("vips_ativos"), list) else []
+    pedidos = payload.get("pedidos") if isinstance(payload.get("pedidos"), list) else []
+    metricas = (
+        payload.get("metricas_diarias")
+        if isinstance(payload.get("metricas_diarias"), list)
+        else []
+    )
+    aud_admin = (
+        payload.get("auditoria_admin")
+        if isinstance(payload.get("auditoria_admin"), list)
+        else []
+    )
+    aud_sistema = (
+        payload.get("auditoria_sistema")
+        if isinstance(payload.get("auditoria_sistema"), list)
+        else []
+    )
+
+    # -----------------------------
+    # Simulação de restauração
+    # -----------------------------
+    usuarios_temp = {}
+    for i, doc in enumerate(usuarios):
+        if not isinstance(doc, dict):
+            erros.append(f"usuario_{i}_nao_e_objeto")
+            continue
+        uid = str(doc.get("_id") or "").strip()
+        if not uid:
+            erros.append(f"usuario_{i}_sem_id")
+            continue
+        if uid in usuarios_temp:
+            erros.append(f"usuario_id_duplicado_{uid[:12]}")
+            continue
+        usuarios_temp[uid] = dict(doc)
+
+    pedidos_temp = {}
+    pedidos_sem_usuario = 0
+    pedidos_pagos_ativos_divergentes = 0
+    hoje = agora_tz().date()
+
+    for i, doc in enumerate(pedidos):
+        if not isinstance(doc, dict):
+            erros.append(f"pedido_{i}_nao_e_objeto")
+            continue
+
+        nsu = str(doc.get("order_nsu") or "").strip()
+        if not nsu:
+            erros.append(f"pedido_{i}_sem_order_nsu")
+            continue
+        if nsu in pedidos_temp:
+            erros.append(f"order_nsu_duplicado_{nsu[:16]}")
+            continue
+        pedidos_temp[nsu] = dict(doc)
+
+        uid = str(doc.get("user_id") or "").strip()
+        if uid and uid not in usuarios_temp:
+            pedidos_sem_usuario += 1
+
+        vip_esperado = doc.get("vip_liberado_ate")
+        if (
+            doc.get("status") == "paid"
+            and vip_esperado
+            and _vip_backup_ativo(vip_esperado, hoje)
+        ):
+            usuario = usuarios_temp.get(uid) or {}
+            # Remoção manual é intencional: não é divergência de backup.
+            if not usuario.get("vip_sync_bloqueado") and not _vip_backup_cobre(
+                usuario.get("vip_ate"),
+                vip_esperado,
+            ):
+                pedidos_pagos_ativos_divergentes += 1
+
+    vips_ids = set()
+    vips_fora_usuarios = 0
+    vips_invalidos = 0
+    for i, doc in enumerate(vips):
+        if not isinstance(doc, dict):
+            erros.append(f"vip_{i}_nao_e_objeto")
+            continue
+        uid = str(doc.get("_id") or "").strip()
+        if not uid:
+            erros.append(f"vip_{i}_sem_id")
+            continue
+        if uid in vips_ids:
+            erros.append(f"vip_id_duplicado_{uid[:12]}")
+            continue
+        vips_ids.add(uid)
+        if uid not in usuarios_temp:
+            vips_fora_usuarios += 1
+        if not _vip_backup_ativo(doc.get("vip_ate"), hoje):
+            vips_invalidos += 1
+
+    def _simular_colecao(docs, chave_preferida=None):
+        temp = {}
+        for pos, doc in enumerate(docs):
+            if not isinstance(doc, dict):
+                continue
+            chave = doc.get(chave_preferida) if chave_preferida else doc.get("_id")
+            if chave is None:
+                # Auditorias podem ter _id serializado; se faltar, mantemos
+                # uma chave posicional apenas para testar se o documento
+                # seria copiável sem mutar produção.
+                chave = f"pos:{pos}"
+            chave = str(chave)
+            if chave in temp:
+                # Colisões em coleções que deveriam ter chave única.
+                if chave_preferida or doc.get("_id") is not None:
+                    erros.append(f"chave_duplicada_{chave[:16]}")
+                chave = f"{chave}:pos:{pos}"
+            temp[chave] = dict(doc)
+        return temp
+
+    metricas_temp = _simular_colecao(metricas)
+    aud_admin_temp = _simular_colecao(aud_admin)
+    aud_sistema_temp = _simular_colecao(aud_sistema)
+
+    if len(usuarios_temp) != len(usuarios):
+        erros.append("dry_run_usuarios_incompleto")
+    if len(pedidos_temp) != len(pedidos):
+        erros.append("dry_run_pedidos_incompleto")
+    if len(metricas_temp) != len(metricas):
+        erros.append("dry_run_metricas_incompleto")
+    if len(aud_admin_temp) != len(aud_admin):
+        erros.append("dry_run_auditoria_admin_incompleto")
+    if len(aud_sistema_temp) != len(aud_sistema):
+        erros.append("dry_run_auditoria_sistema_incompleto")
+
+    if pedidos_sem_usuario:
+        avisos.append(f"{pedidos_sem_usuario} pedido(s) apontam para usuário ausente")
+    if pedidos_pagos_ativos_divergentes:
+        avisos.append(
+            f"{pedidos_pagos_ativos_divergentes} pagamento(s) ativo(s) "
+            "não batem com vip_ate do usuário"
+        )
+    if vips_fora_usuarios:
+        erros.append(f"{vips_fora_usuarios}_vips_fora_da_colecao_usuarios")
+    if vips_invalidos:
+        erros.append(f"{vips_invalidos}_vips_nao_ativos_na_secao_vips")
+
+    # Confere que a lista de VIPs é exatamente a visão dos usuários ativos.
+    vips_esperados = {
+        uid
+        for uid, usuario in usuarios_temp.items()
+        if _vip_backup_ativo(usuario.get("vip_ate"), hoje)
+    }
+    if vips_ids != vips_esperados:
+        faltando = len(vips_esperados - vips_ids)
+        sobrando = len(vips_ids - vips_esperados)
+        erros.append(f"secao_vips_diverge_faltando_{faltando}_sobrando_{sobrando}")
+
+    return {
+        "ok": not erros,
+        "erros": erros,
+        "avisos": avisos,
+        "contagens": contagens,
+        "dry_run": not erros,
+        "pedidos_sem_usuario": pedidos_sem_usuario,
+        "pagamentos_vip_divergentes": pedidos_pagos_ativos_divergentes,
+    }
+
+
+def executar_verificacao_backup_admin(chat_id):
+    """Gera, grava, relê e simula restauração sem tocar nas coleções."""
+    if not BACKUP_ADMIN_LOCK.acquire(blocking=False):
+        safe_send_message(
+            chat_id,
+            "⚠️ Já existe uma operação de backup em andamento. Tente novamente em instantes.",
+        )
+        return
+
+    caminho = None
+    try:
+        payload, _, _ = consultar_docs_backup("geral")
+
+        # 1) Serializa em arquivo real.
+        caminho = salvar_backup_json("verificacao_backup_geral", payload)
+
+        # 2) Relê o JSON do disco. Se estiver truncado/corrompido, json.load falha.
+        garantir_arquivo_privado(caminho)
+        with open(caminho, "r", encoding="utf-8") as f:
+            relido = json.load(f)
+
+        # 3) Validação + restauração simulada apenas em memória.
+        resultado = validar_payload_backup_geral(relido)
+
+        # 4) Compara contagens com o banco atual. É somente leitura.
+        hoje = hoje_str()
+        banco = {
+            "usuarios": usuarios_col.count_documents({}),
+            "vips_ativos": usuarios_col.count_documents(
+                {
+                    "$or": [
+                        {"vip_ate": "Vitalício"},
+                        {"vip_ate": {"$gte": hoje}},
+                    ]
+                }
+            ),
+            "pedidos": pedidos_col.count_documents({}),
+            "metricas_diarias": metricas_col.count_documents({}),
+            "auditoria_admin": auditoria_admin_col.count_documents({}),
+            "auditoria_sistema": auditoria_sistema_col.count_documents({}),
+        }
+
+        divergencias_banco = []
+        for secao, quantidade in banco.items():
+            if int(resultado["contagens"].get(secao, -1)) != int(quantidade):
+                divergencias_banco.append(secao)
+
+        if divergencias_banco:
+            resultado["avisos"].append(
+                "contagem mudou durante a verificação: "
+                + ", ".join(divergencias_banco)
+            )
+
+        status = "✅" if resultado["ok"] else "❌"
+        linhas = [
+            f"{status} *Verificação do backup*",
+            "",
+            f"📄 JSON: `{'válido' if resultado['ok'] else 'com problema'}`",
+            f"🧪 Restauração simulada: `{'OK' if resultado['dry_run'] else 'FALHOU'}`",
+            "🔒 Produção alterada: `NÃO`",
+            "",
+            f"👥 Usuários: `{resultado['contagens'].get('usuarios', 0)}`",
+            f"💎 VIPs ativos: `{resultado['contagens'].get('vips_ativos', 0)}`",
+            f"🧾 Pedidos: `{resultado['contagens'].get('pedidos', 0)}`",
+            f"📊 Métricas: `{resultado['contagens'].get('metricas_diarias', 0)}`",
+            f"🛡 Auditoria ADM: `{resultado['contagens'].get('auditoria_admin', 0)}`",
+            f"⚙️ Auditoria sistema: `{resultado['contagens'].get('auditoria_sistema', 0)}`",
+        ]
+
+        if resultado["avisos"]:
+            linhas.extend(["", "⚠️ *Avisos:*"])
+            for aviso in resultado["avisos"][:8]:
+                linhas.append(f"• {aviso}")
+
+        if resultado["erros"]:
+            linhas.extend(["", "❌ *Erros:*"])
+            for erro in resultado["erros"][:8]:
+                linhas.append(f"• `{erro}`")
+
+        if resultado["ok"] and not resultado["avisos"]:
+            linhas.extend(
+                [
+                    "",
+                    "✅ Estrutura, contagens e relacionamentos principais estão coerentes.",
+                ]
+            )
+
+        safe_send_message(
+            chat_id,
+            "\n".join(linhas),
+            parse_mode="Markdown",
+        )
+
+        logger.info(
+            "[BACKUP_VERIFY] "
+            f"ok={resultado['ok']} dry_run={resultado['dry_run']} "
+            f"usuarios={resultado['contagens'].get('usuarios', 0)} "
+            f"vips={resultado['contagens'].get('vips_ativos', 0)} "
+            f"pedidos={resultado['contagens'].get('pedidos', 0)} "
+            f"avisos={len(resultado['avisos'])} erros={len(resultado['erros'])} "
+            "db_writes=0"
+        )
+
+    except Exception as e:
+        logger.error(
+            "[BACKUP_VERIFY_ERRO] "
+            f"erro={sanitizar_erro_log(e)} db_writes=0"
+        )
+        safe_send_message(
+            chat_id,
+            "❌ Não foi possível validar o backup.\n"
+            "A produção não foi alterada.",
+        )
+    finally:
+        if caminho and os.path.exists(caminho):
+            try:
+                os.remove(caminho)
+            except Exception as e:
+                logger.warning(
+                    "[BACKUP_VERIFY_CLEANUP] "
+                    f"arquivo_ref={referencia_arquivo_log(caminho)} "
+                    f"erro={sanitizar_erro_log(e)}"
+                )
+        BACKUP_ADMIN_LOCK.release()
+
 
 
 def montar_relatorio_diagnostico():
@@ -7207,6 +7662,165 @@ def diagnostico_admin(message):
         args=(message.chat.id, getattr(status, "message_id", None)),
         daemon=True,
     ).start()
+
+
+@bot.message_handler(commands=["linkads"])
+def gerar_link_facebook_ads(message):
+    if not exigir_admin_privado(message):
+        return
+
+    partes = str(message.text or "").split()
+    if len(partes) < 2:
+        safe_reply_to(
+            message,
+            "📣 *Gerar link rastreável*\n\n"
+            "Use: `/linkads campanha anuncio`\n"
+            "Exemplo: `/linkads escala01 shopee01`",
+            parse_mode="Markdown",
+        )
+        return
+
+    campanha = _normalizar_codigo_tracking(partes[1], 20)
+    anuncio = _normalizar_codigo_tracking(
+        partes[2] if len(partes) >= 3 else "geral",
+        24,
+    )
+    if not campanha or not anuncio:
+        safe_reply_to(message, "❌ Use nomes simples para campanha e anúncio.")
+        return
+
+    payload = f"fbads_{campanha}_{anuncio}"
+    if len(payload) > 64:
+        safe_reply_to(message, "❌ Campanha/anúncio ficaram longos demais.")
+        return
+
+    try:
+        username = str(bot.get_me().username or "").strip()
+        if not username:
+            raise RuntimeError("username do bot indisponível")
+        link = f"https://t.me/{username}?start={payload}"
+        safe_send_message(
+            message.chat.id,
+            "📣 <b>Link rastreável criado</b>\n\n"
+            f"Campanha: <code>{html.escape(campanha)}</code>\n"
+            f"Anúncio: <code>{html.escape(anuncio)}</code>\n\n"
+            f"<code>{html.escape(link)}</code>\n\n"
+            "Use este link somente nesse anúncio para medir a conversão.",
+            parse_mode="HTML",
+        )
+        logger.info(
+            "[LINK_ADS_CRIADO] "
+            f"campanha={campanha} anuncio={anuncio} payload_len={len(payload)}"
+        )
+    except Exception as e:
+        logger.error(
+            "[LINK_ADS_ERRO] "
+            f"erro={sanitizar_erro_log(e)}"
+        )
+        safe_reply_to(message, "❌ Não foi possível gerar o link agora.")
+
+
+@bot.message_handler(commands=["origens"])
+def relatorio_origens_aquisicao(message):
+    if not exigir_admin_privado(message):
+        return
+
+    status = safe_reply_to(message, "📊 Calculando origens e conversões...")
+
+    try:
+        pagantes = {
+            str(uid)
+            for uid in pedidos_col.distinct(
+                "user_id",
+                {"status": "paid"},
+            )
+            if uid is not None
+        }
+
+        grupos = {}
+        total = 0
+        total_pagantes = 0
+        total_vips_ativos = 0
+        rastreados = 0
+
+        cursor = usuarios_col.find(
+            {},
+            {
+                "_id": 1,
+                "origem": 1,
+                "campanha": 1,
+                "anuncio": 1,
+                "vip_ate": 1,
+            },
+        )
+        for usuario in cursor:
+            total += 1
+            uid = str(usuario.get("_id"))
+            origem = str(usuario.get("origem") or "legado_sem_origem")
+            if origem != "legado_sem_origem":
+                rastreados += 1
+
+            grupo = grupos.setdefault(
+                origem,
+                {"usuarios": 0, "pagantes": 0, "vips_ativos": 0},
+            )
+            grupo["usuarios"] += 1
+
+            if uid in pagantes:
+                grupo["pagantes"] += 1
+                total_pagantes += 1
+
+            if is_vip_user(usuario):
+                grupo["vips_ativos"] += 1
+                total_vips_ativos += 1
+
+        linhas = [
+            "📊 *Origem dos usuários*",
+            "",
+            f"👥 Usuários: `{total}`",
+            f"🏷️ Com origem rastreada: `{rastreados}`",
+            f"💳 Pagantes únicos: `{total_pagantes}`",
+            f"💎 VIPs ativos: `{total_vips_ativos}`",
+            "",
+            "*Por origem:*",
+        ]
+
+        for origem, dados in sorted(
+            grupos.items(),
+            key=lambda item: item[1]["usuarios"],
+            reverse=True,
+        )[:12]:
+            usuarios = dados["usuarios"]
+            pag = dados["pagantes"]
+            taxa = (pag * 100 / usuarios) if usuarios else 0.0
+            linhas.append(
+                f"• `{origem}` — {usuarios} usuários | "
+                f"{pag} pagantes ({taxa:.1f}%) | "
+                f"{dados['vips_ativos']} VIPs ativos"
+            )
+
+        texto = "\n".join(linhas)
+        if status and getattr(status, "message_id", None):
+            safe_edit_message(
+                message.chat.id,
+                status.message_id,
+                texto,
+                parse_mode="Markdown",
+            )
+        else:
+            safe_reply_to(message, texto, parse_mode="Markdown")
+
+        logger.info(
+            "[ORIGENS_RELATORIO] "
+            f"usuarios={total} rastreados={rastreados} "
+            f"pagantes={total_pagantes} vips_ativos={total_vips_ativos}"
+        )
+    except Exception as e:
+        logger.error(
+            "[ORIGENS_RELATORIO_ERRO] "
+            f"erro={sanitizar_erro_log(e)}"
+        )
+        safe_reply_to(message, "❌ Não foi possível gerar o relatório de origens.")
 
 
 @bot.message_handler(commands=["syncvip"])
@@ -7744,6 +8358,23 @@ def backup_geral(message):
     safe_reply_to(message, "🗂 Gerando backup geral e enviando no seu privado...")
 
 
+@bot.message_handler(commands=["verificarbackup"])
+def verificar_backup_admin(message):
+    if not exigir_admin_privado(message):
+        return
+
+    Thread(
+        target=executar_verificacao_backup_admin,
+        args=(message.chat.id,),
+        daemon=True,
+    ).start()
+
+    safe_reply_to(
+        message,
+        "🧪 Verificando JSON e simulando restauração sem alterar a produção...",
+    )
+
+
 @bot.message_handler(commands=["painel"])
 @bot.message_handler(func=lambda m: m.text == "⚙️ Painel Admin")
 def painel_admin(message):
@@ -7830,6 +8461,8 @@ def start(message):
         orientar_uso_no_privado(message)
         return
 
+    payload = _extrair_payload_start(message)
+    registrar_inicio_e_origem(message.from_user.id, payload)
     user = obter_usuario(message.from_user.id)
     vip = is_vip_user(user)
 
@@ -11431,12 +12064,17 @@ def handle_download(message):
         safe_reply_to(message, mensagem_limite_global)
         return
 
-    status_msg = safe_reply_to(
-        message,
-        "💎 Link recebido com prioridade VIP. Aguarde o processamento..."
-        if vip_status
-        else "⏳ Link recebido. Aguarde o processamento...",
-    )
+    is_admin_download = int(message.from_user.id) == ADMIN_ID
+    prioridade_fila = -1 if is_admin_download else (0 if vip_status else 1)
+
+    if is_admin_download:
+        texto_fila = "👑 Link recebido com prioridade do administrador. Aguarde o processamento..."
+    elif vip_status:
+        texto_fila = "💎 Link recebido com prioridade VIP. Aguarde o processamento..."
+    else:
+        texto_fila = "⏳ Link recebido. Aguarde o processamento..."
+
+    status_msg = safe_reply_to(message, texto_fila)
 
     recusado_desligamento = False
     fila_ficou_cheia = False
@@ -11447,7 +12085,7 @@ def handle_download(message):
             try:
                 DOWNLOAD_QUEUE.put_nowait(
                     (
-                        0 if vip_status else 1,
+                        prioridade_fila,
                         next(DOWNLOAD_SEQUENCE),
                         {
                             "message": message,
@@ -11457,6 +12095,12 @@ def handle_download(message):
                             "download_reservation": reserva_download,
                         },
                     )
+                )
+                logger.info(
+                    "[QUEUE_ENQUEUE] "
+                    f"user_ref={referencia_usuario_log(message.from_user.id)} "
+                    f"classe={'admin' if is_admin_download else ('vip' if vip_status else 'gratis')} "
+                    f"prioridade={prioridade_fila} tamanho={DOWNLOAD_QUEUE.qsize()}"
                 )
             except Full:
                 fila_ficou_cheia = True
@@ -11587,9 +12231,13 @@ def encerrar_healthcheck():
 # MAIN
 # =========================================
 if __name__ == "__main__":
-    logger.info("[BOT_BUILD] bot_downloads_v4_ml_clips_v9_backupvips_menu")
+    logger.info("[BOT_BUILD] bot_downloads_v4_ml_clips_v12_mensal_admin_priority")
     logger.info("[VIP_SYNC_CONFIG] startup=True pos_pagamento=True bloqueio_removervip=True comando_syncvip=True")
     logger.info("[BACKUP_MENU_CONFIG] backupvips=True backupgeral=True")
+    logger.info("[AQUISICAO_CONFIG] deep_link=True linkads=True origens=True origem_imutavel=True")
+    logger.info("[BACKUP_VERIFY_CONFIG] schema=2 json_roundtrip=True dry_run=True db_writes=0")
+    logger.info("[VIP_PLAN_CONFIG] novos=mensal anual=historico_nao_vendavel")
+    logger.info("[QUEUE_PRIORITY_CONFIG] admin=-1 vip=0 gratis=1 worker_compartilhado=True")
     logger.info("[ML_CLIPS_CONFIG] enabled=True login=False cookies=False token=False source=public_mobile_html_hls dns_guard=host_allowlist")
     logger.info(f"[YT_DLP] versao={YT_DLP_VERSION}")
     logger.info(
