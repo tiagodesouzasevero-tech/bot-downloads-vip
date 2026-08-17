@@ -8607,7 +8607,7 @@ def _get_manifesto_ml_clips(url, referer):
         for _ in range(5):
             if (
                 not _host_midia_mercado_livre_clips_permitido(atual)
-                or not validar_url_http_publica(atual)
+                or not validar_url_http_publica(atual, resolver_dns=False)
             ):
                 raise RuntimeError("ML_CLIPS_HLS_HOST_INVALIDO")
             headers = {
@@ -8690,7 +8690,10 @@ def baixar_hls_mercado_livre_clips(url_hls, destino, referer):
     """Remuxa HLS público do MLStatic para MP4 com áudio obrigatório."""
     atualizar_heartbeat_worker("ml_clips_validando_hls")
     url_hls = validar_manifestos_mercado_livre_clips(url_hls, referer)
-    logger.info("[ML_CLIPS_HLS_VALIDADO] host_mlstatic=True referencias_oficiais=True")
+    logger.info(
+        "[ML_CLIPS_HLS_VALIDADO] host_mlstatic=True referencias_oficiais=True "
+        "dns_guard=host_allowlist"
+    )
 
     headers_ffmpeg = (
         f"Referer: {referer}\\r\\n"
@@ -10962,8 +10965,8 @@ def encerrar_healthcheck():
 # MAIN
 # =========================================
 if __name__ == "__main__":
-    logger.info("[BOT_BUILD] bot_downloads_v4_ml_clips_v2")
-    logger.info("[ML_CLIPS_CONFIG] enabled=True login=False cookies=False token=False source=public_mobile_html_hls")
+    logger.info("[BOT_BUILD] bot_downloads_v4_ml_clips_v3")
+    logger.info("[ML_CLIPS_CONFIG] enabled=True login=False cookies=False token=False source=public_mobile_html_hls dns_guard=host_allowlist")
     logger.info(f"[YT_DLP] versao={YT_DLP_VERSION}")
     logger.info(
         f"[MIDIA_CONFIG] profile={MEDIA_PROFILE_VERSION} "
