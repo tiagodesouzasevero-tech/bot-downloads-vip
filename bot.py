@@ -5928,6 +5928,22 @@ def garantir_vip_de_pedido_pago(pedido, origem="pedido_pago"):
             "motivo": "pedido_nao_pago",
         }
 
+    # Segurança: status="paid" isolado não autoriza reativação.
+    # A reconciliação só pode restaurar um VIP se o pedido registrar
+    # explicitamente que a liberação final foi aplicada ao pedido.
+    if not pedido.get("vip_aplicado_ao_pedido"):
+        logger.warning(
+            "[VIP_SYNC_PEDIDO_NAO_APLICADO] "
+            f"pedido_ref={referencia_pedido_log(pedido.get('order_nsu'))} "
+            f"user_ref={referencia_usuario_log(pedido.get('user_id'))} "
+            f"origem={origem}"
+        )
+        return {
+            "ok": True,
+            "corrigido": False,
+            "motivo": "pedido_sem_confirmacao_aplicacao_vip",
+        }
+
     vip_ate = pedido.get("vip_liberado_ate")
     if not vip_ate:
         logger.warning(
@@ -5962,6 +5978,7 @@ def sincronizar_vips_pagos_ativos(notificar_admin=True):
         cursor = pedidos_col.find(
             {
                 "status": "paid",
+                "vip_aplicado_ao_pedido": True,
                 "vip_liberado_ate": {
                     "$exists": True,
                     "$nin": [None, ""],
@@ -5973,6 +5990,7 @@ def sincronizar_vips_pagos_ativos(notificar_admin=True):
                 "user_id": 1,
                 "status": 1,
                 "vip_liberado_ate": 1,
+                "vip_aplicado_ao_pedido": 1,
             },
         )
 
@@ -6021,12 +6039,14 @@ def sincronizar_vips_pagos_ativos(notificar_admin=True):
             "verificados": 0,
             "corrigidos": 0,
             "bloqueados": 0,
+            "ignorados": 0,
             "falhas": 1,
         }
 
     verificados = 0
     corrigidos = 0
     bloqueados = 0
+    ignorados = 0
     falhas = 0
 
     for pedido in por_usuario.values():
@@ -6036,8 +6056,11 @@ def sincronizar_vips_pagos_ativos(notificar_admin=True):
                 pedido,
                 origem="startup_reconciliation",
             )
-            if resultado.get("motivo") == "bloqueio_admin":
+            motivo = resultado.get("motivo")
+            if motivo == "bloqueio_admin":
                 bloqueados += 1
+            elif motivo == "pedido_sem_confirmacao_aplicacao_vip":
+                ignorados += 1
             elif resultado.get("corrigido"):
                 corrigidos += 1
             elif not resultado.get("ok"):
@@ -6060,16 +6083,17 @@ def sincronizar_vips_pagos_ativos(notificar_admin=True):
     logger.info(
         "[VIP_SYNC_STARTUP] "
         f"verificados={verificados} corrigidos={corrigidos} "
-        f"bloqueados={bloqueados} falhas={falhas}"
+        f"bloqueados={bloqueados} ignorados={ignorados} falhas={falhas}"
     )
 
     if notificar_admin and (corrigidos or falhas):
         safe_send_message(
             ADMIN_ID,
             "💎 *Sincronização VIP concluída*\n\n"
-            f"🔎 Pagantes ativos verificados: `{verificados}`\n"
+            f"🔎 Pedidos elegíveis verificados: `{verificados}`\n"
             f"✅ VIPs corrigidos: `{corrigidos}`\n"
             f"🛑 Bloqueados manualmente: `{bloqueados}`\n"
+            f"🧯 Ignorados por segurança: `{ignorados}`\n"
             f"❌ Falhas: `{falhas}`",
             parse_mode="Markdown",
         )
@@ -6078,6 +6102,7 @@ def sincronizar_vips_pagos_ativos(notificar_admin=True):
         "verificados": verificados,
         "corrigidos": corrigidos,
         "bloqueados": bloqueados,
+        "ignorados": ignorados,
         "falhas": falhas,
     }
 
@@ -6330,7 +6355,9 @@ def registrar_inicio_e_origem(user_id, payload=""):
         "downloads_hoje": 0,
         "ultima_data": hoje,
         "primeiro_acesso": agora,
-        "ultimo_acesso": agora,
+        # ultimo_acesso é gravado pelo $set abaixo.
+        # Não repetir o mesmo campo em $setOnInsert e $set,
+        # pois o MongoDB rejeita a atualização por conflito de caminho.
         "origem": atribuicao["origem"],
         "origem_registrada_em": agora,
     }
@@ -7847,9 +7874,10 @@ def sincronizar_vip_admin(message):
             )
             texto = (
                 "💎 *Sincronização VIP concluída*\n\n"
-                f"🔎 Verificados: `{resultado['verificados']}`\n"
+                f"🔎 Pedidos elegíveis: `{resultado['verificados']}`\n"
                 f"✅ Corrigidos: `{resultado['corrigidos']}`\n"
                 f"🛑 Bloqueados manualmente: `{resultado['bloqueados']}`\n"
+                f"🧯 Ignorados por segurança: `{resultado.get('ignorados', 0)}`\n"
                 f"❌ Falhas: `{resultado['falhas']}`"
             )
             if status and getattr(status, "message_id", None):
@@ -8469,7 +8497,18 @@ def start(message):
         return
 
     payload = _extrair_payload_start(message)
-    registrar_inicio_e_origem(message.from_user.id, payload)
+
+    # Rastreamento é auxiliar: uma falha de analytics nunca pode impedir
+    # o usuário (VIP ou gratuito) de receber a tela inicial.
+    try:
+        registrar_inicio_e_origem(message.from_user.id, payload)
+    except Exception as e:
+        logger.error(
+            "[START_TRACKING_ERRO] "
+            f"user_ref={referencia_usuario_log(message.from_user.id)} "
+            f"erro={sanitizar_erro_log(e)}"
+        )
+
     user = obter_usuario(message.from_user.id)
     vip = is_vip_user(user)
 
@@ -8500,12 +8539,26 @@ def start(message):
         "para ver as opções."
     )
 
-    safe_send_message(
+    enviado = safe_send_message(
         message.chat.id,
         texto,
         parse_mode="Markdown",
         reply_markup=types.ReplyKeyboardRemove()
     )
+
+    if enviado:
+        logger.info(
+            "[START_OK] "
+            f"user_ref={referencia_usuario_log(message.from_user.id)} "
+            f"plano={'vip' if vip else 'gratis'} "
+            f"payload={'sim' if payload else 'nao'}"
+        )
+    else:
+        logger.warning(
+            "[START_SEND_FALHA] "
+            f"user_ref={referencia_usuario_log(message.from_user.id)} "
+            f"plano={'vip' if vip else 'gratis'}"
+        )
 
 
 @bot.message_handler(commands=["vip", "planos"])
@@ -12238,9 +12291,11 @@ def encerrar_healthcheck():
 # MAIN
 # =========================================
 if __name__ == "__main__":
-    logger.info("[BOT_BUILD] bot_downloads_v4_ml_clips_v12_1_vip_sync_fix")
+    logger.info("[BOT_BUILD] bot_downloads_v4_ml_clips_v12_3_start_fix")
     logger.info("[VIP_SYNC_CONFIG] startup=True pos_pagamento=True bloqueio_removervip=True comando_syncvip=True")
     logger.info("[VIP_SYNC_FIX] projection_status=True formatacao_newline=True log_motivo=True")
+    logger.info("[VIP_SYNC_POLICY] paid_sozinho_nao_reativa=True exige_vip_aplicado_ao_pedido=True respeita_bloqueio_admin=True")
+    logger.info("[START_FIX] mongo_update_conflict=False tracking_nao_bloqueia_start=True vip_e_gratis=True")
     logger.info("[BACKUP_MENU_CONFIG] backupvips=True backupgeral=True")
     logger.info("[AQUISICAO_CONFIG] deep_link=True linkads=True origens=True origem_imutavel=True")
     logger.info("[BACKUP_VERIFY_CONFIG] schema=2 json_roundtrip=True dry_run=True db_writes=0")
