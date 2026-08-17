@@ -218,6 +218,7 @@ MEDIA_PROFILE_VERSION = (
 )
 INSTAGRAM_AUDIO_CACHE_VERSION = "instagram_audio_v5_nocookies"
 FACEBOOK_AUDIO_CACHE_VERSION = "facebook_audio_v2"
+ML_CLIPS_CACHE_VERSION = "ml_clips_hls_720_v1"
 
 TIKTOK_COOKIES_TEXT = os.environ.get("TIKTOK_COOKIES_TEXT", "")
 TIKTOK_DEVICE_ID_TEXT = os.environ.get("TIKTOK_DEVICE_ID", "")
@@ -2745,6 +2746,12 @@ def perfil_cache_plataforma(plataforma):
         perfil = f"{perfil}|{INSTAGRAM_AUDIO_CACHE_VERSION}"
     elif plataforma_normalizada in ("facebook", "facebook reels", "facebook_reels"):
         perfil = f"{perfil}|{FACEBOOK_AUDIO_CACHE_VERSION}"
+    elif plataforma_normalizada in (
+        "mercado livre clips",
+        "mercadolivre clips",
+        "ml clips",
+    ):
+        perfil = f"{perfil}|{ML_CLIPS_CACHE_VERSION}"
     return perfil
 
 
@@ -8686,6 +8693,144 @@ def _get_manifesto_ml_clips(url, referer, permitir_cdn_derivada=False):
             resposta.close()
 
 
+
+def selecionar_variante_hls_mercado_livre_clips(url_master, referer):
+    """
+    Escolhe explicitamente a melhor variante HLS para o perfil do bot.
+
+    Prioridade:
+    1) maior resolução que caiba em 720x1280 (ou 1280x720);
+    2) se não houver, a menor resolução acima do alvo;
+    3) sem RESOLUTION, usa maior BANDWIDTH.
+    """
+    texto, final_url = _get_manifesto_ml_clips(
+        url_master,
+        referer,
+        permitir_cdn_derivada=False,
+    )
+    linhas = [linha.strip() for linha in texto.splitlines()]
+    variantes = []
+
+    for i, linha in enumerate(linhas):
+        if not linha.upper().startswith("#EXT-X-STREAM-INF:"):
+            continue
+
+        attrs = linha.split(":", 1)[1] if ":" in linha else ""
+        largura = altura = 0
+        largura_match = re.search(
+            r"RESOLUTION\s*=\s*(\d+)\s*x\s*(\d+)",
+            attrs,
+            flags=re.IGNORECASE,
+        )
+        if largura_match:
+            largura = int(largura_match.group(1))
+            altura = int(largura_match.group(2))
+
+        bw_match = re.search(
+            r"(?:AVERAGE-BANDWIDTH|BANDWIDTH)\s*=\s*(\d+)",
+            attrs,
+            flags=re.IGNORECASE,
+        )
+        bandwidth = int(bw_match.group(1)) if bw_match else 0
+
+        uri = None
+        for proxima in linhas[i + 1:]:
+            if not proxima:
+                continue
+            if proxima.startswith("#"):
+                # Encontrou a próxima tag antes da URI desta variante.
+                if proxima.upper().startswith("#EXT-X-STREAM-INF:"):
+                    break
+                continue
+            uri = proxima
+            break
+
+        if not uri:
+            continue
+
+        absoluta = urljoin(final_url, uri)
+        if not _host_playlist_derivada_ml_clips_permitido(absoluta):
+            continue
+
+        variantes.append(
+            {
+                "url": absoluta,
+                "width": largura,
+                "height": altura,
+                "bandwidth": bandwidth,
+            }
+        )
+
+    if not variantes:
+        logger.info(
+            "[ML_CLIPS_VARIANTE] master_sem_variantes=True "
+            "usar_master=True"
+        )
+        return final_url, None
+
+    com_resolucao = [
+        v for v in variantes
+        if v["width"] > 0 and v["height"] > 0
+    ]
+
+    dentro_alvo = [
+        v for v in com_resolucao
+        if min(v["width"], v["height"]) <= 720
+        and max(v["width"], v["height"]) <= 1280
+    ]
+
+    if dentro_alvo:
+        escolhida = max(
+            dentro_alvo,
+            key=lambda v: (
+                v["width"] * v["height"],
+                v["bandwidth"],
+            ),
+        )
+        criterio = "maior_ate_720x1280"
+    elif com_resolucao:
+        acima_alvo = [
+            v for v in com_resolucao
+            if (
+                min(v["width"], v["height"]) > 720
+                or max(v["width"], v["height"]) > 1280
+            )
+        ]
+        if acima_alvo:
+            escolhida = min(
+                acima_alvo,
+                key=lambda v: (
+                    v["width"] * v["height"],
+                    -v["bandwidth"],
+                ),
+            )
+            criterio = "menor_acima_720x1280"
+        else:
+            escolhida = max(
+                com_resolucao,
+                key=lambda v: (
+                    v["width"] * v["height"],
+                    v["bandwidth"],
+                ),
+            )
+            criterio = "maior_resolucao"
+    else:
+        escolhida = max(
+            variantes,
+            key=lambda v: v["bandwidth"],
+        )
+        criterio = "maior_bandwidth"
+
+    logger.info(
+        "[ML_CLIPS_VARIANTE] "
+        f"total={len(variantes)} criterio={criterio} "
+        f"width={escolhida['width'] or 'desconhecida'} "
+        f"height={escolhida['height'] or 'desconhecida'} "
+        f"bandwidth={escolhida['bandwidth'] or 'desconhecido'}"
+    )
+    return escolhida["url"], escolhida
+
+
 def validar_manifestos_mercado_livre_clips(url, referer, profundidade=0, visitados=None):
     """Valida playlists HLS e bloqueia referências absolutas fora do MLStatic."""
     if profundidade > 2:
@@ -8736,12 +8881,30 @@ def validar_manifestos_mercado_livre_clips(url, referer, profundidade=0, visitad
 
 
 def baixar_hls_mercado_livre_clips(url_hls, destino, referer):
-    """Remuxa HLS público do MLStatic para MP4 com áudio obrigatório."""
+    """Remuxa a melhor variante HLS pública do MLStatic para MP4."""
+    atualizar_heartbeat_worker("ml_clips_selecionando_variante")
+    url_selecionada, variante = selecionar_variante_hls_mercado_livre_clips(
+        url_hls,
+        referer,
+    )
+
     atualizar_heartbeat_worker("ml_clips_validando_hls")
-    url_hls = validar_manifestos_mercado_livre_clips(url_hls, referer)
+    if variante is None:
+        url_ffmpeg = validar_manifestos_mercado_livre_clips(
+            url_selecionada,
+            referer,
+            profundidade=0,
+        )
+    else:
+        url_ffmpeg = validar_manifestos_mercado_livre_clips(
+            url_selecionada,
+            referer,
+            profundidade=1,
+        )
+
     logger.info(
         "[ML_CLIPS_HLS_VALIDADO] host_mlstatic=True referencias_oficiais=True "
-        "dns_guard=master_strict_child_mlstatic_v3"
+        "qualidade_selecionada=True cache_version=ml_clips_hls_720_v1"
     )
 
     headers_ffmpeg = (
@@ -8754,7 +8917,7 @@ def baixar_hls_mercado_livre_clips(url_hls, destino, referer):
         "-v", "error",
         "-user_agent", MERCADO_LIVRE_CLIPS_HEADERS["User-Agent"],
         "-headers", headers_ffmpeg,
-        "-i", url_hls,
+        "-i", url_ffmpeg,
         "-map", "0:v:0",
         "-map", "0:a:0",
         "-c", "copy",
@@ -11014,7 +11177,7 @@ def encerrar_healthcheck():
 # MAIN
 # =========================================
 if __name__ == "__main__":
-    logger.info("[BOT_BUILD] bot_downloads_v4_ml_clips_v5")
+    logger.info("[BOT_BUILD] bot_downloads_v4_ml_clips_v6_quality720")
     logger.info("[ML_CLIPS_CONFIG] enabled=True login=False cookies=False token=False source=public_mobile_html_hls dns_guard=host_allowlist")
     logger.info(f"[YT_DLP] versao={YT_DLP_VERSION}")
     logger.info(
