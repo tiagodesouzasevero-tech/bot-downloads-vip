@@ -5971,6 +5971,7 @@ def sincronizar_vips_pagos_ativos(notificar_admin=True):
                 "_id": 0,
                 "order_nsu": 1,
                 "user_id": 1,
+                "status": 1,
                 "vip_liberado_ate": 1,
             },
         )
@@ -6041,6 +6042,12 @@ def sincronizar_vips_pagos_ativos(notificar_admin=True):
                 corrigidos += 1
             elif not resultado.get("ok"):
                 falhas += 1
+                logger.warning(
+                    "[VIP_SYNC_STARTUP_RESULTADO_INVALIDO] "
+                    f"pedido_ref={referencia_pedido_log(pedido.get('order_nsu'))} "
+                    f"user_ref={referencia_usuario_log(pedido.get('user_id'))} "
+                    f"motivo={str(resultado.get('motivo') or 'desconhecido')[:80]}"
+                )
         except Exception as e:
             falhas += 1
             logger.error(
@@ -6059,10 +6066,10 @@ def sincronizar_vips_pagos_ativos(notificar_admin=True):
     if notificar_admin and (corrigidos or falhas):
         safe_send_message(
             ADMIN_ID,
-            "💎 *Sincronização VIP concluída*\\n\\n"
-            f"🔎 Pagantes ativos verificados: `{verificados}`\\n"
-            f"✅ VIPs corrigidos: `{corrigidos}`\\n"
-            f"🛑 Bloqueados manualmente: `{bloqueados}`\\n"
+            "💎 *Sincronização VIP concluída*\n\n"
+            f"🔎 Pagantes ativos verificados: `{verificados}`\n"
+            f"✅ VIPs corrigidos: `{corrigidos}`\n"
+            f"🛑 Bloqueados manualmente: `{bloqueados}`\n"
             f"❌ Falhas: `{falhas}`",
             parse_mode="Markdown",
         )
@@ -7839,10 +7846,10 @@ def sincronizar_vip_admin(message):
                 notificar_admin=False,
             )
             texto = (
-                "💎 *Sincronização VIP concluída*\\n\\n"
-                f"🔎 Verificados: `{resultado['verificados']}`\\n"
-                f"✅ Corrigidos: `{resultado['corrigidos']}`\\n"
-                f"🛑 Bloqueados manualmente: `{resultado['bloqueados']}`\\n"
+                "💎 *Sincronização VIP concluída*\n\n"
+                f"🔎 Verificados: `{resultado['verificados']}`\n"
+                f"✅ Corrigidos: `{resultado['corrigidos']}`\n"
+                f"🛑 Bloqueados manualmente: `{resultado['bloqueados']}`\n"
                 f"❌ Falhas: `{resultado['falhas']}`"
             )
             if status and getattr(status, "message_id", None):
@@ -12231,8 +12238,9 @@ def encerrar_healthcheck():
 # MAIN
 # =========================================
 if __name__ == "__main__":
-    logger.info("[BOT_BUILD] bot_downloads_v4_ml_clips_v12_mensal_admin_priority")
+    logger.info("[BOT_BUILD] bot_downloads_v4_ml_clips_v12_1_vip_sync_fix")
     logger.info("[VIP_SYNC_CONFIG] startup=True pos_pagamento=True bloqueio_removervip=True comando_syncvip=True")
+    logger.info("[VIP_SYNC_FIX] projection_status=True formatacao_newline=True log_motivo=True")
     logger.info("[BACKUP_MENU_CONFIG] backupvips=True backupgeral=True")
     logger.info("[AQUISICAO_CONFIG] deep_link=True linkads=True origens=True origem_imutavel=True")
     logger.info("[BACKUP_VERIFY_CONFIG] schema=2 json_roundtrip=True dry_run=True db_writes=0")
