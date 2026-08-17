@@ -5689,11 +5689,19 @@ def liberar_vip_por_plano(user_id, plano, order_nsu=None):
         atualizacao = {
             "$set": {
                 "vip_ate": novo_vip_ate,
-                "ultima_data": hoje_str()
+                "ultima_data": hoje_str(),
+                "vip_sync_last_source": "novo_pagamento",
+                "vip_sync_last_checked_at": agora_tz(),
             },
             "$setOnInsert": {
                 "downloads_hoje": 0
-            }
+            },
+            "$unset": {
+                "vip_sync_bloqueado": "",
+                "vip_sync_bloqueado_em": "",
+                "vip_sync_bloqueado_motivo": "",
+                "vip_sync_erro": "",
+            },
         }
         if order_nsu:
             atualizacao["$addToSet"] = {"vip_orders_aplicados": order_nsu}
@@ -5734,6 +5742,325 @@ def notificar_pagamento_confirmado(user_id, plano_nome, vip_ate):
         return False
 
 
+def _vip_ate_comparavel(valor):
+    if valor == "Vitalício":
+        return (2, None)
+
+    try:
+        data = datetime.strptime(str(valor or ""), "%Y-%m-%d").date()
+        return (1, data)
+    except Exception:
+        return (0, None)
+
+
+def _vip_ate_maior(a, b):
+    tipo_a, data_a = _vip_ate_comparavel(a)
+    tipo_b, data_b = _vip_ate_comparavel(b)
+
+    if tipo_a == 2 or tipo_b == 2:
+        return "Vitalício"
+
+    if tipo_a == 1 and tipo_b == 1:
+        return a if data_a >= data_b else b
+
+    if tipo_a == 1:
+        return a
+    if tipo_b == 1:
+        return b
+    return None
+
+
+def garantir_vip_pago_sincronizado(
+    user_id,
+    vip_ate_esperado,
+    order_nsu=None,
+    origem="pagamento",
+):
+    """Garante que um pagamento já confirmado esteja refletido no usuário.
+
+    Nunca reduz uma validade já maior e respeita bloqueio administrativo
+    explícito criado por /removervip.
+    """
+    uid = str(user_id or "").strip()
+    esperado = str(vip_ate_esperado or "").strip()
+
+    if not uid or not esperado:
+        return {
+            "ok": False,
+            "corrigido": False,
+            "motivo": "dados_incompletos",
+        }
+
+    lock_usuario = obter_lock_distribuido_local(uid, PAYMENT_USER_LOCKS)
+
+    with lock_usuario:
+        usuario = usuarios_col.find_one({"_id": uid}) or {}
+
+        if usuario.get("vip_sync_bloqueado"):
+            logger.warning(
+                "[VIP_SYNC_BLOQUEADO] "
+                f"user_ref={referencia_usuario_log(uid)} "
+                f"origem={origem}"
+            )
+            return {
+                "ok": True,
+                "corrigido": False,
+                "motivo": "bloqueio_admin",
+                "vip_ate": usuario.get("vip_ate"),
+            }
+
+        atual = usuario.get("vip_ate")
+        alvo = _vip_ate_maior(atual, esperado) or esperado
+
+        # Se o usuário já está igual ou melhor, apenas garante o vínculo do
+        # pedido e limpa qualquer marca de reparo antigo.
+        precisa_corrigir = atual != alvo
+
+        update = {
+            "$set": {
+                "vip_sync_last_checked_at": agora_tz(),
+                "vip_sync_last_source": str(origem)[:80],
+            },
+            "$setOnInsert": {
+                "downloads_hoje": 0,
+                "ultima_data": hoje_str(),
+            },
+            "$unset": {
+                "vip_sync_erro": "",
+            },
+        }
+
+        if precisa_corrigir:
+            update["$set"]["vip_ate"] = alvo
+            update["$set"]["vip_sync_last_repaired_at"] = agora_tz()
+
+        if order_nsu:
+            update["$addToSet"] = {
+                "vip_orders_aplicados": str(order_nsu),
+            }
+
+        resultado = usuarios_col.update_one(
+            {"_id": uid},
+            update,
+            upsert=True,
+        )
+
+        confirmado = usuarios_col.find_one(
+            {"_id": uid},
+            {
+                "vip_ate": 1,
+                "vip_orders_aplicados": 1,
+                "vip_sync_bloqueado": 1,
+            },
+        ) or {}
+
+        vip_confirmado = confirmado.get("vip_ate")
+        alvo_confirmado = _vip_ate_maior(vip_confirmado, esperado)
+
+        if vip_confirmado != alvo_confirmado:
+            usuarios_col.update_one(
+                {"_id": uid},
+                {
+                    "$set": {
+                        "vip_sync_erro": "vip_ate_nao_confirmado",
+                        "vip_sync_last_checked_at": agora_tz(),
+                    }
+                },
+            )
+            logger.error(
+                "[VIP_SYNC_FALHA] "
+                f"user_ref={referencia_usuario_log(uid)} "
+                f"pedido_ref={referencia_pedido_log(order_nsu) if order_nsu else 'sem_pedido'} "
+                f"esperado={esperado} obtido={vip_confirmado} origem={origem}"
+            )
+            return {
+                "ok": False,
+                "corrigido": False,
+                "motivo": "confirmacao_falhou",
+                "vip_ate": vip_confirmado,
+            }
+
+        if precisa_corrigir:
+            logger.warning(
+                "[VIP_SYNC_REPARADO] "
+                f"user_ref={referencia_usuario_log(uid)} "
+                f"pedido_ref={referencia_pedido_log(order_nsu) if order_nsu else 'sem_pedido'} "
+                f"antes={atual} depois={vip_confirmado} origem={origem}"
+            )
+        else:
+            logger.info(
+                "[VIP_SYNC_OK] "
+                f"user_ref={referencia_usuario_log(uid)} "
+                f"pedido_ref={referencia_pedido_log(order_nsu) if order_nsu else 'sem_pedido'} "
+                f"vip_ate={vip_confirmado} origem={origem}"
+            )
+
+        return {
+            "ok": True,
+            "corrigido": bool(precisa_corrigir),
+            "motivo": "reparado" if precisa_corrigir else "ja_sincronizado",
+            "vip_ate": vip_confirmado,
+            "db_changed": bool(
+                resultado.modified_count or resultado.upserted_id
+            ),
+        }
+
+
+def garantir_vip_de_pedido_pago(pedido, origem="pedido_pago"):
+    if not pedido or pedido.get("status") != "paid":
+        return {
+            "ok": False,
+            "corrigido": False,
+            "motivo": "pedido_nao_pago",
+        }
+
+    vip_ate = pedido.get("vip_liberado_ate")
+    if not vip_ate:
+        logger.warning(
+            "[VIP_SYNC_PEDIDO_SEM_VALIDADE] "
+            f"pedido_ref={referencia_pedido_log(pedido.get('order_nsu'))} "
+            f"user_ref={referencia_usuario_log(pedido.get('user_id'))}"
+        )
+        return {
+            "ok": False,
+            "corrigido": False,
+            "motivo": "pedido_sem_validade",
+        }
+
+    return garantir_vip_pago_sincronizado(
+        pedido.get("user_id"),
+        vip_ate,
+        order_nsu=pedido.get("order_nsu"),
+        origem=origem,
+    )
+
+
+def sincronizar_vips_pagos_ativos(notificar_admin=True):
+    """Reconcilia pedidos pagos ainda válidos com a coleção de usuários.
+
+    Só aumenta/restaura validade. Nunca reduz um VIP já maior.
+    /removervip cria um bloqueio explícito para impedir reativação automática.
+    """
+    hoje = agora_tz().date()
+    por_usuario = {}
+
+    try:
+        cursor = pedidos_col.find(
+            {
+                "status": "paid",
+                "vip_liberado_ate": {
+                    "$exists": True,
+                    "$nin": [None, ""],
+                },
+            },
+            {
+                "_id": 0,
+                "order_nsu": 1,
+                "user_id": 1,
+                "vip_liberado_ate": 1,
+            },
+        )
+
+        for pedido in cursor:
+            uid = str(pedido.get("user_id") or "").strip()
+            vip_ate = pedido.get("vip_liberado_ate")
+            if not uid or not vip_ate:
+                continue
+
+            if vip_ate != "Vitalício":
+                try:
+                    data_vip = datetime.strptime(
+                        str(vip_ate),
+                        "%Y-%m-%d",
+                    ).date()
+                except Exception:
+                    logger.warning(
+                        "[VIP_SYNC_STARTUP_INVALIDO] "
+                        f"pedido_ref={referencia_pedido_log(pedido.get('order_nsu'))} "
+                        f"vip_ate={vip_ate}"
+                    )
+                    continue
+
+                if data_vip < hoje:
+                    continue
+
+            atual = por_usuario.get(uid)
+            if not atual:
+                por_usuario[uid] = pedido
+                continue
+
+            melhor = _vip_ate_maior(
+                atual.get("vip_liberado_ate"),
+                vip_ate,
+            )
+            if melhor == vip_ate:
+                por_usuario[uid] = pedido
+
+    except Exception as e:
+        registrar_falha_componente("MongoDB", e)
+        logger.error(
+            "[VIP_SYNC_STARTUP_LISTAR_FALHA] "
+            f"erro={sanitizar_erro_log(e)}"
+        )
+        return {
+            "verificados": 0,
+            "corrigidos": 0,
+            "bloqueados": 0,
+            "falhas": 1,
+        }
+
+    verificados = 0
+    corrigidos = 0
+    bloqueados = 0
+    falhas = 0
+
+    for pedido in por_usuario.values():
+        verificados += 1
+        try:
+            resultado = garantir_vip_de_pedido_pago(
+                pedido,
+                origem="startup_reconciliation",
+            )
+            if resultado.get("motivo") == "bloqueio_admin":
+                bloqueados += 1
+            elif resultado.get("corrigido"):
+                corrigidos += 1
+            elif not resultado.get("ok"):
+                falhas += 1
+        except Exception as e:
+            falhas += 1
+            logger.error(
+                "[VIP_SYNC_STARTUP_FALHA] "
+                f"pedido_ref={referencia_pedido_log(pedido.get('order_nsu'))} "
+                f"user_ref={referencia_usuario_log(pedido.get('user_id'))} "
+                f"erro={sanitizar_erro_log(e)}"
+            )
+
+    logger.info(
+        "[VIP_SYNC_STARTUP] "
+        f"verificados={verificados} corrigidos={corrigidos} "
+        f"bloqueados={bloqueados} falhas={falhas}"
+    )
+
+    if notificar_admin and (corrigidos or falhas):
+        safe_send_message(
+            ADMIN_ID,
+            "💎 *Sincronização VIP concluída*\\n\\n"
+            f"🔎 Pagantes ativos verificados: `{verificados}`\\n"
+            f"✅ VIPs corrigidos: `{corrigidos}`\\n"
+            f"🛑 Bloqueados manualmente: `{bloqueados}`\\n"
+            f"❌ Falhas: `{falhas}`",
+            parse_mode="Markdown",
+        )
+
+    return {
+        "verificados": verificados,
+        "corrigidos": corrigidos,
+        "bloqueados": bloqueados,
+        "falhas": falhas,
+    }
+
+
 def finalizar_aprovacao_pix_em_processamento(order_nsu):
     """Conclui uma aprovação já autorizada pelo administrador.
 
@@ -5746,10 +6073,14 @@ def finalizar_aprovacao_pix_em_processamento(order_nsu):
         raise RuntimeError("PEDIDO_APROVACAO_NAO_ENCONTRADO")
 
     if pedido.get("status") == "paid":
+        sync = garantir_vip_de_pedido_pago(
+            pedido,
+            origem="pedido_ja_pago",
+        )
         return {
             "pedido": pedido,
             "plano": PLANOS.get(pedido.get("plano_key")) or {},
-            "vip_ate": pedido.get("vip_liberado_ate"),
+            "vip_ate": sync.get("vip_ate") or pedido.get("vip_liberado_ate"),
             "vip_aplicado": bool(pedido.get("vip_aplicado_ao_pedido")),
             "finalizado_agora": False,
         }
@@ -5797,10 +6128,14 @@ def finalizar_aprovacao_pix_em_processamento(order_nsu):
 
     if resultado.modified_count:
         pedido_final = pedidos_col.find_one({"order_nsu": order_nsu}) or pedido
+        sync = garantir_vip_de_pedido_pago(
+            pedido_final,
+            origem="finalizacao_pagamento",
+        )
         return {
             "pedido": pedido_final,
             "plano": plano,
-            "vip_ate": vip_ate,
+            "vip_ate": sync.get("vip_ate") or vip_ate,
             "vip_aplicado": vip_aplicado,
             "finalizado_agora": True,
         }
@@ -5809,10 +6144,18 @@ def finalizar_aprovacao_pix_em_processamento(order_nsu):
     # gravação. Aceita somente o estado final esperado.
     pedido_atual = pedidos_col.find_one({"order_nsu": order_nsu}) or {}
     if pedido_atual.get("status") == "paid":
+        sync = garantir_vip_de_pedido_pago(
+            pedido_atual,
+            origem="finalizacao_concorrente",
+        )
         return {
             "pedido": pedido_atual,
             "plano": plano,
-            "vip_ate": pedido_atual.get("vip_liberado_ate") or vip_ate,
+            "vip_ate": (
+                sync.get("vip_ate")
+                or pedido_atual.get("vip_liberado_ate")
+                or vip_ate
+            ),
             "vip_aplicado": bool(pedido_atual.get("vip_aplicado_ao_pedido")),
             "finalizado_agora": False,
         }
@@ -6162,6 +6505,7 @@ def configurar_menu_comandos():
         types.BotCommand("zerar", "Zerar o limite de um usuário"),
         types.BotCommand("avisogeral", "Enviar comunicado aos usuários"),
         types.BotCommand("diagnostico", "Verificar a saúde do bot"),
+        types.BotCommand("backupvips", "Gerar backup dos VIPs ativos"),
         types.BotCommand("backupgeral", "Gerar backup completo"),
     ]
 
@@ -6865,6 +7209,50 @@ def diagnostico_admin(message):
     ).start()
 
 
+@bot.message_handler(commands=["syncvip"])
+def sincronizar_vip_admin(message):
+    if not exigir_admin_privado(message):
+        return
+
+    status = safe_reply_to(
+        message,
+        "💎 Verificando pagamentos e acessos VIP...",
+    )
+
+    def executar():
+        try:
+            resultado = sincronizar_vips_pagos_ativos(
+                notificar_admin=False,
+            )
+            texto = (
+                "💎 *Sincronização VIP concluída*\\n\\n"
+                f"🔎 Verificados: `{resultado['verificados']}`\\n"
+                f"✅ Corrigidos: `{resultado['corrigidos']}`\\n"
+                f"🛑 Bloqueados manualmente: `{resultado['bloqueados']}`\\n"
+                f"❌ Falhas: `{resultado['falhas']}`"
+            )
+            if status and getattr(status, "message_id", None):
+                safe_edit_message(
+                    message.chat.id,
+                    status.message_id,
+                    texto,
+                    parse_mode="Markdown",
+                )
+            else:
+                safe_reply_to(message, texto, parse_mode="Markdown")
+        except Exception as e:
+            logger.error(
+                "[SYNCVIP_ADMIN] "
+                f"erro={sanitizar_erro_log(e)}"
+            )
+            safe_reply_to(
+                message,
+                "❌ Não foi possível concluir a sincronização VIP.",
+            )
+
+    Thread(target=executar, daemon=True).start()
+
+
 @bot.message_handler(commands=["darvip"])
 def dar_vip_manual(message):
     if not exigir_admin_privado(message):
@@ -6915,7 +7303,15 @@ def dar_vip_manual(message):
             {
                 "$set": {
                     "vip_ate": nova_data,
-                    "ultima_data": hoje_str()
+                    "ultima_data": hoje_str(),
+                    "vip_sync_last_source": "darvip_manual",
+                    "vip_sync_last_checked_at": agora_tz(),
+                },
+                "$unset": {
+                    "vip_sync_bloqueado": "",
+                    "vip_sync_bloqueado_em": "",
+                    "vip_sync_bloqueado_motivo": "",
+                    "vip_sync_erro": "",
                 },
                 "$setOnInsert": {
                     "downloads_hoje": 0
@@ -7022,9 +7418,17 @@ def remover_vip_manual(message):
             details={"vip_was_active": vip_estava_ativo},
         )
 
+        agora_remocao = agora_tz()
         resultado = usuarios_col.update_one(
             {"_id": alvo_id},
-            {"$set": {"vip_ate": None}},
+            {
+                "$set": {
+                    "vip_ate": None,
+                    "vip_sync_bloqueado": True,
+                    "vip_sync_bloqueado_em": agora_remocao,
+                    "vip_sync_bloqueado_motivo": "remocao_manual_admin",
+                }
+            },
         )
 
         logger.info(
@@ -11183,7 +11587,9 @@ def encerrar_healthcheck():
 # MAIN
 # =========================================
 if __name__ == "__main__":
-    logger.info("[BOT_BUILD] bot_downloads_v4_ml_clips_v7_diagnostico_plataformas")
+    logger.info("[BOT_BUILD] bot_downloads_v4_ml_clips_v9_backupvips_menu")
+    logger.info("[VIP_SYNC_CONFIG] startup=True pos_pagamento=True bloqueio_removervip=True comando_syncvip=True")
+    logger.info("[BACKUP_MENU_CONFIG] backupvips=True backupgeral=True")
     logger.info("[ML_CLIPS_CONFIG] enabled=True login=False cookies=False token=False source=public_mobile_html_hls dns_guard=host_allowlist")
     logger.info(f"[YT_DLP] versao={YT_DLP_VERSION}")
     logger.info(
@@ -11291,6 +11697,7 @@ if __name__ == "__main__":
     cleanup_download_dir_old_files(max_age_hours=6)
     configurar_menu_comandos()
     recuperar_aprovacoes_pix_interrompidas()
+    sincronizar_vips_pagos_ativos(notificar_admin=True)
     bot.set_update_listener(registrar_atividade_bot)
     registrar_sinais_desligamento()
 
