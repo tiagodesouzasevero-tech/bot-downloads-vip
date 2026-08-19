@@ -4364,6 +4364,67 @@ def extrair_id_facebook_para_fallback(info, url):
     return None
 
 
+
+def resumir_formatos_facebook(info, origem="desconhecida"):
+    """
+    Registra os formatos retornados pelo Facebook sem expor URLs assinadas,
+    cookies ou outros dados sensíveis. É apenas diagnóstico: não altera o
+    formato escolhido nem o comportamento do download.
+    """
+    if not isinstance(info, dict):
+        logger.info(
+            f"[FACEBOOK_FORMATOS] origem={origem} total=0 info_valida=False"
+        )
+        return
+
+    formatos = info.get("formats")
+    if not isinstance(formatos, list):
+        formatos = []
+
+    resumo = []
+    for item in formatos[:40]:
+        if not isinstance(item, dict):
+            continue
+
+        format_id = sanitizar_erro_log(item.get("format_id"), limite=80)
+        ext = sanitizar_erro_log(item.get("ext"), limite=20)
+        vcodec = sanitizar_erro_log(item.get("vcodec"), limite=40)
+        acodec = sanitizar_erro_log(item.get("acodec"), limite=40)
+        protocolo = sanitizar_erro_log(item.get("protocol"), limite=40)
+
+        resumo.append(
+            "{id=%s ext=%s v=%s a=%s %sx%s fps=%s proto=%s "
+            "tbr=%s vbr=%s abr=%s size=%s}" % (
+                format_id,
+                ext,
+                vcodec,
+                acodec,
+                item.get("width"),
+                item.get("height"),
+                item.get("fps"),
+                protocolo,
+                item.get("tbr"),
+                item.get("vbr"),
+                item.get("abr"),
+                item.get("filesize") or item.get("filesize_approx"),
+            )
+        )
+
+    requested_formats = info.get("requested_formats")
+    requested_downloads = info.get("requested_downloads")
+
+    logger.info(
+        f"[FACEBOOK_FORMATOS] origem={origem} "
+        f"total={len(formatos)} "
+        f"requested_formats={len(requested_formats) if isinstance(requested_formats, list) else 0} "
+        f"requested_downloads={len(requested_downloads) if isinstance(requested_downloads, list) else 0} "
+        f"top_ext={sanitizar_erro_log(info.get('ext'), limite=20)} "
+        f"top_v={sanitizar_erro_log(info.get('vcodec'), limite=40)} "
+        f"top_a={sanitizar_erro_log(info.get('acodec'), limite=40)} "
+        f"itens={' '.join(resumo)[:7000]}"
+    )
+
+
 def extrair_info_facebook_com_fallback(url):
     """
     Prefere uma origem pública com áudio confirmado.
@@ -4385,6 +4446,7 @@ def extrair_info_facebook_com_fallback(url):
             montar_info_opts(is_facebook_reel=True)
         ) as ydl:
             primeiro_info = ydl.extract_info(url, download=False)
+            resumir_formatos_facebook(primeiro_info, origem="reel_publico")
     except FalhaComponenteDownload:
         raise
     except Exception as e:
@@ -4444,6 +4506,10 @@ def extrair_info_facebook_com_fallback(url):
             info_alternativa = ydl.extract_info(
                 url_alternativa,
                 download=False,
+            )
+            resumir_formatos_facebook(
+                info_alternativa,
+                origem="pagina_publica_alternativa",
             )
     except FalhaComponenteDownload:
         raise
