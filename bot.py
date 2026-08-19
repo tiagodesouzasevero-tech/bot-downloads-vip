@@ -217,7 +217,7 @@ MEDIA_PROFILE_VERSION = (
     f"720x1280_30fps_h264_crf{VIDEO_CRF}_audio{AUDIO_BITRATE}_sem_marca_v2"
 )
 INSTAGRAM_AUDIO_CACHE_VERSION = "instagram_audio_v5_nocookies"
-FACEBOOK_AUDIO_CACHE_VERSION = "facebook_audio_v2"
+FACEBOOK_AUDIO_CACHE_VERSION = "facebook_audio_v3"
 ML_CLIPS_CACHE_VERSION = "ml_clips_hls_720_v1"
 
 TIKTOK_COOKIES_TEXT = os.environ.get("TIKTOK_COOKIES_TEXT", "")
