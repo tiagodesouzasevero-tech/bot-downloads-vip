@@ -5335,12 +5335,31 @@ def _extrair_candidatos_dash_facebook(url):
             resposta.close()
 
 
+def _prioridade_codec_audio_facebook(codec):
+    """
+    Preferência baseada no caso real diagnosticado:
+    - mp4a.40.5 = HE-AAC (mesmo perfil do arquivo dos concorrentes)
+    - mp4a.40.2 = AAC-LC
+    """
+    codec = str(codec or "").strip().lower()
+    if codec.startswith("mp4a.40.5"):
+        return 4
+    if codec.startswith("mp4a.40.2"):
+        return 3
+    if codec.startswith("mp4a"):
+        return 2
+    if codec.startswith("aac"):
+        return 1
+    return 0
+
+
 def _montar_pares_dash_facebook(audios, videos):
     """
-    Forma pares do mesmo manifest e prioriza:
-    - vídeo AVC/H.264 até 720x1280 (ou 1280x720);
-    - maior resolução/bitrate;
-    - áudio AAC/mp4a, preferindo LC (mp4a.40.2) e maior bitrate.
+    Forma pares do mesmo manifest.
+
+    Diferente da versão anterior, mantém TODAS as faixas AAC compatíveis
+    como tentativas separadas. Isso permite testar mp4a.40.5 e rejeitar
+    automaticamente uma faixa tecnicamente AAC, porém praticamente muda.
     """
     por_manifesto_audio = {}
     por_manifesto_video = {}
@@ -5378,7 +5397,6 @@ def _montar_pares_dash_facebook(audios, videos):
             if "video/mp4" not in mime and not codec.startswith(("avc", "h264")):
                 continue
 
-            # Mantém o limite atual do bot em ambas as orientações.
             dentro_limite = (
                 (largura <= 720 and altura <= 1280)
                 or (largura <= 1280 and altura <= 720)
@@ -5391,14 +5409,6 @@ def _montar_pares_dash_facebook(audios, videos):
         if not videos_validos:
             continue
 
-        audios_validos.sort(
-            key=lambda a: (
-                1 if str(a.get("codecs") or "").lower().startswith("mp4a.40.2") else 0,
-                int(a.get("bandwidth") or 0),
-            ),
-            reverse=True,
-        )
-
         videos_validos.sort(
             key=lambda v: (
                 int(v.get("width") or 0) * int(v.get("height") or 0),
@@ -5406,23 +5416,25 @@ def _montar_pares_dash_facebook(audios, videos):
             ),
             reverse=True,
         )
-
-        melhor_audio = audios_validos[0]
         melhor_video = videos_validos[0]
 
-        pares.append(
-            {
-                "manifesto": manifesto,
-                "audio": melhor_audio,
-                "video": melhor_video,
-                "score": (
-                    int(melhor_video.get("width") or 0)
-                    * int(melhor_video.get("height") or 0),
-                    int(melhor_video.get("bandwidth") or 0),
-                    int(melhor_audio.get("bandwidth") or 0),
-                ),
-            }
-        )
+        # Uma tentativa para cada faixa de áudio do manifest.
+        for audio in audios_validos:
+            codec_audio = str(audio.get("codecs") or "")
+            pares.append(
+                {
+                    "manifesto": manifesto,
+                    "audio": audio,
+                    "video": melhor_video,
+                    "score": (
+                        int(melhor_video.get("width") or 0)
+                        * int(melhor_video.get("height") or 0),
+                        _prioridade_codec_audio_facebook(codec_audio),
+                        int(melhor_video.get("bandwidth") or 0),
+                        int(audio.get("bandwidth") or 0),
+                    ),
+                }
+            )
 
     pares.sort(key=lambda p: p["score"], reverse=True)
 
@@ -5434,12 +5446,136 @@ def _montar_pares_dash_facebook(audios, videos):
             f"{pares[0]['video'].get('width')}x{pares[0]['video'].get('height')} "
             f"video_bitrate={pares[0]['video'].get('bandwidth')} "
             f"audio_codec={str(pares[0]['audio'].get('codecs') or '')[:40]} "
-            f"audio_bitrate={pares[0]['audio'].get('bandwidth')}"
+            f"audio_bitrate={pares[0]['audio'].get('bandwidth')} "
+            f"codec_prioridade="
+            f"{_prioridade_codec_audio_facebook(pares[0]['audio'].get('codecs'))}"
             if pares
             else "nenhum=True"
         )
     )
     return pares
+
+
+def _avaliar_faixa_audio_facebook_dash(audio_path, codec_manifesto=None):
+    """
+    Verifica se a faixa contém áudio audível de verdade.
+
+    O arquivo problemático diagnosticado tinha AAC válido no container,
+    mas ficou ~98% do tempo abaixo de -40 dB. Assim, apenas ffprobe/acodec
+    não é suficiente.
+
+    Regra conservadora:
+    - rejeita somente quando >=95% da faixa é silêncio abaixo de -40 dB
+      E o volume médio é <= -38 dB;
+    - caso a medição de volume falhe, só rejeita com >=98% de silêncio.
+    """
+    atualizar_heartbeat_worker("facebook_dash_audio_check")
+
+    info = obter_info_midia(audio_path)
+    duracao = float(info.get("duration") or 0)
+
+    if duracao <= 0 or not arquivo_possui_audio(info):
+        raise RuntimeError("FACEBOOK_DASH_AUDIO_PROBE_INVALIDO")
+
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-nostats",
+        "-i", audio_path,
+        "-map", "0:a:0",
+        "-af", "silencedetect=noise=-40dB:d=0.5,volumedetect",
+        "-f", "null",
+        "-",
+    ]
+
+    try:
+        resultado = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=FFMPEG_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError(
+            f"FACEBOOK_DASH_AUDIO_ANALISE_TIMEOUT timeout={FFMPEG_TIMEOUT_SECONDS}s"
+        ) from e
+
+    if resultado.returncode != 0:
+        raise RuntimeError(
+            f"FACEBOOK_DASH_AUDIO_ANALISE_FALHOU codigo={resultado.returncode}"
+        )
+
+    stderr = resultado.stderr or ""
+
+    mean_match = re.search(
+        r"mean_volume:\s*(-?(?:\d+(?:\.\d+)?|inf))\s*dB",
+        stderr,
+        flags=re.IGNORECASE,
+    )
+    max_match = re.search(
+        r"max_volume:\s*(-?(?:\d+(?:\.\d+)?|inf))\s*dB",
+        stderr,
+        flags=re.IGNORECASE,
+    )
+
+    def _parse_db(match):
+        if not match:
+            return None
+        valor = str(match.group(1)).lower()
+        if valor in ("-inf", "inf"):
+            return float("-inf") if valor == "-inf" else float("inf")
+        try:
+            return float(valor)
+        except ValueError:
+            return None
+
+    mean_db = _parse_db(mean_match)
+    max_db = _parse_db(max_match)
+
+    silencios = []
+    for valor in re.findall(
+        r"silence_duration:\s*(\d+(?:\.\d+)?)",
+        stderr,
+        flags=re.IGNORECASE,
+    ):
+        try:
+            silencios.append(float(valor))
+        except ValueError:
+            pass
+
+    silencio_total = min(duracao, sum(silencios))
+    proporcao_silencio = (
+        max(0.0, min(1.0, silencio_total / duracao))
+        if duracao > 0
+        else 1.0
+    )
+
+    if mean_db is not None:
+        quase_muda = (
+            proporcao_silencio >= 0.95
+            and mean_db <= -38.0
+        )
+    else:
+        quase_muda = proporcao_silencio >= 0.98
+
+    logger.info(
+        "[FACEBOOK_DASH_AUDIO_QUALIDADE] "
+        f"codec_manifesto={str(codec_manifesto or '')[:40]} "
+        f"duracao={duracao:.3f} "
+        f"silencio_segundos={silencio_total:.3f} "
+        f"silencio_pct={proporcao_silencio * 100:.1f} "
+        f"mean_db={mean_db} max_db={max_db} "
+        f"audivel={not quase_muda}"
+    )
+
+    return {
+        "audivel": not quase_muda,
+        "duracao": duracao,
+        "silencio_pct": proporcao_silencio * 100,
+        "mean_db": mean_db,
+        "max_db": max_db,
+    }
 
 
 def _muxar_facebook_dash(video_path, audio_path, saida_path):
@@ -5514,7 +5650,7 @@ def baixar_facebook_dash_com_audio(url, prefix):
     # Evita deixar os MP4 mudos tentados antes no mesmo prefixo.
     cleanup_prefix(prefix)
 
-    for tentativa, par in enumerate(pares[:6], start=1):
+    for tentativa, par in enumerate(pares[:10], start=1):
         video_path = f"{prefix}_fb_dash_video.mp4"
         audio_path = f"{prefix}_fb_dash_audio.m4a"
         saida_path = f"{prefix}_fb_dash_mux.mp4"
@@ -5532,7 +5668,7 @@ def baixar_facebook_dash_com_audio(url, prefix):
 
             logger.info(
                 "[FACEBOOK_DASH_TENTATIVA] "
-                f"tentativa={tentativa}/{min(len(pares), 6)} "
+                f"tentativa={tentativa}/{min(len(pares), 10)} "
                 f"manifesto={par.get('manifesto')} "
                 f"video={video.get('width')}x{video.get('height')} "
                 f"video_bitrate={video.get('bandwidth')} "
@@ -5560,6 +5696,17 @@ def baixar_facebook_dash_com_audio(url, prefix):
                 raise RuntimeError("FACEBOOK_DASH_FAIXA_VIDEO_INVALIDA")
             if not arquivo_possui_audio(info_audio):
                 raise RuntimeError("FACEBOOK_DASH_FAIXA_AUDIO_INVALIDA")
+
+            qualidade_audio = _avaliar_faixa_audio_facebook_dash(
+                audio_path,
+                codec_manifesto=audio.get("codecs"),
+            )
+            if not qualidade_audio.get("audivel"):
+                raise RuntimeError(
+                    "FACEBOOK_DASH_FAIXA_AUDIO_QUASE_MUDA "
+                    f"codec={str(audio.get('codecs') or '')[:40]} "
+                    f"silencio_pct={qualidade_audio.get('silencio_pct', 0):.1f}"
+                )
 
             _muxar_facebook_dash(video_path, audio_path, saida_path)
 
