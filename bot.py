@@ -4486,6 +4486,23 @@ def diagnosticar_dash_manifest_facebook(texto_pagina, origem="desconhecida"):
         except Exception:
             return match.group(0)
 
+    def reparar_ampersands_xml(texto_xml):
+        """
+        Corrige somente '&' que não iniciam uma entidade XML válida.
+
+        Exemplos preservados:
+        &amp;  &#123;  &#xAF;
+
+        Exemplo corrigido:
+        ?token=abc&expires=123  ->  ?token=abc&amp;expires=123
+        """
+        padrao = re.compile(
+            r"&(?!(?:amp|lt|gt|quot|apos);|#\d+;|#x[0-9a-fA-F]+;)"
+        )
+        reparado, quantidade = padrao.subn("&amp;", str(texto_xml or ""))
+        return reparado, quantidade
+
+
     def desescapar_camadas(valor):
         """
         Produz candidatos progressivamente decodificados, sem executar código
@@ -4616,63 +4633,118 @@ def diagnosticar_dash_manifest_facebook(texto_pagina, origem="desconhecida"):
                 "backslash_quote": candidato.count('\\"'),
             }
 
+            candidato_usado = candidato
+            rotulo_usado = rotulo
+            reparos_ampersand = 0
+
             try:
                 raiz = ET.fromstring(candidato)
-            except ET.ParseError as e:
-                pos = getattr(e, "position", None)
-                erro = {
-                    "tipo": type(e).__name__,
-                    "linha": pos[0] if pos else None,
-                    "coluna": pos[1] if pos else None,
-                    "rotulo": rotulo,
-                }
-
-                pontuacao = (
-                    int(estrutura["tem_mpd"]) * 4
-                    + int(estrutura["comeca_xml"]) * 2
-                    + int(estrutura["tem_adaptation"])
-                    + int(estrutura["tem_representation"])
+            except ET.ParseError as e_original:
+                # Tentativa controlada: corrige somente '&' inválidos.
+                candidato_reparado, reparos_ampersand = reparar_ampersands_xml(
+                    candidato
                 )
-                if (
-                    melhor_estrutura is None
-                    or pontuacao > melhor_estrutura["pontuacao"]
-                ):
-                    melhor_estrutura = {
-                        **estrutura,
-                        "pontuacao": pontuacao,
+
+                if reparos_ampersand > 0:
+                    try:
+                        raiz = ET.fromstring(candidato_reparado)
+                        candidato_usado = candidato_reparado
+                        rotulo_usado = rotulo + "+amp"
+                        logger.info(
+                            "[FACEBOOK_DASH_REPAIR_OK] "
+                            f"origem={origem} indice={indice} "
+                            f"reparos_ampersand={reparos_ampersand} "
+                            f"decodificacao={rotulo_usado} "
+                            f"tamanho={len(candidato_reparado)}"
+                        )
+                    except ET.ParseError as e:
+                        pos = getattr(e, "position", None)
+                        erro = {
+                            "tipo": type(e).__name__,
+                            "linha": pos[0] if pos else None,
+                            "coluna": pos[1] if pos else None,
+                            "rotulo": rotulo + "+amp",
+                            "reparos_ampersand": reparos_ampersand,
+                        }
+
+                        pontuacao = (
+                            int(estrutura["tem_mpd"]) * 4
+                            + int(estrutura["comeca_xml"]) * 2
+                            + int(estrutura["tem_adaptation"])
+                            + int(estrutura["tem_representation"])
+                        )
+                        if (
+                            melhor_estrutura is None
+                            or pontuacao > melhor_estrutura["pontuacao"]
+                        ):
+                            melhor_estrutura = {
+                                **estrutura,
+                                "pontuacao": pontuacao,
+                                "reparos_ampersand": reparos_ampersand,
+                            }
+                            melhor_erro = erro
+                        continue
+                else:
+                    pos = getattr(e_original, "position", None)
+                    erro = {
+                        "tipo": type(e_original).__name__,
+                        "linha": pos[0] if pos else None,
+                        "coluna": pos[1] if pos else None,
+                        "rotulo": rotulo,
+                        "reparos_ampersand": 0,
                     }
-                    melhor_erro = erro
-                continue
+
+                    pontuacao = (
+                        int(estrutura["tem_mpd"]) * 4
+                        + int(estrutura["comeca_xml"]) * 2
+                        + int(estrutura["tem_adaptation"])
+                        + int(estrutura["tem_representation"])
+                    )
+                    if (
+                        melhor_estrutura is None
+                        or pontuacao > melhor_estrutura["pontuacao"]
+                    ):
+                        melhor_estrutura = {
+                            **estrutura,
+                            "pontuacao": pontuacao,
+                            "reparos_ampersand": 0,
+                        }
+                        melhor_erro = erro
+                    continue
             except Exception as e:
                 melhor_erro = {
                     "tipo": type(e).__name__,
                     "linha": None,
                     "coluna": None,
                     "rotulo": rotulo,
+                    "reparos_ampersand": 0,
                 }
                 melhor_estrutura = {
                     **estrutura,
                     "pontuacao": 0,
+                    "reparos_ampersand": 0,
                 }
                 continue
 
             assinatura_xml = hashlib.sha256(
-                candidato.encode("utf-8", errors="ignore")
+                candidato_usado.encode("utf-8", errors="ignore")
             ).hexdigest()
             if assinatura_xml not in vistos_xml:
                 vistos_xml.add(assinatura_xml)
                 manifests.append(
                     {
-                        "xml": candidato,
+                        "xml": candidato_usado,
                         "raiz": raiz,
-                        "decodificacao": rotulo,
+                        "decodificacao": rotulo_usado,
                     }
                 )
 
             logger.info(
                 "[FACEBOOK_DASH_DECODE_OK] "
                 f"origem={origem} indice={indice} "
-                f"decodificacao={rotulo} tamanho={len(candidato)}"
+                f"decodificacao={rotulo_usado} "
+                f"reparos_ampersand={reparos_ampersand} "
+                f"tamanho={len(candidato_usado)}"
             )
             parseou = True
             break
@@ -4713,6 +4785,7 @@ def diagnosticar_dash_manifest_facebook(texto_pagina, origem="desconhecida"):
                 f"escape_x={estrutura['escape_x']} "
                 f"entidade_lt={estrutura['entidade_lt']} "
                 f"backslash_quote={estrutura['backslash_quote']} "
+                f"reparos_ampersand={erro.get('reparos_ampersand', 0)} "
                 f"erro_tipo={erro['tipo']} "
                 f"erro_linha={erro['linha']} erro_coluna={erro['coluna']}"
             )
