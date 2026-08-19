@@ -4426,6 +4426,220 @@ def resumir_formatos_facebook(info, origem="desconhecida"):
 
 
 
+
+def diagnosticar_dash_manifest_facebook(texto_pagina, origem="desconhecida"):
+    """
+    Extrai e resume DASH manifests presentes no HTML/JSON do Facebook.
+
+    Segurança:
+    - não registra BaseURL;
+    - não registra query strings, tokens ou URLs assinadas;
+    - registra apenas contagens, codecs, mime types e bitrates.
+    """
+    import xml.etree.ElementTree as ET
+
+    texto = str(texto_pagina or "")
+    if not texto:
+        logger.info(
+            f"[FACEBOOK_DASH_DIAG] origem={origem} manifests=0 motivo=pagina_vazia"
+        )
+        return None
+
+    padroes = (
+        r'"dash_manifest"\s*:\s*("(?:\\.|[^"\\])*")',
+        r'"dash_manifest_xml_string"\s*:\s*("(?:\\.|[^"\\])*")',
+        r'"manifest_xml"\s*:\s*("(?:\\.|[^"\\])*")',
+    )
+
+    manifests = []
+    vistos = set()
+
+    for padrao in padroes:
+        for match in re.finditer(padrao, texto, flags=re.IGNORECASE):
+            bruto_json = match.group(1)
+            try:
+                valor = json.loads(bruto_json)
+            except Exception:
+                continue
+
+            if not isinstance(valor, str):
+                continue
+
+            valor = html.unescape(valor).strip()
+            if not valor:
+                continue
+
+            # Algumas páginas trazem o XML ainda escapado com \u003C/\u003E.
+            if "\\u003c" in valor.lower() or "\\u003e" in valor.lower():
+                try:
+                    valor = json.loads(f'"{valor.replace(chr(34), r"\"")}"')
+                except Exception:
+                    pass
+
+            if "<" not in valor or ">" not in valor:
+                continue
+
+            assinatura = hashlib.sha256(
+                valor.encode("utf-8", errors="ignore")
+            ).hexdigest()
+            if assinatura in vistos:
+                continue
+            vistos.add(assinatura)
+            manifests.append(valor)
+
+            if len(manifests) >= 20:
+                break
+
+        if len(manifests) >= 20:
+            break
+
+    total_audio = 0
+    total_video = 0
+    total_desconhecido = 0
+    manifests_parseados = 0
+    manifests_com_audio = 0
+    manifests_com_video = 0
+    baseurl_audio = 0
+    baseurl_video = 0
+    codecs_audio = set()
+    codecs_video = set()
+    mimes_audio = set()
+    mimes_video = set()
+    bitrates_audio = []
+    bitrates_video = []
+
+    def nome_local(tag):
+        return str(tag or "").split("}", 1)[-1].lower()
+
+    def classificar(mime_type, content_type, codecs):
+        mime = str(mime_type or "").lower()
+        content = str(content_type or "").lower()
+        codec = str(codecs or "").lower()
+
+        if (
+            "audio" in mime
+            or content == "audio"
+            or codec.startswith(("mp4a", "aac", "opus", "vorbis"))
+        ):
+            return "audio"
+
+        if (
+            "video" in mime
+            or content == "video"
+            or codec.startswith(("avc", "h264", "hev", "hvc", "vp9", "vp0", "av01"))
+        ):
+            return "video"
+
+        return "desconhecido"
+
+    for manifesto in manifests:
+        try:
+            raiz = ET.fromstring(manifesto)
+        except Exception:
+            continue
+
+        manifests_parseados += 1
+        manifesto_tem_audio = False
+        manifesto_tem_video = False
+
+        for adaptation in raiz.iter():
+            if nome_local(adaptation.tag) != "adaptationset":
+                continue
+
+            adapt_mime = adaptation.attrib.get("mimeType")
+            adapt_content = adaptation.attrib.get("contentType")
+            adapt_codecs = adaptation.attrib.get("codecs")
+
+            for rep in adaptation.iter():
+                if nome_local(rep.tag) != "representation":
+                    continue
+
+                mime = rep.attrib.get("mimeType") or adapt_mime
+                content = rep.attrib.get("contentType") or adapt_content
+                codecs = rep.attrib.get("codecs") or adapt_codecs
+                categoria = classificar(mime, content, codecs)
+
+                bandwidth = rep.attrib.get("bandwidth")
+                try:
+                    bandwidth = int(bandwidth) if bandwidth is not None else None
+                except (TypeError, ValueError):
+                    bandwidth = None
+
+                tem_baseurl = any(
+                    nome_local(filho.tag) == "baseurl"
+                    and bool(str(filho.text or "").strip())
+                    for filho in rep
+                )
+
+                if categoria == "audio":
+                    total_audio += 1
+                    manifesto_tem_audio = True
+                    if codecs:
+                        codecs_audio.add(str(codecs)[:80])
+                    if mime:
+                        mimes_audio.add(str(mime)[:80])
+                    if bandwidth:
+                        bitrates_audio.append(bandwidth)
+                    if tem_baseurl:
+                        baseurl_audio += 1
+
+                elif categoria == "video":
+                    total_video += 1
+                    manifesto_tem_video = True
+                    if codecs:
+                        codecs_video.add(str(codecs)[:80])
+                    if mime:
+                        mimes_video.add(str(mime)[:80])
+                    if bandwidth:
+                        bitrates_video.append(bandwidth)
+                    if tem_baseurl:
+                        baseurl_video += 1
+
+                else:
+                    total_desconhecido += 1
+
+        if manifesto_tem_audio:
+            manifests_com_audio += 1
+        if manifesto_tem_video:
+            manifests_com_video += 1
+
+    def resumir_conjunto(valores, limite=6):
+        if not valores:
+            return "nenhum"
+        return ",".join(sorted(valores)[:limite])
+
+    logger.info(
+        "[FACEBOOK_DASH_DIAG] "
+        f"origem={origem} "
+        f"manifests_encontrados={len(manifests)} "
+        f"manifests_parseados={manifests_parseados} "
+        f"manifests_com_audio={manifests_com_audio} "
+        f"manifests_com_video={manifests_com_video} "
+        f"audio_representations={total_audio} "
+        f"video_representations={total_video} "
+        f"desconhecidas={total_desconhecido} "
+        f"audio_baseurl={baseurl_audio} "
+        f"video_baseurl={baseurl_video} "
+        f"audio_codecs={resumir_conjunto(codecs_audio)} "
+        f"video_codecs={resumir_conjunto(codecs_video)} "
+        f"audio_mimes={resumir_conjunto(mimes_audio)} "
+        f"video_mimes={resumir_conjunto(mimes_video)} "
+        f"audio_bitrate_max={max(bitrates_audio) if bitrates_audio else 0} "
+        f"video_bitrate_max={max(bitrates_video) if bitrates_video else 0}"
+    )
+
+    return {
+        "manifests_encontrados": len(manifests),
+        "manifests_parseados": manifests_parseados,
+        "audio_representations": total_audio,
+        "video_representations": total_video,
+        "audio_baseurl": baseurl_audio,
+        "video_baseurl": baseurl_video,
+        "audio_codecs": sorted(codecs_audio),
+        "video_codecs": sorted(codecs_video),
+    }
+
+
 def diagnosticar_pagina_facebook_audio(url, origem="desconhecida"):
     """
     Diagnóstico somente de metadados da página pública do Facebook.
@@ -4470,6 +4684,11 @@ def diagnosticar_pagina_facebook_audio(url, origem="desconhecida"):
         # Decodifica apenas entidades HTML. Não loga valores encontrados.
         texto_busca = html.unescape(texto)
         texto_lower = texto_busca.lower()
+
+        diagnosticar_dash_manifest_facebook(
+            texto_busca,
+            origem=origem,
+        )
 
         def contar_literal(*marcadores):
             return sum(texto_lower.count(str(m).lower()) for m in marcadores)
