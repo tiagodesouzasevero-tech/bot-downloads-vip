@@ -4429,19 +4429,22 @@ def resumir_formatos_facebook(info, origem="desconhecida"):
 
 def diagnosticar_dash_manifest_facebook(texto_pagina, origem="desconhecida"):
     """
-    Extrai e resume DASH manifests presentes no HTML/JSON do Facebook.
+    Extrai, decodifica e resume DASH manifests presentes no HTML/JSON do Facebook.
 
     Segurança:
     - não registra BaseURL;
     - não registra query strings, tokens ou URLs assinadas;
-    - registra apenas contagens, codecs, mime types e bitrates.
+    - não registra XML bruto;
+    - registra apenas estrutura, contagens, codecs, mime types, bitrates
+      e o tipo de transformação necessária para o XML ficar válido.
     """
     import xml.etree.ElementTree as ET
 
     texto = str(texto_pagina or "")
     if not texto:
         logger.info(
-            f"[FACEBOOK_DASH_DIAG] origem={origem} manifests=0 motivo=pagina_vazia"
+            f"[FACEBOOK_DASH_DIAG] origem={origem} manifests_encontrados=0 "
+            "motivo=pagina_vazia"
         )
         return None
 
@@ -4451,52 +4454,273 @@ def diagnosticar_dash_manifest_facebook(texto_pagina, origem="desconhecida"):
         r'"manifest_xml"\s*:\s*("(?:\\.|[^"\\])*")',
     )
 
-    manifests = []
-    vistos = set()
+    valores_brutos = []
+    vistos_brutos = set()
 
     for padrao in padroes:
         for match in re.finditer(padrao, texto, flags=re.IGNORECASE):
             bruto_json = match.group(1)
-            try:
-                valor = json.loads(bruto_json)
-            except Exception:
-                continue
-
-            if not isinstance(valor, str):
-                continue
-
-            valor = html.unescape(valor).strip()
-            if not valor:
-                continue
-
-            # Algumas páginas trazem o XML ainda escapado com \u003C/\u003E.
-            if "\\u003c" in valor.lower() or "\\u003e" in valor.lower():
-                try:
-                    valor = json.loads(f'"{valor.replace(chr(34), r"\"")}"')
-                except Exception:
-                    pass
-
-            if "<" not in valor or ">" not in valor:
-                continue
-
             assinatura = hashlib.sha256(
-                valor.encode("utf-8", errors="ignore")
+                bruto_json.encode("utf-8", errors="ignore")
             ).hexdigest()
-            if assinatura in vistos:
+            if assinatura in vistos_brutos:
                 continue
-            vistos.add(assinatura)
-            manifests.append(valor)
+            vistos_brutos.add(assinatura)
+            valores_brutos.append(bruto_json)
 
-            if len(manifests) >= 20:
+            if len(valores_brutos) >= 20:
                 break
 
-        if len(manifests) >= 20:
+        if len(valores_brutos) >= 20:
             break
+
+    def substituir_escape_unicode(match):
+        try:
+            return chr(int(match.group(1), 16))
+        except Exception:
+            return match.group(0)
+
+    def substituir_escape_hex(match):
+        try:
+            return chr(int(match.group(1), 16))
+        except Exception:
+            return match.group(0)
+
+    def desescapar_camadas(valor):
+        """
+        Produz candidatos progressivamente decodificados, sem executar código
+        e sem reinterpretar bytes arbitrariamente.
+        """
+        candidatos = []
+        vistos = set()
+
+        def adicionar(rotulo, candidato):
+            if not isinstance(candidato, str):
+                return
+            candidato = candidato.strip()
+            if not candidato:
+                return
+            chave = hashlib.sha256(
+                candidato.encode("utf-8", errors="ignore")
+            ).hexdigest()
+            if chave in vistos:
+                return
+            vistos.add(chave)
+            candidatos.append((rotulo, candidato))
+
+        try:
+            valor = json.loads(valor)
+            adicionar("json1", valor)
+        except Exception:
+            adicionar("bruto", valor)
+
+        for _ in range(5):
+            snapshot = list(candidatos)
+            mudou = False
+
+            for rotulo, atual in snapshot:
+                transformacoes = []
+
+                html_dec = html.unescape(atual)
+                if html_dec != atual:
+                    transformacoes.append((rotulo + "+html", html_dec))
+
+                js_dec = re.sub(
+                    r"\\u([0-9a-fA-F]{4})",
+                    substituir_escape_unicode,
+                    atual,
+                )
+                js_dec = re.sub(
+                    r"\\x([0-9a-fA-F]{2})",
+                    substituir_escape_hex,
+                    js_dec,
+                )
+                js_dec = js_dec.replace("\\/", "/")
+                js_dec = js_dec.replace('\\"', '"')
+                js_dec = js_dec.replace("\\'", "'")
+                js_dec = js_dec.replace("\\\\", "\\")
+                if js_dec != atual:
+                    transformacoes.append((rotulo + "+js", js_dec))
+
+                texto_strip = atual.strip()
+                if (
+                    len(texto_strip) >= 2
+                    and texto_strip[0] == '"'
+                    and texto_strip[-1] == '"'
+                ):
+                    try:
+                        json_dec = json.loads(texto_strip)
+                        if isinstance(json_dec, str) and json_dec != atual:
+                            transformacoes.append((rotulo + "+json", json_dec))
+                    except Exception:
+                        pass
+
+                for novo_rotulo, novo_valor in transformacoes:
+                    antes = len(candidatos)
+                    adicionar(novo_rotulo, novo_valor)
+                    if len(candidatos) > antes:
+                        mudou = True
+
+            if not mudou:
+                break
+
+        snapshot = list(candidatos)
+        for rotulo, atual in snapshot:
+            inicio_mpd = re.search(
+                r"<(?:[A-Za-z_][\w.-]*:)?MPD\b",
+                atual,
+                flags=re.IGNORECASE,
+            )
+            fim_mpd = list(
+                re.finditer(
+                    r"</(?:[A-Za-z_][\w.-]*:)?MPD\s*>",
+                    atual,
+                    flags=re.IGNORECASE,
+                )
+            )
+            if inicio_mpd and fim_mpd:
+                ultimo = fim_mpd[-1]
+                if ultimo.end() > inicio_mpd.start():
+                    adicionar(
+                        rotulo + "+recorte_mpd",
+                        atual[inicio_mpd.start():ultimo.end()],
+                    )
+
+        return candidatos
+
+    manifests = []
+    manifests_invalidos = []
+    vistos_xml = set()
+
+    for indice, bruto_json in enumerate(valores_brutos, start=1):
+        candidatos = desescapar_camadas(bruto_json)
+        parseou = False
+        melhor_erro = None
+        melhor_estrutura = None
+
+        for rotulo, candidato in candidatos:
+            estrutura = {
+                "rotulo": rotulo,
+                "len": len(candidato),
+                "comeca_xml": candidato.lstrip().startswith("<"),
+                "tem_mpd": bool(re.search(
+                    r"<(?:[A-Za-z_][\w.-]*:)?MPD\b",
+                    candidato,
+                    flags=re.IGNORECASE,
+                )),
+                "tem_adaptation": "adaptationset" in candidato.lower(),
+                "tem_representation": "representation" in candidato.lower(),
+                "escape_u": len(re.findall(r"\\u[0-9a-fA-F]{4}", candidato)),
+                "escape_x": len(re.findall(r"\\x[0-9a-fA-F]{2}", candidato)),
+                "entidade_lt": candidato.lower().count("&lt;"),
+                "backslash_quote": candidato.count('\\"'),
+            }
+
+            try:
+                raiz = ET.fromstring(candidato)
+            except ET.ParseError as e:
+                pos = getattr(e, "position", None)
+                erro = {
+                    "tipo": type(e).__name__,
+                    "linha": pos[0] if pos else None,
+                    "coluna": pos[1] if pos else None,
+                    "rotulo": rotulo,
+                }
+
+                pontuacao = (
+                    int(estrutura["tem_mpd"]) * 4
+                    + int(estrutura["comeca_xml"]) * 2
+                    + int(estrutura["tem_adaptation"])
+                    + int(estrutura["tem_representation"])
+                )
+                if (
+                    melhor_estrutura is None
+                    or pontuacao > melhor_estrutura["pontuacao"]
+                ):
+                    melhor_estrutura = {
+                        **estrutura,
+                        "pontuacao": pontuacao,
+                    }
+                    melhor_erro = erro
+                continue
+            except Exception as e:
+                melhor_erro = {
+                    "tipo": type(e).__name__,
+                    "linha": None,
+                    "coluna": None,
+                    "rotulo": rotulo,
+                }
+                melhor_estrutura = {
+                    **estrutura,
+                    "pontuacao": 0,
+                }
+                continue
+
+            assinatura_xml = hashlib.sha256(
+                candidato.encode("utf-8", errors="ignore")
+            ).hexdigest()
+            if assinatura_xml not in vistos_xml:
+                vistos_xml.add(assinatura_xml)
+                manifests.append(
+                    {
+                        "xml": candidato,
+                        "raiz": raiz,
+                        "decodificacao": rotulo,
+                    }
+                )
+
+            logger.info(
+                "[FACEBOOK_DASH_DECODE_OK] "
+                f"origem={origem} indice={indice} "
+                f"decodificacao={rotulo} tamanho={len(candidato)}"
+            )
+            parseou = True
+            break
+
+        if not parseou:
+            estrutura = melhor_estrutura or {
+                "rotulo": "nenhum",
+                "len": 0,
+                "comeca_xml": False,
+                "tem_mpd": False,
+                "tem_adaptation": False,
+                "tem_representation": False,
+                "escape_u": 0,
+                "escape_x": 0,
+                "entidade_lt": 0,
+                "backslash_quote": 0,
+                "pontuacao": 0,
+            }
+            erro = melhor_erro or {
+                "tipo": "sem_candidato_xml",
+                "linha": None,
+                "coluna": None,
+                "rotulo": estrutura["rotulo"],
+            }
+            manifests_invalidos.append((indice, estrutura, erro))
+
+            logger.info(
+                "[FACEBOOK_DASH_DECODE_FALHA] "
+                f"origem={origem} indice={indice} "
+                f"candidatos={len(candidatos)} "
+                f"melhor={estrutura['rotulo']} "
+                f"tamanho={estrutura['len']} "
+                f"comeca_xml={estrutura['comeca_xml']} "
+                f"tem_mpd={estrutura['tem_mpd']} "
+                f"tem_adaptation={estrutura['tem_adaptation']} "
+                f"tem_representation={estrutura['tem_representation']} "
+                f"escape_u={estrutura['escape_u']} "
+                f"escape_x={estrutura['escape_x']} "
+                f"entidade_lt={estrutura['entidade_lt']} "
+                f"backslash_quote={estrutura['backslash_quote']} "
+                f"erro_tipo={erro['tipo']} "
+                f"erro_linha={erro['linha']} erro_coluna={erro['coluna']}"
+            )
 
     total_audio = 0
     total_video = 0
     total_desconhecido = 0
-    manifests_parseados = 0
+    manifests_parseados = len(manifests)
     manifests_com_audio = 0
     manifests_com_video = 0
     baseurl_audio = 0
@@ -4507,6 +4731,7 @@ def diagnosticar_dash_manifest_facebook(texto_pagina, origem="desconhecida"):
     mimes_video = set()
     bitrates_audio = []
     bitrates_video = []
+    decodificacoes_ok = set()
 
     def nome_local(tag):
         return str(tag or "").split("}", 1)[-1].lower()
@@ -4526,19 +4751,17 @@ def diagnosticar_dash_manifest_facebook(texto_pagina, origem="desconhecida"):
         if (
             "video" in mime
             or content == "video"
-            or codec.startswith(("avc", "h264", "hev", "hvc", "vp9", "vp0", "av01"))
+            or codec.startswith(
+                ("avc", "h264", "hev", "hvc", "vp9", "vp0", "av01")
+            )
         ):
             return "video"
 
         return "desconhecido"
 
     for manifesto in manifests:
-        try:
-            raiz = ET.fromstring(manifesto)
-        except Exception:
-            continue
-
-        manifests_parseados += 1
+        raiz = manifesto["raiz"]
+        decodificacoes_ok.add(manifesto["decodificacao"])
         manifesto_tem_audio = False
         manifesto_tem_video = False
 
@@ -4546,22 +4769,40 @@ def diagnosticar_dash_manifest_facebook(texto_pagina, origem="desconhecida"):
             if nome_local(adaptation.tag) != "adaptationset":
                 continue
 
-            adapt_mime = adaptation.attrib.get("mimeType")
-            adapt_content = adaptation.attrib.get("contentType")
+            adapt_mime = (
+                adaptation.attrib.get("mimeType")
+                or adaptation.attrib.get("mimetype")
+            )
+            adapt_content = (
+                adaptation.attrib.get("contentType")
+                or adaptation.attrib.get("contenttype")
+            )
             adapt_codecs = adaptation.attrib.get("codecs")
 
             for rep in adaptation.iter():
                 if nome_local(rep.tag) != "representation":
                     continue
 
-                mime = rep.attrib.get("mimeType") or adapt_mime
-                content = rep.attrib.get("contentType") or adapt_content
+                mime = (
+                    rep.attrib.get("mimeType")
+                    or rep.attrib.get("mimetype")
+                    or adapt_mime
+                )
+                content = (
+                    rep.attrib.get("contentType")
+                    or rep.attrib.get("contenttype")
+                    or adapt_content
+                )
                 codecs = rep.attrib.get("codecs") or adapt_codecs
                 categoria = classificar(mime, content, codecs)
 
                 bandwidth = rep.attrib.get("bandwidth")
                 try:
-                    bandwidth = int(bandwidth) if bandwidth is not None else None
+                    bandwidth = (
+                        int(float(bandwidth))
+                        if bandwidth is not None
+                        else None
+                    )
                 except (TypeError, ValueError):
                     bandwidth = None
 
@@ -4611,8 +4852,10 @@ def diagnosticar_dash_manifest_facebook(texto_pagina, origem="desconhecida"):
     logger.info(
         "[FACEBOOK_DASH_DIAG] "
         f"origem={origem} "
-        f"manifests_encontrados={len(manifests)} "
+        f"manifests_encontrados={len(valores_brutos)} "
         f"manifests_parseados={manifests_parseados} "
+        f"manifests_invalidos={len(manifests_invalidos)} "
+        f"decodificacoes_ok={resumir_conjunto(decodificacoes_ok)} "
         f"manifests_com_audio={manifests_com_audio} "
         f"manifests_com_video={manifests_com_video} "
         f"audio_representations={total_audio} "
@@ -4629,14 +4872,16 @@ def diagnosticar_dash_manifest_facebook(texto_pagina, origem="desconhecida"):
     )
 
     return {
-        "manifests_encontrados": len(manifests),
+        "manifests_encontrados": len(valores_brutos),
         "manifests_parseados": manifests_parseados,
+        "manifests_invalidos": len(manifests_invalidos),
         "audio_representations": total_audio,
         "video_representations": total_video,
         "audio_baseurl": baseurl_audio,
         "video_baseurl": baseurl_video,
         "audio_codecs": sorted(codecs_audio),
         "video_codecs": sorted(codecs_video),
+        "decodificacoes_ok": sorted(decodificacoes_ok),
     }
 
 
