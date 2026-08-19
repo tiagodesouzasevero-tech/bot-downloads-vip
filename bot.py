@@ -4365,7 +4365,14 @@ def extrair_id_facebook_para_fallback(info, url):
 
 
 def extrair_info_facebook_com_fallback(url):
-    """Exige áudio e tenta uma segunda página pública oficial quando necessário."""
+    """
+    Prefere uma origem pública com áudio confirmado.
+
+    True  -> áudio confirmado: usa a origem.
+    False -> sem áudio confirmado: tenta a página pública alternativa.
+    None  -> metadados inconclusivos: deixa o download seguir para que
+             o ffprobe confirme o áudio no arquivo real.
+    """
     primeiro_info = None
     ultimo_erro = None
 
@@ -4389,9 +4396,21 @@ def extrair_info_facebook_com_fallback(url):
         )
 
     audio_primeira_consulta = info_plataforma_indica_audio(primeiro_info)
+
     if audio_primeira_consulta is True:
         return primeiro_info
 
+    # Metadados inconclusivos não significam ausência de áudio.
+    # O arquivo real será validado depois com ffprobe.
+    if audio_primeira_consulta is None and primeiro_info is not None:
+        logger.info(
+            "[FACEBOOK_REELS_INFO_AUDIO_INCONCLUSIVO] "
+            "modo=reel_publico proxima_etapa=ffprobe"
+        )
+        return primeiro_info
+
+    # Só chegamos ao fallback quando os metadados realmente indicam
+    # ausência de áudio ou quando a primeira extração falhou.
     video_id = extrair_id_facebook_para_fallback(primeiro_info, url)
     if not video_id:
         logger.warning(
@@ -4407,6 +4426,7 @@ def extrair_info_facebook_com_fallback(url):
         "https://www.facebook.com/photo.php?"
         f"{urlencode({'fbid': video_id})}"
     )
+
     logger.warning(
         "[FACEBOOK_REELS_INFO_SEM_AUDIO] modo=reel_publico "
         f"audio_disponivel={audio_primeira_consulta} "
@@ -4437,10 +4457,20 @@ def extrair_info_facebook_com_fallback(url):
         raise RuntimeError("FACEBOOK_AUDIO_INDISPONIVEL_PUBLICO") from e
 
     audio_alternativo = info_plataforma_indica_audio(info_alternativa)
+
     if audio_alternativo is True:
         logger.info(
             "[FACEBOOK_REELS_INFO_FALLBACK_OK] "
             "modo=pagina_publica_alternativa audio_disponivel=True"
+        )
+        return info_alternativa
+
+    # Também não rejeita a página alternativa quando os metadados
+    # forem inconclusivos. O ffprobe decide depois.
+    if audio_alternativo is None:
+        logger.info(
+            "[FACEBOOK_REELS_INFO_AUDIO_INCONCLUSIVO] "
+            "modo=pagina_publica_alternativa proxima_etapa=ffprobe"
         )
         return info_alternativa
 
@@ -4450,7 +4480,6 @@ def extrair_info_facebook_com_fallback(url):
         f"audio_disponivel={audio_alternativo} fallback_disponivel=False"
     )
     raise RuntimeError("FACEBOOK_AUDIO_INDISPONIVEL_PUBLICO")
-
 
 def resumir_formatos_instagram(info):
     """Registra codecs/formats sem expor URLs assinadas do Instagram."""
@@ -11106,7 +11135,7 @@ def _processar_download(message, url, status_msg, reserva_download=None):
                 "[FACEBOOK_REELS_AUDIO_INFO] "
                 f"audio_disponivel={audio_facebook_esperado}"
             )
-            if audio_facebook_esperado is not True:
+            if audio_facebook_esperado is False:
                 raise FalhaComponenteDownload(
                     plataforma,
                     "FACEBOOK_AUDIO_INDISPONIVEL_PUBLICO",
