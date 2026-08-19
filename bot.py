@@ -5093,6 +5093,347 @@ def diagnosticar_dash_manifest_facebook(texto_pagina, origem="desconhecida"):
     }
 
 
+
+def diagnosticar_correlacao_manifests_facebook(
+    texto_pagina,
+    resultado_dash=None,
+    origem="desconhecida",
+):
+    """
+    Correlaciona cada DASH manifest com sinais do objeto/JSON ao redor.
+
+    Objetivo:
+    - descobrir se manifests com durações diferentes pertencem ao mesmo vídeo;
+    - localizar sinais de áudio/VideoDelivery próximos ao manifest completo;
+    - detectar IDs próximos sem expor os valores reais.
+
+    Segurança:
+    - não registra HTML/JSON bruto;
+    - não registra URLs, BaseURL, query strings ou tokens;
+    - IDs encontrados são convertidos em referências HMAC irreversíveis.
+    """
+    texto = str(texto_pagina or "")
+    if not texto:
+        logger.info(
+            f"[FACEBOOK_DASH_CORRELACAO] origem={origem} manifests=0 motivo=pagina_vazia"
+        )
+        return None
+
+    padroes = (
+        r'"dash_manifest"\s*:\s*("(?:\\.|[^"\\])*")',
+        r'"dash_manifest_xml_string"\s*:\s*("(?:\\.|[^"\\])*")',
+        r'"manifest_xml"\s*:\s*("(?:\\.|[^"\\])*")',
+    )
+
+    ocorrencias = []
+    vistos = set()
+
+    # Mantém a mesma ordem lógica usada pelo parser DASH.
+    for padrao in padroes:
+        for match in re.finditer(padrao, texto, flags=re.IGNORECASE):
+            bruto = match.group(1)
+            assinatura = hashlib.sha256(
+                bruto.encode("utf-8", errors="ignore")
+            ).hexdigest()
+            if assinatura in vistos:
+                continue
+            vistos.add(assinatura)
+            ocorrencias.append(
+                {
+                    "inicio": match.start(),
+                    "fim": match.end(),
+                    "assinatura": assinatura,
+                }
+            )
+            if len(ocorrencias) >= 20:
+                break
+        if len(ocorrencias) >= 20:
+            break
+
+    diagnosticos = {}
+    for item in (resultado_dash or {}).get("_diagnosticos_manifestos", []):
+        try:
+            indice = int(item.get("manifesto"))
+        except (TypeError, ValueError):
+            continue
+        diagnosticos[indice] = item
+
+    def refs_ids_contexto(contexto, chaves, tipo, limite=5):
+        referencias = []
+        vistos_local = set()
+
+        for chave in chaves:
+            padrao = (
+                r'["\']'
+                + re.escape(chave)
+                + r'["\']\s*[:=]\s*["\']?([0-9]{5,30})'
+            )
+            for match in re.finditer(
+                padrao,
+                contexto,
+                flags=re.IGNORECASE,
+            ):
+                valor = match.group(1)
+                if valor in vistos_local:
+                    continue
+                vistos_local.add(valor)
+                referencias.append(
+                    referencia_privada_log(tipo, valor, tamanho=10)
+                )
+                if len(referencias) >= limite:
+                    return referencias
+
+        return referencias
+
+    def duracoes_contexto(contexto, limite=8):
+        valores = []
+
+        padroes_duracao = (
+            r'["\'](?:duration|playable_duration|video_duration)["\']\s*[:=]\s*([0-9]+(?:\.[0-9]+)?)',
+            r'["\'](?:duration_ms|playable_duration_in_ms|video_duration_ms)["\']\s*[:=]\s*([0-9]+(?:\.[0-9]+)?)',
+        )
+
+        for indice_padrao, padrao in enumerate(padroes_duracao):
+            for match in re.finditer(
+                padrao,
+                contexto,
+                flags=re.IGNORECASE,
+            ):
+                try:
+                    valor = float(match.group(1))
+                except (TypeError, ValueError):
+                    continue
+
+                # Segundo padrão representa milissegundos.
+                if indice_padrao == 1 and valor > 1000:
+                    valor /= 1000.0
+
+                if valor <= 0 or valor > 24 * 3600:
+                    continue
+
+                arredondado = round(valor, 3)
+                if arredondado not in valores:
+                    valores.append(arredondado)
+
+                if len(valores) >= limite:
+                    return valores
+
+        return valores
+
+    def distancia_minima(texto_total, pos_manifesto, marcadores, raio=12000):
+        inicio = max(0, pos_manifesto - raio)
+        fim = min(len(texto_total), pos_manifesto + raio)
+        trecho = texto_total[inicio:fim]
+        pos_local_manifesto = pos_manifesto - inicio
+        melhor = None
+
+        for marcador_local in marcadores:
+            for match in re.finditer(
+                re.escape(marcador_local),
+                trecho,
+                flags=re.IGNORECASE,
+            ):
+                distancia = abs(match.start() - pos_local_manifesto)
+                if melhor is None or distancia < melhor:
+                    melhor = distancia
+
+        return melhor
+
+    resultados = []
+
+    for indice, ocorrencia in enumerate(ocorrencias, start=1):
+        # Contexto grande o bastante para capturar o objeto Relay/VideoDelivery
+        # ao redor, mas o conteúdo jamais é gravado.
+        antes = 9000
+        depois = 5000
+        inicio_ctx = max(0, ocorrencia["inicio"] - antes)
+        fim_ctx = min(len(texto), ocorrencia["fim"] + depois)
+        contexto = texto[inicio_ctx:fim_ctx]
+        contexto_lower = contexto.lower()
+
+        video_refs = refs_ids_contexto(
+            contexto,
+            (
+                "video_id",
+                "videoid",
+                "videoId",
+                "video_id_str",
+                "legacy_fbid",
+                "story_fbid",
+                "media_id",
+                "mediaId",
+            ),
+            "fbvid",
+        )
+
+        audio_refs = refs_ids_contexto(
+            contexto,
+            (
+                "audio_id",
+                "audioid",
+                "audioId",
+                "audio_asset_id",
+                "audioAssetId",
+                "music_id",
+                "musicId",
+                "original_audio_id",
+                "originalAudioId",
+            ),
+            "fbaud",
+        )
+
+        codecs_contexto = sorted(
+            {
+                valor.lower()
+                for valor in re.findall(
+                    r"mp4a\.40\.\d+",
+                    contexto,
+                    flags=re.IGNORECASE,
+                )
+            }
+        )[:6]
+
+        duracoes = duracoes_contexto(contexto)
+
+        sinais = {
+            "video_delivery": sum(
+                contexto_lower.count(item)
+                for item in (
+                    "videodeliveryresponsefragment",
+                    "videodeliveryresponseresult",
+                    "videodeliveryresponse",
+                )
+            ),
+            "audio_mime": sum(
+                contexto_lower.count(item)
+                for item in (
+                    'audio/mp4',
+                    '"mimetype":"audio',
+                    '"mime_type":"audio',
+                    'contenttype="audio',
+                )
+            ),
+            "audio_codec": contexto_lower.count("mp4a.40"),
+            "browser_native": sum(
+                contexto_lower.count(item)
+                for item in (
+                    "browser_native_hd_url",
+                    "browser_native_sd_url",
+                )
+            ),
+            "playable": sum(
+                contexto_lower.count(item)
+                for item in (
+                    "playable_url",
+                    "playable_url_quality_hd",
+                    "playable_url_dash",
+                )
+            ),
+            "relay": sum(
+                contexto_lower.count(item)
+                for item in (
+                    "relayprefetchedstreamcache",
+                    "data-sjs",
+                )
+            ),
+        }
+
+        diag = diagnosticos.get(indice) or {}
+        duracao_manifesto = diag.get("duracao")
+        audio_manifesto = int(diag.get("audio_representations") or 0)
+        video_manifesto = int(diag.get("video_representations") or 0)
+
+        # Referência do contexto inteiro para comparar estabilidade entre testes,
+        # sem permitir recuperar o conteúdo.
+        contexto_ref = referencia_privada_log(
+            "fbctx",
+            hashlib.sha256(
+                contexto.encode("utf-8", errors="ignore")
+            ).hexdigest(),
+            tamanho=10,
+        )
+
+        dist_video_delivery = distancia_minima(
+            texto,
+            ocorrencia["inicio"],
+            (
+                "VideoDeliveryResponseFragment",
+                "videoDeliveryResponseResult",
+                "videoDeliveryResponse",
+            ),
+        )
+        dist_audio_codec = distancia_minima(
+            texto,
+            ocorrencia["inicio"],
+            ("mp4a.40", "audio/mp4"),
+        )
+
+        resultado = {
+            "manifesto": indice,
+            "duracao": duracao_manifesto,
+            "audio_representations": audio_manifesto,
+            "video_representations": video_manifesto,
+            "video_refs": video_refs,
+            "audio_refs": audio_refs,
+            "codecs_contexto": codecs_contexto,
+            "duracoes_contexto": duracoes,
+            "sinais": sinais,
+            "contexto_ref": contexto_ref,
+            "dist_video_delivery": dist_video_delivery,
+            "dist_audio_codec": dist_audio_codec,
+        }
+        resultados.append(resultado)
+
+        logger.info(
+            "[FACEBOOK_DASH_CORRELACAO] "
+            f"origem={origem} "
+            f"manifesto={indice} "
+            f"duracao={duracao_manifesto} "
+            f"audio_representations={audio_manifesto} "
+            f"video_representations={video_manifesto} "
+            f"contexto_ref={contexto_ref} "
+            f"video_refs={','.join(video_refs) if video_refs else 'nenhum'} "
+            f"audio_refs={','.join(audio_refs) if audio_refs else 'nenhum'} "
+            f"codecs_proximos={','.join(codecs_contexto) if codecs_contexto else 'nenhum'} "
+            f"duracoes_proximas={','.join(str(v) for v in duracoes) if duracoes else 'nenhum'} "
+            f"video_delivery={sinais['video_delivery']} "
+            f"audio_mime={sinais['audio_mime']} "
+            f"audio_codec={sinais['audio_codec']} "
+            f"browser_native={sinais['browser_native']} "
+            f"playable={sinais['playable']} "
+            f"relay={sinais['relay']} "
+            f"dist_video_delivery={dist_video_delivery} "
+            f"dist_audio_codec={dist_audio_codec}"
+        )
+
+    # Detecta automaticamente pares que compartilham pelo menos uma referência
+    # de vídeo próxima. Isso é apenas diagnóstico.
+    for i, atual in enumerate(resultados):
+        refs_atual = set(atual.get("video_refs") or [])
+        if not refs_atual:
+            continue
+
+        for outro in resultados[i + 1:]:
+            refs_outro = set(outro.get("video_refs") or [])
+            comuns = sorted(refs_atual & refs_outro)
+            if not comuns:
+                continue
+
+            logger.info(
+                "[FACEBOOK_DASH_CORRELACAO_PAR] "
+                f"origem={origem} "
+                f"manifesto_a={atual['manifesto']} "
+                f"duracao_a={atual.get('duracao')} "
+                f"audio_a={atual.get('audio_representations')} "
+                f"manifesto_b={outro['manifesto']} "
+                f"duracao_b={outro.get('duracao')} "
+                f"audio_b={outro.get('audio_representations')} "
+                f"video_refs_comuns={','.join(comuns[:3])}"
+            )
+
+    return resultados
+
+
 def diagnosticar_pagina_facebook_audio(url, origem="desconhecida"):
     """
     Diagnóstico somente de metadados da página pública do Facebook.
@@ -5138,8 +5479,14 @@ def diagnosticar_pagina_facebook_audio(url, origem="desconhecida"):
         texto_busca = html.unescape(texto)
         texto_lower = texto_busca.lower()
 
-        diagnosticar_dash_manifest_facebook(
+        resultado_dash = diagnosticar_dash_manifest_facebook(
             texto_busca,
+            origem=origem,
+        )
+
+        diagnosticar_correlacao_manifests_facebook(
+            texto_busca,
+            resultado_dash=resultado_dash,
             origem=origem,
         )
 
