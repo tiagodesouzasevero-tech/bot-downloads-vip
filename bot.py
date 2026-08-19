@@ -4480,7 +4480,14 @@ def extrair_info_facebook_com_fallback(url):
             f"audio_disponivel={audio_primeira_consulta} "
             "fallback_disponivel=False"
         )
-        if primeiro_info is None and ultimo_erro is not None:
+        if primeiro_info is not None:
+            logger.info(
+                "[FACEBOOK_REELS_PROBE_REAL] "
+                "origem=reel_publico motivo=metadata_sem_audio "
+                "proxima_etapa=baixar_hd_sd_e_ffprobe"
+            )
+            return primeiro_info
+        if ultimo_erro is not None:
             raise ultimo_erro
         raise RuntimeError("FACEBOOK_AUDIO_INDISPONIVEL_PUBLICO")
 
@@ -4520,6 +4527,13 @@ def extrair_info_facebook_com_fallback(url):
             f"url_ref={referencia_url_log(url_alternativa)} "
             f"erro={sanitizar_erro_log(e)}"
         )
+        if primeiro_info is not None:
+            logger.info(
+                "[FACEBOOK_REELS_PROBE_REAL] "
+                "origem=reel_publico motivo=fallback_falhou "
+                "proxima_etapa=baixar_hd_sd_e_ffprobe"
+            )
+            return primeiro_info
         raise RuntimeError("FACEBOOK_AUDIO_INDISPONIVEL_PUBLICO") from e
 
     audio_alternativo = info_plataforma_indica_audio(info_alternativa)
@@ -4545,7 +4559,12 @@ def extrair_info_facebook_com_fallback(url):
         "modo=pagina_publica_alternativa "
         f"audio_disponivel={audio_alternativo} fallback_disponivel=False"
     )
-    raise RuntimeError("FACEBOOK_AUDIO_INDISPONIVEL_PUBLICO")
+    logger.info(
+        "[FACEBOOK_REELS_PROBE_REAL] "
+        "origem=pagina_publica_alternativa motivo=metadata_sem_audio "
+        "proxima_etapa=baixar_hd_sd_e_ffprobe"
+    )
+    return info_alternativa
 
 def resumir_formatos_instagram(info):
     """Registra codecs/formats sem expor URLs assinadas do Instagram."""
@@ -4575,6 +4594,49 @@ def resumir_formatos_instagram(info):
         f"[INSTAGRAM_FORMATOS] total={len(formatos)} "
         f"itens={' '.join(resumo)[:3500]}"
     )
+
+
+
+def formatos_progressivos_facebook(info):
+    """
+    Prioriza os MP4 progressivos 'hd' e 'sd' do Facebook.
+
+    O Facebook pode publicar esses formatos com acodec/vcodec ausentes nos
+    metadados. Por isso não confiamos apenas no campo acodec: o arquivo é
+    baixado e o ffprobe confirma se existe áudio real.
+    """
+    formatos = (info or {}).get("formats") if isinstance(info, dict) else None
+    if not isinstance(formatos, list):
+        return []
+
+    por_id = {}
+    for item in formatos:
+        if not isinstance(item, dict):
+            continue
+        format_id = str(item.get("format_id") or "").strip()
+        if not format_id:
+            continue
+        por_id.setdefault(format_id.lower(), item)
+
+    candidatos = []
+    for preferido in ("hd", "sd"):
+        item = por_id.get(preferido)
+        if not item:
+            continue
+        if str(item.get("ext") or "").strip().lower() != "mp4":
+            continue
+        candidatos.append(str(item.get("format_id")))
+
+    if candidatos:
+        logger.info(
+            "[FACEBOOK_PROGRESSIVOS] "
+            f"candidatos={','.join(candidatos)} "
+            "validacao=ffprobe"
+        )
+    else:
+        logger.info("[FACEBOOK_PROGRESSIVOS] candidatos=nenhum")
+
+    return candidatos
 
 
 def formatos_progressivos_instagram(info):
@@ -11202,9 +11264,9 @@ def _processar_download(message, url, status_msg, reserva_download=None):
                 f"audio_disponivel={audio_facebook_esperado}"
             )
             if audio_facebook_esperado is False:
-                raise FalhaComponenteDownload(
-                    plataforma,
-                    "FACEBOOK_AUDIO_INDISPONIVEL_PUBLICO",
+                logger.info(
+                    "[FACEBOOK_REELS_PROBE_REAL] "
+                    "metadata=False acao=testar_arquivo_real_com_ffprobe"
                 )
 
         duracao = info.get("duration")
@@ -11267,12 +11329,19 @@ def _processar_download(message, url, status_msg, reserva_download=None):
         formatos_progressivos_ig = (
             formatos_progressivos_instagram(info) if is_instagram else []
         )
-        formatos = formatos_progressivos_ig + formatos_por_plataforma(
+        formatos_progressivos_fb = (
+            formatos_progressivos_facebook(info) if is_facebook_reel else []
+        )
+        formatos = (
+            formatos_progressivos_ig
+            + formatos_progressivos_fb
+            + formatos_por_plataforma(
             is_tiktok=is_tiktok,
             is_instagram=is_instagram,
             is_pinterest=is_pinterest,
             is_rednote=is_rednote,
             is_facebook_reel=is_facebook_reel,
+            )
         )
         formatos = list(dict.fromkeys(formatos))
         baixou = False
