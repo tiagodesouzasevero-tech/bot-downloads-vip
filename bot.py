@@ -217,7 +217,7 @@ MEDIA_PROFILE_VERSION = (
     f"720x1280_30fps_h264_crf{VIDEO_CRF}_audio{AUDIO_BITRATE}_sem_marca_v2"
 )
 INSTAGRAM_AUDIO_CACHE_VERSION = "instagram_audio_v5_nocookies"
-FACEBOOK_AUDIO_CACHE_VERSION = "facebook_audio_v6"
+FACEBOOK_AUDIO_CACHE_VERSION = "facebook_audio_v7"
 ML_CLIPS_CACHE_VERSION = "ml_clips_hls_720_v1"
 
 TIKTOK_COOKIES_TEXT = os.environ.get("TIKTOK_COOKIES_TEXT", "")
@@ -5715,6 +5715,7 @@ def _baixar_url_facebook_dash(url_midia, destino, referer, tipo):
 
     headers = {
         **DEFAULT_HEADERS,
+        "User-Agent": "facebookexternalhit/1.1",
         "Accept": (
             "audio/mp4,audio/*;q=0.9,*/*;q=0.8"
             if tipo == "audio"
@@ -6247,19 +6248,37 @@ def _localizar_manifest_target_facebook(texto, target_video_id):
     return melhor
 
 
-def _extrair_videodelivery_target_facebook(url, target_video_id):
+def _extrair_videodelivery_target_facebook(
+    url,
+    target_video_id,
+    duracao_esperada=None,
+):
     """
-    Isola o contexto do manifest do Reel alvo e procura as URLs que o
-    VideoDeliveryResponse fornece para esse mesmo objeto.
+    Extrai VideoDelivery do Reel alvo a partir dos blocos Relay data-sjs.
 
-    Coleta:
-    - hls_playlist_url
-    - progressive_url
+    Esta versão não usa regex para procurar progressive/hls em uma janela
+    arbitrária do HTML. Em vez disso, parseia o JSON e procura estruturas:
+      videoDeliveryResponseFragment
+        -> videoDeliveryResponseResult
+          -> hls_playlist_urls[].hls_playlist_url
+          -> progressive_urls[].progressive_url
 
-    As URLs permanecem somente em memória e nunca são gravadas nos logs.
+    URLs permanecem somente em memória e nunca são gravadas nos logs.
     """
     resposta = None
+
     try:
+        target_video_id = str(target_video_id or "").strip()
+        if not re.fullmatch(r"\d{5,30}", target_video_id):
+            raise RuntimeError("FACEBOOK_VIDEODELIVERY_SEM_TARGET_ID")
+
+        try:
+            duracao_esperada = float(duracao_esperada or 0)
+        except (TypeError, ValueError):
+            duracao_esperada = 0.0
+        if duracao_esperada <= 0:
+            duracao_esperada = None
+
         resposta, url_final = seguir_redirecionamentos_seguros(
             url,
             headers={
@@ -6293,63 +6312,206 @@ def _extrair_videodelivery_target_facebook(url, target_video_id):
         except LookupError:
             texto = b"".join(partes).decode("utf-8", errors="replace")
 
-        texto = html.unescape(texto)
-
-        alvo_manifest = _localizar_manifest_target_facebook(
+        # Os scripts data-sjs carregam JSON Relay. Não loga o conteúdo.
+        blocos_sjs = re.findall(
+            r"<script[^>]*\bdata-sjs\b[^>]*>(.*?)</script>",
             texto,
-            target_video_id,
+            flags=re.IGNORECASE | re.DOTALL,
         )
 
-        # O diagnóstico anterior mostrou VideoDelivery a alguns KB do MPD.
-        # Usa uma janela mais ampla, mas ainda ancorada no manifest do target.
-        inicio_ctx = max(0, alvo_manifest["inicio"] - 12000)
-        fim_ctx = min(len(texto), alvo_manifest["fim"] + 12000)
-        contexto = texto[inicio_ctx:fim_ctx]
+        relay_objs = []
+        relay_falhas = 0
 
-        # Encontra o marcador VideoDelivery mais próximo do manifest alvo.
-        marcadores_delivery = []
-        for termo in (
-            "videoDeliveryResponseFragment",
-            "videoDeliveryResponseResult",
-            "videoDeliveryResponse",
-        ):
-            for match in re.finditer(
-                re.escape(termo),
-                contexto,
-                flags=re.IGNORECASE,
+        for bruto in blocos_sjs:
+            conteudo = html.unescape(str(bruto or "").strip())
+            if not conteudo:
+                continue
+
+            # Remove apenas prefixos anti-JSON conhecidos, se existirem.
+            conteudo = re.sub(
+                r"^\s*for\s*\(\s*;\s*;\s*\)\s*;\s*",
+                "",
+                conteudo,
+                count=1,
+            )
+
+            try:
+                relay_objs.append(json.loads(conteudo))
+            except Exception:
+                relay_falhas += 1
+
+        # Fallback compatível com páginas em que o atributo aparece de forma
+        # mínima, como no extractor oficial.
+        if not relay_objs:
+            for bruto in re.findall(
+                r"data-sjs[^>]*>\s*({.*?})\s*</script>",
+                texto,
+                flags=re.IGNORECASE | re.DOTALL,
             ):
-                pos_abs = inicio_ctx + match.start()
-                marcadores_delivery.append(
-                    {
-                        "pos": pos_abs,
-                        "dist": abs(pos_abs - alvo_manifest["inicio"]),
-                    }
+                try:
+                    relay_objs.append(json.loads(html.unescape(bruto)))
+                except Exception:
+                    relay_falhas += 1
+
+        if not relay_objs:
+            raise RuntimeError("FACEBOOK_RELAY_JSON_NAO_ENCONTRADO")
+
+        def _duracao_video_obj(video_obj):
+            if not isinstance(video_obj, dict):
+                return None
+
+            valor_ms = video_obj.get("playable_duration_in_ms")
+            try:
+                if valor_ms is not None:
+                    valor = float(valor_ms) / 1000.0
+                    if valor > 0:
+                        return valor
+            except (TypeError, ValueError):
+                pass
+
+            for chave in ("length_in_second", "duration"):
+                try:
+                    valor = float(video_obj.get(chave) or 0)
+                except (TypeError, ValueError):
+                    valor = 0
+                if valor > 0:
+                    return valor
+
+            return None
+
+        def _obj_contem_target(objeto, limite_nos=5000):
+            """
+            Procura o target dentro do objeto candidato sem serializar/logar o
+            objeto inteiro. Retorna (match_exato, match_substring).
+            """
+            pilha = [objeto]
+            visitados = 0
+            substring = False
+
+            while pilha and visitados < limite_nos:
+                atual = pilha.pop()
+                visitados += 1
+
+                if isinstance(atual, dict):
+                    # Dá prioridade aos campos de ID mais prováveis.
+                    for chave in (
+                        "videoId",
+                        "video_id",
+                        "id",
+                        "legacy_fbid",
+                        "story_fbid",
+                        "media_id",
+                    ):
+                        valor = atual.get(chave)
+                        if valor is not None and str(valor) == target_video_id:
+                            return True, True
+
+                    pilha.extend(atual.values())
+
+                elif isinstance(atual, (list, tuple)):
+                    pilha.extend(atual)
+
+                elif isinstance(atual, (str, int)):
+                    valor = str(atual)
+                    if valor == target_video_id:
+                        return True, True
+                    if target_video_id in valor:
+                        substring = True
+
+            return False, substring
+
+        # Procura qualquer dict que seja um "video" com VideoDelivery.
+        objetos_delivery = []
+        pilha = list(relay_objs)
+        visitados = 0
+        limite_nos = 250000
+
+        while pilha and visitados < limite_nos:
+            atual = pilha.pop()
+            visitados += 1
+
+            if isinstance(atual, dict):
+                fragmento = atual.get("videoDeliveryResponseFragment")
+                resultado = (
+                    fragmento.get("videoDeliveryResponseResult")
+                    if isinstance(fragmento, dict)
+                    else None
                 )
 
-        marcadores_delivery.sort(key=lambda item: item["dist"])
-        delivery_dist = (
-            marcadores_delivery[0]["dist"]
-            if marcadores_delivery
-            else None
-        )
+                if isinstance(resultado, dict):
+                    match_exato, match_substring = _obj_contem_target(atual)
+                    duracao_obj = _duracao_video_obj(atual)
 
-        # Quando existe um marcador próximo, estreita em torno dele para reduzir
-        # a chance de capturar URLs de mídia relacionada.
-        if marcadores_delivery:
-            centro = marcadores_delivery[0]["pos"]
-            inicio_delivery = max(0, centro - 4500)
-            fim_delivery = min(len(texto), centro + 16000)
-            contexto_delivery = texto[inicio_delivery:fim_delivery]
-            base_contexto = inicio_delivery
-        else:
-            contexto_delivery = contexto
-            base_contexto = inicio_ctx
+                    objetos_delivery.append(
+                        {
+                            "video": atual,
+                            "resultado": resultado,
+                            "match_exato": match_exato,
+                            "match_substring": match_substring,
+                            "duracao": duracao_obj,
+                        }
+                    )
+
+                pilha.extend(atual.values())
+
+            elif isinstance(atual, (list, tuple)):
+                pilha.extend(atual)
+
+        if not objetos_delivery:
+            raise RuntimeError("FACEBOOK_RELAY_SEM_VIDEODELIVERY")
+
+        # Primeiro usa somente objetos com match exato/substring do target.
+        selecionados = [
+            item for item in objetos_delivery
+            if item["match_exato"] or item["match_substring"]
+        ]
+
+        modo_selecao = "target"
+
+        # Fallback conservador: se nenhum objeto trouxer o ID, permite duração
+        # apenas quando houver um ÚNICO objeto muito próximo da duração alvo.
+        if not selecionados and duracao_esperada:
+            proximos = []
+            for item in objetos_delivery:
+                dur = item.get("duracao")
+                if not dur:
+                    continue
+                diferenca = abs(float(dur) - duracao_esperada)
+                if diferenca <= max(1.5, duracao_esperada * 0.025):
+                    proximos.append((diferenca, item))
+
+            proximos.sort(key=lambda x: x[0])
+            if len(proximos) == 1:
+                selecionados = [proximos[0][1]]
+                modo_selecao = "duracao_unica"
+
+        if not selecionados:
+            logger.info(
+                "[FACEBOOK_VIDEODELIVERY_RELAY_DIAG] "
+                f"scripts={len(blocos_sjs)} "
+                f"json_ok={len(relay_objs)} json_falhas={relay_falhas} "
+                f"objetos_delivery={len(objetos_delivery)} "
+                "target_matches=0"
+            )
+            raise RuntimeError("FACEBOOK_RELAY_TARGET_NAO_LOCALIZADO")
 
         candidatos = []
         vistos_url = set()
 
-        def adicionar_candidato(url_bruta, tipo, prioridade, pos_local):
-            valor = _decodificar_string_json_facebook(url_bruta)
+        def _iter_lista(valor):
+            if isinstance(valor, list):
+                return valor
+            if isinstance(valor, tuple):
+                return list(valor)
+            if isinstance(valor, dict):
+                return [valor]
+            return []
+
+        def _adicionar_url(url_valor, tipo, prioridade, qualidade=None):
+            if not isinstance(url_valor, str):
+                return
+
+            valor = html.unescape(url_valor).strip()
             if not valor:
                 return
 
@@ -6364,64 +6526,86 @@ def _extrair_videodelivery_target_facebook(url, target_video_id):
             if not validar_url_http_publica(valor):
                 return
 
-            pos_abs = base_contexto + pos_local
             candidatos.append(
                 {
                     "url": valor,
                     "tipo": tipo,
                     "prioridade": prioridade,
-                    "manifesto": alvo_manifest["indice"],
-                    "distancia_manifest": abs(
-                        pos_abs - alvo_manifest["inicio"]
-                    ),
-                    "distancia_delivery": (
-                        abs(pos_abs - marcadores_delivery[0]["pos"])
-                        if marcadores_delivery
-                        else None
-                    ),
+                    "qualidade": qualidade,
+                    "manifesto": None,
+                    "distancia_manifest": None,
+                    "distancia_delivery": None,
                 }
             )
 
-        # HLS primeiro: pode carregar vídeo e áudio em grupos separados no
-        # mesmo master playlist.
-        for chave, tipo, prioridade in (
-            ("hls_playlist_url", "hls", 30),
-            ("progressive_url", "progressive", 20),
-        ):
-            padrao = (
-                r'"'
-                + re.escape(chave)
-                + r'"\s*:\s*("(?:\\.|[^"\\])*")'
-            )
+        for selecionado in selecionados:
+            resultado = selecionado["resultado"]
 
-            for match in re.finditer(
-                padrao,
-                contexto_delivery,
-                flags=re.IGNORECASE,
-            ):
-                adicionar_candidato(
-                    match.group(1),
-                    tipo,
-                    prioridade,
-                    match.start(),
+            # HLS: exatamente hls_playlist_urls[].hls_playlist_url
+            for item in _iter_lista(resultado.get("hls_playlist_urls")):
+                if not isinstance(item, dict):
+                    continue
+                _adicionar_url(
+                    item.get("hls_playlist_url"),
+                    "hls",
+                    40,
+                    qualidade="hls",
                 )
 
-        # Fallback extra: algumas respostas podem usar arrays com URLs em
-        # objetos próximos, mas manter os mesmos nomes.
+            # Progressive: exatamente progressive_urls[].progressive_url
+            for item in _iter_lista(resultado.get("progressive_urls")):
+                if not isinstance(item, dict):
+                    continue
+
+                prog = item.get("progressive_url")
+                qualidade = None
+                if isinstance(prog, dict):
+                    metadata = prog.get("metadata")
+                    if isinstance(metadata, dict):
+                        qualidade = metadata.get("quality")
+                    prog = prog.get("progressive_url")
+
+                # Algumas respostas colocam metadata no objeto externo.
+                if qualidade is None:
+                    metadata = item.get("metadata")
+                    if isinstance(metadata, dict):
+                        qualidade = metadata.get("quality")
+
+                prioridade = (
+                    35
+                    if str(qualidade or "").lower() == "hd"
+                    else 30
+                )
+                _adicionar_url(
+                    prog,
+                    "progressive",
+                    prioridade,
+                    qualidade=str(qualidade or "").lower() or None,
+                )
+
         candidatos.sort(
-            key=lambda item: (
-                item["prioridade"],
-                -(item["distancia_delivery"] or 10**9),
-                -item["distancia_manifest"],
-            ),
+            key=lambda item: item["prioridade"],
             reverse=True,
         )
 
         logger.info(
+            "[FACEBOOK_VIDEODELIVERY_RELAY_DIAG] "
+            f"scripts={len(blocos_sjs)} "
+            f"json_ok={len(relay_objs)} json_falhas={relay_falhas} "
+            f"objetos_delivery={len(objetos_delivery)} "
+            f"target_matches={len(selecionados)} "
+            f"modo_selecao={modo_selecao} "
+            f"candidatos={len(candidatos)} "
+            f"hls={sum(1 for c in candidatos if c['tipo'] == 'hls')} "
+            f"progressive={sum(1 for c in candidatos if c['tipo'] == 'progressive')} "
+            f"pagina_bytes={total}"
+        )
+
+        logger.info(
             "[FACEBOOK_VIDEODELIVERY_TARGET] "
-            f"manifesto={alvo_manifest['indice']} "
-            f"target_dist={alvo_manifest['target_dist']} "
-            f"video_delivery_dist={delivery_dist} "
+            f"manifesto=relay "
+            f"target_dist=0 "
+            f"video_delivery_dist=0 "
             f"candidatos={len(candidatos)} "
             f"hls={sum(1 for c in candidatos if c['tipo'] == 'hls')} "
             f"progressive={sum(1 for c in candidatos if c['tipo'] == 'progressive')} "
@@ -6452,7 +6636,7 @@ def _baixar_hls_facebook_target(url_hls, destino, referer):
 
     headers = (
         f"Referer: {referer}\r\n"
-        f"User-Agent: {DEFAULT_HEADERS.get('User-Agent', 'Mozilla/5.0')}\r\n"
+        "User-Agent: facebookexternalhit/1.1\r\n"
     )
 
     cmd = [
@@ -6527,6 +6711,7 @@ def baixar_facebook_videodelivery_target(
     referer, candidatos = _extrair_videodelivery_target_facebook(
         url,
         target_video_id,
+        duracao_esperada=duracao_esperada,
     )
 
     if not candidatos:
