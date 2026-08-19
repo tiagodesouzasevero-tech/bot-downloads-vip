@@ -5098,6 +5098,7 @@ def diagnosticar_correlacao_manifests_facebook(
     texto_pagina,
     resultado_dash=None,
     origem="desconhecida",
+    target_video_id=None,
 ):
     """
     Correlaciona cada DASH manifest com sinais do objeto/JSON ao redor.
@@ -5118,6 +5119,16 @@ def diagnosticar_correlacao_manifests_facebook(
             f"[FACEBOOK_DASH_CORRELACAO] origem={origem} manifests=0 motivo=pagina_vazia"
         )
         return None
+
+    target_video_id = str(target_video_id or "").strip()
+    if not re.fullmatch(r"\d{5,30}", target_video_id):
+        target_video_id = ""
+
+    target_ref = (
+        referencia_privada_log("fbtarget", target_video_id, tamanho=10)
+        if target_video_id
+        else "nenhum"
+    )
 
     padroes = (
         r'"dash_manifest"\s*:\s*("(?:\\.|[^"\\])*")',
@@ -5251,6 +5262,53 @@ def diagnosticar_correlacao_manifests_facebook(
         contexto = texto[inicio_ctx:fim_ctx]
         contexto_lower = contexto.lower()
 
+        target_ocorrencias = []
+        target_key_hits = []
+        target_dist = None
+        target_key_dist = None
+
+        if target_video_id:
+            for match_target in re.finditer(
+                re.escape(target_video_id),
+                contexto,
+            ):
+                pos_abs = inicio_ctx + match_target.start()
+                distancia = abs(pos_abs - ocorrencia["inicio"])
+                target_ocorrencias.append(distancia)
+
+            chaves_video_alvo = (
+                "video_id",
+                "videoid",
+                "videoId",
+                "video_id_str",
+                "legacy_fbid",
+                "story_fbid",
+                "media_id",
+                "mediaId",
+                "fbid",
+            )
+            padrao_chaves_alvo = (
+                r'["\'](?:'
+                + "|".join(re.escape(chave) for chave in chaves_video_alvo)
+                + r')["\']\s*[:=]\s*["\']?'
+                + re.escape(target_video_id)
+                + r'(?!\d)'
+            )
+
+            for match_target in re.finditer(
+                padrao_chaves_alvo,
+                contexto,
+                flags=re.IGNORECASE,
+            ):
+                pos_abs = inicio_ctx + match_target.start()
+                distancia = abs(pos_abs - ocorrencia["inicio"])
+                target_key_hits.append(distancia)
+
+            if target_ocorrencias:
+                target_dist = min(target_ocorrencias)
+            if target_key_hits:
+                target_key_dist = min(target_key_hits)
+
         video_refs = refs_ids_contexto(
             contexto,
             (
@@ -5381,6 +5439,12 @@ def diagnosticar_correlacao_manifests_facebook(
             "contexto_ref": contexto_ref,
             "dist_video_delivery": dist_video_delivery,
             "dist_audio_codec": dist_audio_codec,
+            "target_ref": target_ref,
+            "target_nearby": bool(target_ocorrencias),
+            "target_occurrences": len(target_ocorrencias),
+            "target_key_hits": len(target_key_hits),
+            "target_dist": target_dist,
+            "target_key_dist": target_key_dist,
         }
         resultados.append(resultado)
 
@@ -5403,8 +5467,30 @@ def diagnosticar_correlacao_manifests_facebook(
             f"playable={sinais['playable']} "
             f"relay={sinais['relay']} "
             f"dist_video_delivery={dist_video_delivery} "
-            f"dist_audio_codec={dist_audio_codec}"
+            f"dist_audio_codec={dist_audio_codec} "
+            f"target_ref={target_ref} "
+            f"target_nearby={bool(target_ocorrencias)} "
+            f"target_occurrences={len(target_ocorrencias)} "
+            f"target_key_hits={len(target_key_hits)} "
+            f"target_dist={target_dist} "
+            f"target_key_dist={target_key_dist}"
         )
+
+        if target_video_id:
+            logger.info(
+                "[FACEBOOK_DASH_TARGET] "
+                f"origem={origem} "
+                f"manifesto={indice} "
+                f"duracao={duracao_manifesto} "
+                f"audio_representations={audio_manifesto} "
+                f"video_representations={video_manifesto} "
+                f"target_ref={target_ref} "
+                f"target_nearby={bool(target_ocorrencias)} "
+                f"target_occurrences={len(target_ocorrencias)} "
+                f"target_key_hits={len(target_key_hits)} "
+                f"target_dist={target_dist} "
+                f"target_key_dist={target_key_dist}"
+            )
 
     # Detecta automaticamente pares que compartilham pelo menos uma referência
     # de vídeo próxima. Isso é apenas diagnóstico.
@@ -5434,7 +5520,11 @@ def diagnosticar_correlacao_manifests_facebook(
     return resultados
 
 
-def diagnosticar_pagina_facebook_audio(url, origem="desconhecida"):
+def diagnosticar_pagina_facebook_audio(
+    url,
+    origem="desconhecida",
+    target_video_id=None,
+):
     """
     Diagnóstico somente de metadados da página pública do Facebook.
 
@@ -5488,6 +5578,7 @@ def diagnosticar_pagina_facebook_audio(url, origem="desconhecida"):
             texto_busca,
             resultado_dash=resultado_dash,
             origem=origem,
+            target_video_id=target_video_id,
         )
 
         def contar_literal(*marcadores):
@@ -6485,13 +6576,14 @@ def extrair_info_facebook_com_fallback(url):
 
     # Só chegamos ao fallback quando os metadados realmente indicam
     # ausência de áudio ou quando a primeira extração falhou.
+    video_id = extrair_id_facebook_para_fallback(primeiro_info, url)
+
     if audio_primeira_consulta is False:
         diagnosticar_pagina_facebook_audio(
             url,
             origem="reel_publico",
+            target_video_id=video_id,
         )
-
-    video_id = extrair_id_facebook_para_fallback(primeiro_info, url)
     if not video_id:
         logger.warning(
             "[FACEBOOK_REELS_INFO_SEM_AUDIO] modo=reel_publico "
@@ -6576,6 +6668,7 @@ def extrair_info_facebook_com_fallback(url):
         diagnosticar_pagina_facebook_audio(
             url_alternativa,
             origem="pagina_publica_alternativa",
+            target_video_id=video_id,
         )
 
     logger.warning(
