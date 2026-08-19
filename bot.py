@@ -4425,6 +4425,160 @@ def resumir_formatos_facebook(info, origem="desconhecida"):
     )
 
 
+
+def diagnosticar_pagina_facebook_audio(url, origem="desconhecida"):
+    """
+    Diagnóstico somente de metadados da página pública do Facebook.
+
+    Procura sinais de DASH/HLS/VideoDelivery e representações de áudio sem
+    registrar URLs de mídia, tokens, cookies ou conteúdo completo da página.
+    O resultado serve apenas para descobrir se a página contém uma origem de
+    áudio que o yt-dlp não transformou em formato utilizável.
+    """
+    resposta = None
+    try:
+        resposta, url_final = seguir_redirecionamentos_seguros(
+            url,
+            headers={
+                **DEFAULT_HEADERS,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            },
+            max_redirects=5,
+        )
+
+        limite_bytes = 5 * 1024 * 1024
+        partes = []
+        total = 0
+
+        for bloco in resposta.iter_content(chunk_size=65536):
+            if not bloco:
+                continue
+            restante = limite_bytes - total
+            if restante <= 0:
+                break
+            if len(bloco) > restante:
+                bloco = bloco[:restante]
+            partes.append(bloco)
+            total += len(bloco)
+
+        charset = resposta.encoding or "utf-8"
+        try:
+            texto = b"".join(partes).decode(charset, errors="replace")
+        except LookupError:
+            texto = b"".join(partes).decode("utf-8", errors="replace")
+
+        # Decodifica apenas entidades HTML. Não loga valores encontrados.
+        texto_busca = html.unescape(texto)
+        texto_lower = texto_busca.lower()
+
+        def contar_literal(*marcadores):
+            return sum(texto_lower.count(str(m).lower()) for m in marcadores)
+
+        # Sinais usados/relacionados ao pipeline moderno do Facebook/yt-dlp.
+        sinais = {
+            "dash_manifest": contar_literal(
+                '"dash_manifest"',
+                '"dash_manifests"',
+                '"dash_manifest_urls"',
+                '"dash_manifest_xml_string"',
+                '"manifest_xml"',
+            ),
+            "playable_dash": contar_literal('"playable_url_dash"'),
+            "playable_hd": contar_literal('"playable_url_quality_hd"'),
+            "browser_native": contar_literal(
+                '"browser_native_hd_url"',
+                '"browser_native_sd_url"',
+            ),
+            "video_delivery": contar_literal(
+                '"videodeliveryresponsefragment"',
+                '"videodeliveryresponseresult"',
+            ),
+            "progressive": contar_literal(
+                '"progressive_urls"',
+                '"progressive_url"',
+            ),
+            "hls": contar_literal(
+                '"hls_playlist_urls"',
+                '"hls_playlist_url"',
+            ),
+            "relay_prefetch": contar_literal(
+                "relayprefetchedstreamcache",
+                "data-sjs",
+            ),
+            "audio_mime": contar_literal(
+                'mimetype="audio/',
+                '"mimetype":"audio/',
+                '"mime_type":"audio/',
+                'contenttype="audio"',
+                '"contenttype":"audio"',
+            ),
+            "audio_codec": contar_literal(
+                "mp4a.40",
+                '"acodec":"aac"',
+                '"audio_codec"',
+                '"audiocodec"',
+                "audiosamplingrate",
+            ),
+            "mpd_audio": contar_literal(
+                '<adaptationset contenttype="audio"',
+                '<adaptationset mimetype="audio/',
+                '<representation mimetype="audio/',
+            ),
+        }
+
+        possui_sinal_audio = any(
+            sinais[chave] > 0
+            for chave in ("audio_mime", "audio_codec", "mpd_audio")
+        )
+        possui_manifesto = any(
+            sinais[chave] > 0
+            for chave in (
+                "dash_manifest",
+                "playable_dash",
+                "video_delivery",
+                "hls",
+            )
+        )
+
+        logger.info(
+            "[FACEBOOK_PAGINA_AUDIO_DIAG] "
+            f"origem={origem} "
+            f"status={getattr(resposta, 'status_code', None)} "
+            f"bytes_lidos={total} limite_bytes={limite_bytes} "
+            f"url_final_ref={referencia_url_log(url_final)} "
+            f"possui_manifesto={possui_manifesto} "
+            f"possui_sinal_audio={possui_sinal_audio} "
+            f"dash_manifest={sinais['dash_manifest']} "
+            f"playable_dash={sinais['playable_dash']} "
+            f"playable_hd={sinais['playable_hd']} "
+            f"browser_native={sinais['browser_native']} "
+            f"video_delivery={sinais['video_delivery']} "
+            f"progressive={sinais['progressive']} "
+            f"hls={sinais['hls']} "
+            f"relay_prefetch={sinais['relay_prefetch']} "
+            f"audio_mime={sinais['audio_mime']} "
+            f"audio_codec={sinais['audio_codec']} "
+            f"mpd_audio={sinais['mpd_audio']}"
+        )
+        return sinais
+
+    except Exception as e:
+        logger.warning(
+            "[FACEBOOK_PAGINA_AUDIO_DIAG_FALHA] "
+            f"origem={origem} "
+            f"url_ref={referencia_url_log(url)} "
+            f"erro={sanitizar_erro_log(e)}"
+        )
+        return None
+
+    finally:
+        if resposta is not None:
+            try:
+                resposta.close()
+            except Exception:
+                pass
+
+
 def extrair_info_facebook_com_fallback(url):
     """
     Prefere uma origem pública com áudio confirmado.
@@ -4473,6 +4627,12 @@ def extrair_info_facebook_com_fallback(url):
 
     # Só chegamos ao fallback quando os metadados realmente indicam
     # ausência de áudio ou quando a primeira extração falhou.
+    if audio_primeira_consulta is False:
+        diagnosticar_pagina_facebook_audio(
+            url,
+            origem="reel_publico",
+        )
+
     video_id = extrair_id_facebook_para_fallback(primeiro_info, url)
     if not video_id:
         logger.warning(
@@ -4553,6 +4713,12 @@ def extrair_info_facebook_com_fallback(url):
             "modo=pagina_publica_alternativa proxima_etapa=ffprobe"
         )
         return info_alternativa
+
+    if audio_alternativo is False:
+        diagnosticar_pagina_facebook_audio(
+            url_alternativa,
+            origem="pagina_publica_alternativa",
+        )
 
     logger.warning(
         "[FACEBOOK_REELS_INFO_SEM_AUDIO] "
