@@ -4423,8 +4423,8 @@ def extrair_info_facebook_com_fallback(url):
         raise RuntimeError("FACEBOOK_AUDIO_INDISPONIVEL_PUBLICO")
 
     url_alternativa = (
-        "https://www.facebook.com/photo.php?"
-        f"{urlencode({'fbid': video_id})}"
+        "https://m.facebook.com/watch/?"
+        f"{urlencode({'v': video_id})}"
     )
 
     logger.warning(
