@@ -217,7 +217,7 @@ MEDIA_PROFILE_VERSION = (
     f"720x1280_30fps_h264_crf{VIDEO_CRF}_audio{AUDIO_BITRATE}_sem_marca_v2"
 )
 INSTAGRAM_AUDIO_CACHE_VERSION = "instagram_audio_v5_nocookies"
-FACEBOOK_AUDIO_CACHE_VERSION = "facebook_audio_v5"
+FACEBOOK_AUDIO_CACHE_VERSION = "facebook_audio_v6"
 ML_CLIPS_CACHE_VERSION = "ml_clips_hls_720_v1"
 
 TIKTOK_COOKIES_TEXT = os.environ.get("TIKTOK_COOKIES_TEXT", "")
@@ -6169,6 +6169,502 @@ def baixar_facebook_browser_native_target(
         + sanitizar_erro_log(
             ultimo_erro or "sem_detalhe",
             limite=220,
+        )
+    )
+
+
+
+def _localizar_manifest_target_facebook(texto, target_video_id):
+    """
+    Localiza o dash_manifest mais próximo do ID exato do Reel alvo.
+    Retorna apenas posições/índice; nunca expõe conteúdo sensível.
+    """
+    target_video_id = str(target_video_id or "").strip()
+    if not re.fullmatch(r"\d{5,30}", target_video_id):
+        raise RuntimeError("FACEBOOK_VIDEODELIVERY_SEM_TARGET_ID")
+
+    padroes_manifest = (
+        r'"dash_manifest"\s*:\s*("(?:\\.|[^"\\])*")',
+        r'"dash_manifest_xml_string"\s*:\s*("(?:\\.|[^"\\])*")',
+        r'"manifest_xml"\s*:\s*("(?:\\.|[^"\\])*")',
+    )
+
+    ocorrencias = []
+    vistos = set()
+
+    for padrao in padroes_manifest:
+        for match in re.finditer(padrao, texto, flags=re.IGNORECASE):
+            bruto = match.group(1)
+            assinatura = hashlib.sha256(
+                bruto.encode("utf-8", errors="ignore")
+            ).hexdigest()
+            if assinatura in vistos:
+                continue
+            vistos.add(assinatura)
+            ocorrencias.append(
+                {
+                    "indice": len(ocorrencias) + 1,
+                    "inicio": match.start(),
+                    "fim": match.end(),
+                }
+            )
+            if len(ocorrencias) >= 20:
+                break
+        if len(ocorrencias) >= 20:
+            break
+
+    if not ocorrencias:
+        raise RuntimeError("FACEBOOK_VIDEODELIVERY_SEM_MANIFEST")
+
+    melhor = None
+
+    for ocorrencia in ocorrencias:
+        inicio_ctx = max(0, ocorrencia["inicio"] - 10000)
+        fim_ctx = min(len(texto), ocorrencia["fim"] + 7000)
+        contexto = texto[inicio_ctx:fim_ctx]
+
+        distancias = []
+        for match_target in re.finditer(
+            re.escape(target_video_id),
+            contexto,
+        ):
+            pos_abs = inicio_ctx + match_target.start()
+            distancias.append(abs(pos_abs - ocorrencia["inicio"]))
+
+        if not distancias:
+            continue
+
+        distancia = min(distancias)
+        if melhor is None or distancia < melhor["target_dist"]:
+            melhor = {
+                **ocorrencia,
+                "target_dist": distancia,
+            }
+
+    if melhor is None:
+        raise RuntimeError("FACEBOOK_VIDEODELIVERY_TARGET_NAO_LOCALIZADO")
+
+    return melhor
+
+
+def _extrair_videodelivery_target_facebook(url, target_video_id):
+    """
+    Isola o contexto do manifest do Reel alvo e procura as URLs que o
+    VideoDeliveryResponse fornece para esse mesmo objeto.
+
+    Coleta:
+    - hls_playlist_url
+    - progressive_url
+
+    As URLs permanecem somente em memória e nunca são gravadas nos logs.
+    """
+    resposta = None
+    try:
+        resposta, url_final = seguir_redirecionamentos_seguros(
+            url,
+            headers={
+                **DEFAULT_HEADERS,
+                "Accept": (
+                    "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                    "*/*;q=0.8"
+                ),
+            },
+            max_redirects=5,
+        )
+
+        limite_bytes = 5 * 1024 * 1024
+        partes = []
+        total = 0
+
+        for bloco in resposta.iter_content(chunk_size=65536):
+            if not bloco:
+                continue
+            restante = limite_bytes - total
+            if restante <= 0:
+                break
+            if len(bloco) > restante:
+                bloco = bloco[:restante]
+            partes.append(bloco)
+            total += len(bloco)
+
+        charset = resposta.encoding or "utf-8"
+        try:
+            texto = b"".join(partes).decode(charset, errors="replace")
+        except LookupError:
+            texto = b"".join(partes).decode("utf-8", errors="replace")
+
+        texto = html.unescape(texto)
+
+        alvo_manifest = _localizar_manifest_target_facebook(
+            texto,
+            target_video_id,
+        )
+
+        # O diagnóstico anterior mostrou VideoDelivery a alguns KB do MPD.
+        # Usa uma janela mais ampla, mas ainda ancorada no manifest do target.
+        inicio_ctx = max(0, alvo_manifest["inicio"] - 12000)
+        fim_ctx = min(len(texto), alvo_manifest["fim"] + 12000)
+        contexto = texto[inicio_ctx:fim_ctx]
+
+        # Encontra o marcador VideoDelivery mais próximo do manifest alvo.
+        marcadores_delivery = []
+        for termo in (
+            "videoDeliveryResponseFragment",
+            "videoDeliveryResponseResult",
+            "videoDeliveryResponse",
+        ):
+            for match in re.finditer(
+                re.escape(termo),
+                contexto,
+                flags=re.IGNORECASE,
+            ):
+                pos_abs = inicio_ctx + match.start()
+                marcadores_delivery.append(
+                    {
+                        "pos": pos_abs,
+                        "dist": abs(pos_abs - alvo_manifest["inicio"]),
+                    }
+                )
+
+        marcadores_delivery.sort(key=lambda item: item["dist"])
+        delivery_dist = (
+            marcadores_delivery[0]["dist"]
+            if marcadores_delivery
+            else None
+        )
+
+        # Quando existe um marcador próximo, estreita em torno dele para reduzir
+        # a chance de capturar URLs de mídia relacionada.
+        if marcadores_delivery:
+            centro = marcadores_delivery[0]["pos"]
+            inicio_delivery = max(0, centro - 4500)
+            fim_delivery = min(len(texto), centro + 16000)
+            contexto_delivery = texto[inicio_delivery:fim_delivery]
+            base_contexto = inicio_delivery
+        else:
+            contexto_delivery = contexto
+            base_contexto = inicio_ctx
+
+        candidatos = []
+        vistos_url = set()
+
+        def adicionar_candidato(url_bruta, tipo, prioridade, pos_local):
+            valor = _decodificar_string_json_facebook(url_bruta)
+            if not valor:
+                return
+
+            valor = urljoin(url_final, valor)
+
+            if valor in vistos_url:
+                return
+            vistos_url.add(valor)
+
+            if not _host_midia_facebook_permitido(valor):
+                return
+            if not validar_url_http_publica(valor):
+                return
+
+            pos_abs = base_contexto + pos_local
+            candidatos.append(
+                {
+                    "url": valor,
+                    "tipo": tipo,
+                    "prioridade": prioridade,
+                    "manifesto": alvo_manifest["indice"],
+                    "distancia_manifest": abs(
+                        pos_abs - alvo_manifest["inicio"]
+                    ),
+                    "distancia_delivery": (
+                        abs(pos_abs - marcadores_delivery[0]["pos"])
+                        if marcadores_delivery
+                        else None
+                    ),
+                }
+            )
+
+        # HLS primeiro: pode carregar vídeo e áudio em grupos separados no
+        # mesmo master playlist.
+        for chave, tipo, prioridade in (
+            ("hls_playlist_url", "hls", 30),
+            ("progressive_url", "progressive", 20),
+        ):
+            padrao = (
+                r'"'
+                + re.escape(chave)
+                + r'"\s*:\s*("(?:\\.|[^"\\])*")'
+            )
+
+            for match in re.finditer(
+                padrao,
+                contexto_delivery,
+                flags=re.IGNORECASE,
+            ):
+                adicionar_candidato(
+                    match.group(1),
+                    tipo,
+                    prioridade,
+                    match.start(),
+                )
+
+        # Fallback extra: algumas respostas podem usar arrays com URLs em
+        # objetos próximos, mas manter os mesmos nomes.
+        candidatos.sort(
+            key=lambda item: (
+                item["prioridade"],
+                -(item["distancia_delivery"] or 10**9),
+                -item["distancia_manifest"],
+            ),
+            reverse=True,
+        )
+
+        logger.info(
+            "[FACEBOOK_VIDEODELIVERY_TARGET] "
+            f"manifesto={alvo_manifest['indice']} "
+            f"target_dist={alvo_manifest['target_dist']} "
+            f"video_delivery_dist={delivery_dist} "
+            f"candidatos={len(candidatos)} "
+            f"hls={sum(1 for c in candidatos if c['tipo'] == 'hls')} "
+            f"progressive={sum(1 for c in candidatos if c['tipo'] == 'progressive')} "
+            f"pagina_bytes={total}"
+        )
+
+        return url_final, candidatos
+
+    finally:
+        if resposta is not None:
+            try:
+                resposta.close()
+            except Exception:
+                pass
+
+
+def _baixar_hls_facebook_target(url_hls, destino, referer):
+    """
+    Baixa um HLS do CDN do Facebook usando ffmpeg e remuxa sem recodificar.
+    O URL nunca é gravado nos logs.
+    """
+    if not _host_midia_facebook_permitido(url_hls):
+        raise RuntimeError("FACEBOOK_HLS_HOST_NAO_PERMITIDO")
+    if not validar_url_http_publica(url_hls):
+        raise RuntimeError("FACEBOOK_HLS_DESTINO_NAO_PUBLICO")
+
+    atualizar_heartbeat_worker("facebook_hls")
+
+    headers = (
+        f"Referer: {referer}\r\n"
+        f"User-Agent: {DEFAULT_HEADERS.get('User-Agent', 'Mozilla/5.0')}\r\n"
+    )
+
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-v", "error",
+        "-headers", headers,
+        "-i", url_hls,
+        "-map", "0:v:0",
+        "-map", "0:a:0?",
+        "-c", "copy",
+        "-movflags", "+faststart",
+        "-shortest",
+        destino,
+    ]
+
+    try:
+        resultado = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=FFMPEG_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError(
+            f"FACEBOOK_HLS_TIMEOUT timeout={FFMPEG_TIMEOUT_SECONDS}s"
+        ) from e
+
+    if resultado.returncode != 0:
+        raise RuntimeError(
+            f"FACEBOOK_HLS_FFMPEG_FALHOU codigo={resultado.returncode}"
+        )
+
+    if not os.path.isfile(destino) or os.path.getsize(destino) <= 0:
+        raise RuntimeError("FACEBOOK_HLS_SEM_ARQUIVO")
+
+    logger.info(
+        "[FACEBOOK_VIDEODELIVERY_HLS_BAIXADO] "
+        f"bytes={os.path.getsize(destino)} "
+        f"arquivo_ref={referencia_arquivo_log(destino)}"
+    )
+
+    return destino
+
+
+def baixar_facebook_videodelivery_target(
+    url,
+    prefix,
+    target_video_id,
+    duracao_esperada=None,
+):
+    """
+    Fallback VideoDelivery do Reel alvo.
+
+    Ordem:
+    1. HLS do VideoDeliveryResponse;
+    2. progressive_url do mesmo objeto.
+
+    Só aceita arquivo com vídeo + áudio audível + duração completa.
+    """
+    atualizar_heartbeat_worker("facebook_videodelivery")
+
+    try:
+        duracao_esperada = float(duracao_esperada or 0)
+    except (TypeError, ValueError):
+        duracao_esperada = 0.0
+
+    if duracao_esperada <= 0:
+        duracao_esperada = None
+
+    referer, candidatos = _extrair_videodelivery_target_facebook(
+        url,
+        target_video_id,
+    )
+
+    if not candidatos:
+        raise RuntimeError("FACEBOOK_VIDEODELIVERY_SEM_CANDIDATOS")
+
+    def duracao_compativel(valor, referencia):
+        if not referencia:
+            return True
+        try:
+            valor = float(valor or 0)
+            referencia = float(referencia or 0)
+        except (TypeError, ValueError):
+            return False
+        if valor <= 0 or referencia <= 0:
+            return False
+        tolerancia = max(3.0, referencia * 0.06)
+        return abs(valor - referencia) <= tolerancia
+
+    cleanup_prefix(prefix)
+    ultimo_erro = None
+
+    for tentativa, candidato in enumerate(candidatos[:8], start=1):
+        saida = (
+            f"{prefix}_fb_videodelivery_"
+            f"{candidato['tipo']}_{tentativa}.mp4"
+        )
+
+        try:
+            if os.path.exists(saida):
+                os.remove(saida)
+
+            logger.info(
+                "[FACEBOOK_VIDEODELIVERY_TENTATIVA] "
+                f"tentativa={tentativa}/{min(len(candidatos), 8)} "
+                f"manifesto={candidato.get('manifesto')} "
+                f"tipo={candidato.get('tipo')} "
+                f"dist_manifest={candidato.get('distancia_manifest')} "
+                f"dist_delivery={candidato.get('distancia_delivery')}"
+            )
+
+            if candidato["tipo"] == "hls":
+                _baixar_hls_facebook_target(
+                    candidato["url"],
+                    saida,
+                    referer=referer,
+                )
+            else:
+                _baixar_url_facebook_dash(
+                    candidato["url"],
+                    saida,
+                    referer=referer,
+                    tipo="video",
+                )
+
+            info = obter_info_midia(saida)
+            if not info or not info.get("vcodec"):
+                raise RuntimeError(
+                    "FACEBOOK_VIDEODELIVERY_SEM_VIDEO"
+                )
+
+            if not arquivo_possui_audio(info):
+                raise RuntimeError(
+                    "FACEBOOK_VIDEODELIVERY_SEM_AUDIO"
+                )
+
+            qualidade_audio = _avaliar_faixa_audio_facebook_dash(
+                saida,
+                codec_manifesto=info.get("acodec"),
+            )
+            if not qualidade_audio.get("audivel"):
+                raise RuntimeError(
+                    "FACEBOOK_VIDEODELIVERY_AUDIO_QUASE_MUDO "
+                    f"silencio_pct="
+                    f"{qualidade_audio.get('silencio_pct', 0):.1f}"
+                )
+
+            try:
+                duracao = float(
+                    info.get("duration")
+                    or qualidade_audio.get("duracao")
+                    or 0
+                )
+            except (TypeError, ValueError):
+                duracao = 0.0
+
+            if not duracao_compativel(
+                duracao,
+                duracao_esperada,
+            ):
+                raise RuntimeError(
+                    "FACEBOOK_VIDEODELIVERY_DURACAO_INCOMPATIVEL "
+                    f"arquivo={duracao:.3f} "
+                    f"esperada={duracao_esperada}"
+                )
+
+            logger.info(
+                "[FACEBOOK_VIDEODELIVERY_OK] "
+                f"tipo={candidato.get('tipo')} "
+                f"duracao={duracao:.3f} "
+                f"duracao_esperada={duracao_esperada} "
+                f"width={info.get('width')} "
+                f"height={info.get('height')} "
+                f"vcodec={info.get('vcodec')} "
+                f"acodec={info.get('acodec')} "
+                f"bytes={os.path.getsize(saida)}"
+            )
+
+            for arq in glob.glob(f"{prefix}*"):
+                if arq == saida:
+                    continue
+                try:
+                    if os.path.isfile(arq):
+                        os.remove(arq)
+                except OSError:
+                    pass
+
+            return saida
+
+        except Exception as e:
+            ultimo_erro = e
+            logger.warning(
+                "[FACEBOOK_VIDEODELIVERY_FALHA] "
+                f"tentativa={tentativa} "
+                f"tipo={candidato.get('tipo')} "
+                f"erro={sanitizar_erro_log(e)}"
+            )
+            try:
+                if os.path.exists(saida):
+                    os.remove(saida)
+            except OSError:
+                pass
+
+    cleanup_prefix(prefix)
+    raise RuntimeError(
+        "FACEBOOK_VIDEODELIVERY_TARGET_FALHOU "
+        + sanitizar_erro_log(
+            ultimo_erro or "sem_detalhe",
+            limite=240,
         )
     )
 
@@ -14040,6 +14536,45 @@ def _processar_download(message, url, status_msg, reserva_download=None):
                     "[FACEBOOK_BROWSER_NATIVE_FALLBACK_FALHA] "
                     f"erro={sanitizar_erro_log(e)}"
                 )
+
+            if not baixou:
+                logger.info(
+                    "[FACEBOOK_VIDEODELIVERY_INICIO] "
+                    f"url_ref={referencia_url_log(url)} "
+                    f"target_disponivel={bool(target_video_id)}"
+                )
+                try:
+                    arquivo_delivery = baixar_facebook_videodelivery_target(
+                        url,
+                        prefix,
+                        target_video_id=target_video_id,
+                        duracao_esperada=duracao,
+                    )
+                    if arquivo_delivery and os.path.exists(arquivo_delivery):
+                        info_delivery = obter_info_midia(arquivo_delivery)
+                        if not arquivo_possui_audio(info_delivery):
+                            raise RuntimeError(
+                                "FACEBOOK_VIDEODELIVERY_FINAL_SEM_AUDIO"
+                            )
+                        baixou = True
+                        logger.info(
+                            "[FACEBOOK_VIDEODELIVERY_FALLBACK_OK] "
+                            f"arquivo_ref={referencia_arquivo_log(arquivo_delivery)} "
+                            f"width={info_delivery.get('width')} "
+                            f"height={info_delivery.get('height')} "
+                            f"vcodec={info_delivery.get('vcodec')} "
+                            f"acodec={info_delivery.get('acodec')} "
+                            f"duration={info_delivery.get('duration')}"
+                        )
+                except Exception as e:
+                    ultimo_erro = (
+                        "FACEBOOK_VIDEODELIVERY_TARGET_FALHOU "
+                        + sanitizar_erro_log(e, limite=300)
+                    )
+                    logger.warning(
+                        "[FACEBOOK_VIDEODELIVERY_FALLBACK_FALHA] "
+                        f"erro={sanitizar_erro_log(e)}"
+                    )
 
             if not baixou:
                 logger.info(
