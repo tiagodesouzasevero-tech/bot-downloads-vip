@@ -217,7 +217,7 @@ MEDIA_PROFILE_VERSION = (
     f"720x1280_30fps_h264_crf{VIDEO_CRF}_audio{AUDIO_BITRATE}_sem_marca_v2"
 )
 INSTAGRAM_AUDIO_CACHE_VERSION = "instagram_audio_v5_nocookies"
-FACEBOOK_AUDIO_CACHE_VERSION = "facebook_audio_v7"
+FACEBOOK_AUDIO_CACHE_VERSION = "facebook_audio_v8"
 ML_CLIPS_CACHE_VERSION = "ml_clips_hls_720_v1"
 
 TIKTOK_COOKIES_TEXT = os.environ.get("TIKTOK_COOKIES_TEXT", "")
@@ -6254,14 +6254,21 @@ def _extrair_videodelivery_target_facebook(
     duracao_esperada=None,
 ):
     """
-    Extrai VideoDelivery do Reel alvo a partir dos blocos Relay data-sjs.
+    Extrai dados do Reel seguindo a mesma estrutura lógica usada pelo
+    extractor atual do yt-dlp para RelayPrefetchedStreamCache.
 
-    Esta versão não usa regex para procurar progressive/hls em uma janela
-    arbitrária do HTML. Em vez disso, parseia o JSON e procura estruturas:
-      videoDeliveryResponseFragment
+    Caminho:
+      data-sjs
+        -> require
+        -> RelayPrefetchedStreamCache*
+        -> __bbox
+        -> result
+        -> data
+        -> vídeo alvo
+        -> videoDeliveryResponseFragment
         -> videoDeliveryResponseResult
-          -> hls_playlist_urls[].hls_playlist_url
-          -> progressive_urls[].progressive_url
+
+    Também lê videoDeliveryLegacyFields do MESMO vídeo.
 
     URLs permanecem somente em memória e nunca são gravadas nos logs.
     """
@@ -6312,7 +6319,9 @@ def _extrair_videodelivery_target_facebook(
         except LookupError:
             texto = b"".join(partes).decode("utf-8", errors="replace")
 
-        # Os scripts data-sjs carregam JSON Relay. Não loga o conteúdo.
+        # ----------------------------------------------------
+        # ETAPA A: parseia scripts data-sjs.
+        # ----------------------------------------------------
         blocos_sjs = re.findall(
             r"<script[^>]*\bdata-sjs\b[^>]*>(.*?)</script>",
             texto,
@@ -6323,191 +6332,326 @@ def _extrair_videodelivery_target_facebook(
         relay_falhas = 0
 
         for bruto in blocos_sjs:
-            conteudo = html.unescape(str(bruto or "").strip())
-            if not conteudo:
+            bruto = str(bruto or "").strip()
+            if not bruto:
                 continue
 
-            # Remove apenas prefixos anti-JSON conhecidos, se existirem.
-            conteudo = re.sub(
-                r"^\s*for\s*\(\s*;\s*;\s*\)\s*;\s*",
-                "",
-                conteudo,
-                count=1,
-            )
+            tentativas = [bruto]
+            html_dec = html.unescape(bruto)
+            if html_dec != bruto:
+                tentativas.append(html_dec)
 
-            try:
-                relay_objs.append(json.loads(conteudo))
-            except Exception:
+            parseado = None
+            for conteudo in tentativas:
+                conteudo = re.sub(
+                    r"^\s*for\s*\(\s*;\s*;\s*\)\s*;\s*",
+                    "",
+                    conteudo,
+                    count=1,
+                )
+                try:
+                    parseado = json.loads(conteudo)
+                    break
+                except Exception:
+                    continue
+
+            if parseado is None:
                 relay_falhas += 1
+            else:
+                relay_objs.append(parseado)
 
-        # Fallback compatível com páginas em que o atributo aparece de forma
-        # mínima, como no extractor oficial.
+        # Emula de perto o regex do extractor oficial para páginas em que
+        # o script não foi capturado pelo padrão HTML mais amplo.
         if not relay_objs:
             for bruto in re.findall(
-                r"data-sjs[^>]*>\s*({.*?})\s*</script>",
+                r'data-sjs>\s*({.*?(?:dash_manifest|playable_url).*?})\s*</script>',
                 texto,
                 flags=re.IGNORECASE | re.DOTALL,
             ):
                 try:
-                    relay_objs.append(json.loads(html.unescape(bruto)))
+                    relay_objs.append(json.loads(bruto))
                 except Exception:
                     relay_falhas += 1
 
         if not relay_objs:
             raise RuntimeError("FACEBOOK_RELAY_JSON_NAO_ENCONTRADO")
 
-        def _duracao_video_obj(video_obj):
-            if not isinstance(video_obj, dict):
-                return None
+        # ----------------------------------------------------
+        # ETAPA B: encontra módulos RelayPrefetchedStreamCache.
+        #
+        # Estrutura comum:
+        # ["RelayPrefetchedStreamCache...", ..., {"__bbox": {
+        #     "result": {"data": {...}}
+        # }}]
+        #
+        # O extractor oficial aceita variações aninhadas em __bbox/require;
+        # por isso a busca abaixo é recursiva, mas só aceita módulos cujo
+        # próprio array/tuple contém a string RelayPrefetchedStreamCache.
+        # ----------------------------------------------------
+        modulos_cache = []
+        visitados_obj = set()
 
-            valor_ms = video_obj.get("playable_duration_in_ms")
-            try:
-                if valor_ms is not None:
-                    valor = float(valor_ms) / 1000.0
-                    if valor > 0:
-                        return valor
-            except (TypeError, ValueError):
-                pass
+        def caminhar_para_modulos(obj):
+            oid = id(obj)
+            if oid in visitados_obj:
+                return
+            if isinstance(obj, (dict, list, tuple)):
+                visitados_obj.add(oid)
 
-            for chave in ("length_in_second", "duration"):
-                try:
-                    valor = float(video_obj.get(chave) or 0)
-                except (TypeError, ValueError):
-                    valor = 0
-                if valor > 0:
-                    return valor
+            if isinstance(obj, (list, tuple)):
+                if any(
+                    isinstance(item, str)
+                    and item.startswith("RelayPrefetchedStreamCache")
+                    for item in obj
+                ):
+                    modulos_cache.append(obj)
 
-            return None
+                for item in obj:
+                    caminhar_para_modulos(item)
 
-        def _obj_contem_target(objeto, limite_nos=5000):
-            """
-            Procura o target dentro do objeto candidato sem serializar/logar o
-            objeto inteiro. Retorna (match_exato, match_substring).
-            """
-            pilha = [objeto]
-            visitados = 0
-            substring = False
+            elif isinstance(obj, dict):
+                for valor in obj.values():
+                    caminhar_para_modulos(valor)
 
-            while pilha and visitados < limite_nos:
-                atual = pilha.pop()
-                visitados += 1
+        for root in relay_objs:
+            caminhar_para_modulos(root)
 
-                if isinstance(atual, dict):
-                    # Dá prioridade aos campos de ID mais prováveis.
-                    for chave in (
-                        "videoId",
-                        "video_id",
-                        "id",
-                        "legacy_fbid",
-                        "story_fbid",
-                        "media_id",
-                    ):
-                        valor = atual.get(chave)
-                        if valor is not None and str(valor) == target_video_id:
-                            return True, True
+        # Deduplica por identidade.
+        modulos_unicos = []
+        ids_modulos = set()
+        for modulo in modulos_cache:
+            if id(modulo) in ids_modulos:
+                continue
+            ids_modulos.add(id(modulo))
+            modulos_unicos.append(modulo)
+        modulos_cache = modulos_unicos
 
-                    pilha.extend(atual.values())
+        if not modulos_cache:
+            logger.info(
+                "[FACEBOOK_RELAY_PREFETCH_DIAG] "
+                f"scripts={len(blocos_sjs)} "
+                f"json_ok={len(relay_objs)} json_falhas={relay_falhas} "
+                "cache_modules=0 relay_data=0 target_videos=0"
+            )
+            raise RuntimeError("FACEBOOK_RELAY_PREFETCH_CACHE_NAO_ENCONTRADO")
 
-                elif isinstance(atual, (list, tuple)):
-                    pilha.extend(atual)
+        # ----------------------------------------------------
+        # ETAPA C: dentro de cada módulo, encontra
+        # __bbox -> result -> data.
+        # ----------------------------------------------------
+        relay_data = []
+        data_assinaturas = set()
 
-                elif isinstance(atual, (str, int)):
-                    valor = str(atual)
-                    if valor == target_video_id:
-                        return True, True
-                    if target_video_id in valor:
-                        substring = True
+        def coletar_bbox_data(obj):
+            if isinstance(obj, dict):
+                bbox = obj.get("__bbox")
+                if isinstance(bbox, dict):
+                    result = bbox.get("result")
+                    if isinstance(result, dict):
+                        data = result.get("data")
+                        if isinstance(data, dict):
+                            # Deduplica sem logar/serializar o conteúdo.
+                            assinatura = hashlib.sha256(
+                                repr(sorted(data.keys())).encode(
+                                    "utf-8",
+                                    errors="ignore",
+                                )
+                                + str(id(data)).encode("ascii")
+                            ).hexdigest()
+                            if assinatura not in data_assinaturas:
+                                data_assinaturas.add(assinatura)
+                                relay_data.append(data)
 
-            return False, substring
+                for valor in obj.values():
+                    coletar_bbox_data(valor)
 
-        # Procura qualquer dict que seja um "video" com VideoDelivery.
-        objetos_delivery = []
-        pilha = list(relay_objs)
-        visitados = 0
-        limite_nos = 250000
+            elif isinstance(obj, (list, tuple)):
+                for item in obj:
+                    coletar_bbox_data(item)
 
-        while pilha and visitados < limite_nos:
-            atual = pilha.pop()
-            visitados += 1
+        for modulo in modulos_cache:
+            coletar_bbox_data(modulo)
 
-            if isinstance(atual, dict):
-                fragmento = atual.get("videoDeliveryResponseFragment")
-                resultado = (
-                    fragmento.get("videoDeliveryResponseResult")
-                    if isinstance(fragmento, dict)
+        if not relay_data:
+            logger.info(
+                "[FACEBOOK_RELAY_PREFETCH_DIAG] "
+                f"scripts={len(blocos_sjs)} "
+                f"json_ok={len(relay_objs)} json_falhas={relay_falhas} "
+                f"cache_modules={len(modulos_cache)} "
+                "relay_data=0 target_videos=0"
+            )
+            raise RuntimeError("FACEBOOK_RELAY_PREFETCH_SEM_DATA")
+
+        # ----------------------------------------------------
+        # ETAPA D: encontra o vídeo alvo dentro dos data dicts.
+        # ----------------------------------------------------
+        videos_alvo = []
+        videos_vistos = set()
+
+        def adicionar_video(video, origem_video):
+            if not isinstance(video, dict):
+                return
+
+            oid = id(video)
+            if oid in videos_vistos:
+                return
+
+            video_id_local = video.get("videoId") or video.get("id")
+            if str(video_id_local or "") != target_video_id:
+                return
+
+            videos_vistos.add(oid)
+            videos_alvo.append(
+                {
+                    "video": video,
+                    "origem": origem_video,
+                }
+            )
+
+            # Reels podem carregar a fonte de playback dentro de:
+            # creation_story -> short_form_video_context -> playback_video
+            creation_story = video.get("creation_story")
+            if isinstance(creation_story, dict):
+                short_ctx = creation_story.get("short_form_video_context")
+                playback = (
+                    short_ctx.get("playback_video")
+                    if isinstance(short_ctx, dict)
                     else None
                 )
 
-                if isinstance(resultado, dict):
-                    match_exato, match_substring = _obj_contem_target(atual)
-                    duracao_obj = _duracao_video_obj(atual)
+                if isinstance(playback, dict):
+                    # Emula o merge lógico do extractor oficial sem mutar
+                    # o JSON original.
+                    merged = dict(creation_story)
+                    owner = (
+                        short_ctx.get("video_owner")
+                        if isinstance(short_ctx, dict)
+                        else None
+                    )
+                    if owner is not None:
+                        merged["owner"] = owner
+                    merged.update(playback)
 
-                    objetos_delivery.append(
-                        {
-                            "video": atual,
-                            "resultado": resultado,
-                            "match_exato": match_exato,
-                            "match_substring": match_substring,
-                            "duracao": duracao_obj,
-                        }
+                    chave_merged = (
+                        "merged",
+                        id(video),
+                        str(playback.get("videoId") or playback.get("id") or ""),
+                    )
+                    if chave_merged not in videos_vistos:
+                        # Usa um sentinela hashável separado do id().
+                        videos_vistos.add(chave_merged)
+                        videos_alvo.append(
+                            {
+                                "video": merged,
+                                "origem": "reel_playback_merged",
+                            }
+                        )
+
+        # Busca direta pelo target em todos os dicts do relay data.
+        def caminhar_videos(obj, origem="relay_data", limite=[0]):
+            if limite[0] >= 300000:
+                return
+            limite[0] += 1
+
+            if isinstance(obj, dict):
+                adicionar_video(obj, origem)
+                for chave, valor in obj.items():
+                    caminhar_videos(
+                        valor,
+                        origem=f"{origem}.{str(chave)[:40]}",
+                        limite=limite,
                     )
 
-                pilha.extend(atual.values())
+            elif isinstance(obj, (list, tuple)):
+                for item in obj:
+                    caminhar_videos(item, origem=origem, limite=limite)
 
-            elif isinstance(atual, (list, tuple)):
-                pilha.extend(atual)
+        for data in relay_data:
+            caminhar_videos(data)
 
-        if not objetos_delivery:
-            raise RuntimeError("FACEBOOK_RELAY_SEM_VIDEODELIVERY")
+        # Fallback: alguns wrappers não têm o ID no mesmo dict que os
+        # formatos, mas o subtree do target contém o playback.
+        if not videos_alvo:
+            def buscar_subtree_target(obj, limite=[0]):
+                if limite[0] >= 300000:
+                    return
+                limite[0] += 1
 
-        # Primeiro usa somente objetos com match exato/substring do target.
-        selecionados = [
-            item for item in objetos_delivery
-            if item["match_exato"] or item["match_substring"]
-        ]
+                if isinstance(obj, dict):
+                    contem_target_direto = any(
+                        str(obj.get(chave) or "") == target_video_id
+                        for chave in (
+                            "videoId",
+                            "id",
+                            "legacy_fbid",
+                            "story_fbid",
+                            "media_id",
+                        )
+                    )
+                    if contem_target_direto:
+                        # Procura qualquer descendente com dados de delivery.
+                        pilha = [obj]
+                        nos = 0
+                        while pilha and nos < 10000:
+                            atual = pilha.pop()
+                            nos += 1
+                            if isinstance(atual, dict):
+                                if (
+                                    "videoDeliveryResponseFragment" in atual
+                                    or "videoDeliveryLegacyFields" in atual
+                                    or "browser_native_hd_url" in atual
+                                    or "playable_url" in atual
+                                ):
+                                    chave = ("subtree", id(atual))
+                                    if chave not in videos_vistos:
+                                        videos_vistos.add(chave)
+                                        videos_alvo.append(
+                                            {
+                                                "video": atual,
+                                                "origem": "target_subtree",
+                                            }
+                                        )
+                                pilha.extend(atual.values())
+                            elif isinstance(atual, (list, tuple)):
+                                pilha.extend(atual)
 
-        modo_selecao = "target"
+                    for valor in obj.values():
+                        buscar_subtree_target(valor, limite)
 
-        # Fallback conservador: se nenhum objeto trouxer o ID, permite duração
-        # apenas quando houver um ÚNICO objeto muito próximo da duração alvo.
-        if not selecionados and duracao_esperada:
-            proximos = []
-            for item in objetos_delivery:
-                dur = item.get("duracao")
-                if not dur:
-                    continue
-                diferenca = abs(float(dur) - duracao_esperada)
-                if diferenca <= max(1.5, duracao_esperada * 0.025):
-                    proximos.append((diferenca, item))
+                elif isinstance(obj, (list, tuple)):
+                    for item in obj:
+                        buscar_subtree_target(item, limite)
 
-            proximos.sort(key=lambda x: x[0])
-            if len(proximos) == 1:
-                selecionados = [proximos[0][1]]
-                modo_selecao = "duracao_unica"
+            for data in relay_data:
+                buscar_subtree_target(data)
 
-        if not selecionados:
+        if not videos_alvo:
             logger.info(
-                "[FACEBOOK_VIDEODELIVERY_RELAY_DIAG] "
+                "[FACEBOOK_RELAY_PREFETCH_DIAG] "
                 f"scripts={len(blocos_sjs)} "
                 f"json_ok={len(relay_objs)} json_falhas={relay_falhas} "
-                f"objetos_delivery={len(objetos_delivery)} "
-                "target_matches=0"
+                f"cache_modules={len(modulos_cache)} "
+                f"relay_data={len(relay_data)} "
+                "target_videos=0 delivery_objects=0 candidates=0"
             )
-            raise RuntimeError("FACEBOOK_RELAY_TARGET_NAO_LOCALIZADO")
+            raise RuntimeError("FACEBOOK_RELAY_PREFETCH_TARGET_NAO_LOCALIZADO")
 
+        # ----------------------------------------------------
+        # ETAPA E: extrai exatamente as fontes usadas pelo yt-dlp.
+        # ----------------------------------------------------
         candidatos = []
         vistos_url = set()
+        delivery_objects = 0
+        dash_embutidos = 0
+        mpd_urls_total = 0
 
-        def _iter_lista(valor):
-            if isinstance(valor, list):
-                return valor
-            if isinstance(valor, tuple):
-                return list(valor)
-            if isinstance(valor, dict):
-                return [valor]
-            return []
-
-        def _adicionar_url(url_valor, tipo, prioridade, qualidade=None):
+        def adicionar_url(
+            url_valor,
+            tipo,
+            prioridade,
+            qualidade=None,
+            origem_formato=None,
+        ):
             if not isinstance(url_valor, str):
                 return
 
@@ -6532,55 +6676,117 @@ def _extrair_videodelivery_target_facebook(
                     "tipo": tipo,
                     "prioridade": prioridade,
                     "qualidade": qualidade,
+                    "origem_formato": origem_formato,
                     "manifesto": None,
                     "distancia_manifest": None,
                     "distancia_delivery": None,
                 }
             )
 
-        for selecionado in selecionados:
-            resultado = selecionado["resultado"]
+        def iter_lista(valor):
+            if isinstance(valor, list):
+                return valor
+            if isinstance(valor, tuple):
+                return list(valor)
+            if isinstance(valor, dict):
+                return [valor]
+            return []
 
-            # HLS: exatamente hls_playlist_urls[].hls_playlist_url
-            for item in _iter_lista(resultado.get("hls_playlist_urls")):
-                if not isinstance(item, dict):
-                    continue
-                _adicionar_url(
-                    item.get("hls_playlist_url"),
-                    "hls",
-                    40,
-                    qualidade="hls",
-                )
+        for item_video in videos_alvo:
+            video = item_video["video"]
+            origem_video = item_video["origem"]
 
-            # Progressive: exatamente progressive_urls[].progressive_url
-            for item in _iter_lista(resultado.get("progressive_urls")):
-                if not isinstance(item, dict):
-                    continue
+            # Legacy: videoDeliveryLegacyFields ou o próprio video.
+            legacy = video.get("videoDeliveryLegacyFields")
+            if not isinstance(legacy, dict):
+                legacy = video
 
-                prog = item.get("progressive_url")
-                qualidade = None
-                if isinstance(prog, dict):
-                    metadata = prog.get("metadata")
-                    if isinstance(metadata, dict):
-                        qualidade = metadata.get("quality")
-                    prog = prog.get("progressive_url")
-
-                # Algumas respostas colocam metadata no objeto externo.
-                if qualidade is None:
-                    metadata = item.get("metadata")
-                    if isinstance(metadata, dict):
-                        qualidade = metadata.get("quality")
-
-                prioridade = (
-                    35
-                    if str(qualidade or "").lower() == "hd"
-                    else 30
-                )
-                _adicionar_url(
-                    prog,
+            for chave, qualidade, prioridade in (
+                ("playable_url_quality_hd", "hd", 46),
+                ("browser_native_hd_url", "hd", 45),
+                ("playable_url", "sd", 42),
+                ("browser_native_sd_url", "sd", 41),
+            ):
+                adicionar_url(
+                    legacy.get(chave),
                     "progressive",
                     prioridade,
-                    qualidade=str(qualidade or "").lower() or None,
+                    qualidade=qualidade,
+                    origem_formato=f"legacy:{chave}:{origem_video}",
+                )
+
+            # playable_url_dash costuma ser um MPD URL.
+            adicionar_url(
+                legacy.get("playable_url_dash"),
+                "mpd",
+                38,
+                qualidade="dash",
+                origem_formato=f"legacy:playable_url_dash:{origem_video}",
+            )
+
+            # Novo VideoDeliveryResponse.
+            fragmento = video.get("videoDeliveryResponseFragment")
+            resultado = (
+                fragmento.get("videoDeliveryResponseResult")
+                if isinstance(fragmento, dict)
+                else None
+            )
+
+            if not isinstance(resultado, dict):
+                continue
+
+            delivery_objects += 1
+
+            # dash_manifest_urls[].manifest_url
+            for item in iter_lista(resultado.get("dash_manifest_urls")):
+                if not isinstance(item, dict):
+                    continue
+                manifest_url = item.get("manifest_url")
+                if manifest_url:
+                    mpd_urls_total += 1
+                adicionar_url(
+                    manifest_url,
+                    "mpd",
+                    40,
+                    qualidade="dash",
+                    origem_formato=f"delivery:manifest_url:{origem_video}",
+                )
+
+            # dash_manifests[].manifest_xml
+            for item in iter_lista(resultado.get("dash_manifests")):
+                if isinstance(item, dict) and item.get("manifest_xml"):
+                    dash_embutidos += 1
+
+            # progressive_urls[] -> item.progressive_url + metadata.quality
+            for item in iter_lista(resultado.get("progressive_urls")):
+                if not isinstance(item, dict):
+                    continue
+                progressive_url = item.get("progressive_url")
+                metadata = item.get("metadata")
+                qualidade = (
+                    str(metadata.get("quality") or "").lower()
+                    if isinstance(metadata, dict)
+                    else ""
+                )
+                prioridade = 56 if qualidade == "hd" else 52
+                adicionar_url(
+                    progressive_url,
+                    "progressive",
+                    prioridade,
+                    qualidade=qualidade or None,
+                    origem_formato=f"delivery:progressive:{origem_video}",
+                )
+
+            # hls_playlist_urls[].hls_playlist_url
+            for item in iter_lista(resultado.get("hls_playlist_urls")):
+                if not isinstance(item, dict):
+                    continue
+                adicionar_url(
+                    item.get("hls_playlist_url"),
+                    "hls",
+                    60,
+                    qualidade="hls",
+                    origem_formato=f"delivery:hls:{origem_video}",
                 )
 
         candidatos.sort(
@@ -6589,28 +6795,35 @@ def _extrair_videodelivery_target_facebook(
         )
 
         logger.info(
-            "[FACEBOOK_VIDEODELIVERY_RELAY_DIAG] "
+            "[FACEBOOK_RELAY_PREFETCH_DIAG] "
             f"scripts={len(blocos_sjs)} "
             f"json_ok={len(relay_objs)} json_falhas={relay_falhas} "
-            f"objetos_delivery={len(objetos_delivery)} "
-            f"target_matches={len(selecionados)} "
-            f"modo_selecao={modo_selecao} "
-            f"candidatos={len(candidatos)} "
+            f"cache_modules={len(modulos_cache)} "
+            f"relay_data={len(relay_data)} "
+            f"target_videos={len(videos_alvo)} "
+            f"delivery_objects={delivery_objects} "
+            f"dash_embutidos={dash_embutidos} "
+            f"mpd_urls={mpd_urls_total} "
+            f"candidates={len(candidatos)} "
             f"hls={sum(1 for c in candidatos if c['tipo'] == 'hls')} "
             f"progressive={sum(1 for c in candidatos if c['tipo'] == 'progressive')} "
+            f"mpd={sum(1 for c in candidatos if c['tipo'] == 'mpd')} "
             f"pagina_bytes={total}"
         )
 
         logger.info(
             "[FACEBOOK_VIDEODELIVERY_TARGET] "
-            f"manifesto=relay "
-            f"target_dist=0 "
-            f"video_delivery_dist=0 "
+            "manifesto=relay_prefetched "
+            f"target_dist=0 video_delivery_dist=0 "
             f"candidatos={len(candidatos)} "
             f"hls={sum(1 for c in candidatos if c['tipo'] == 'hls')} "
             f"progressive={sum(1 for c in candidatos if c['tipo'] == 'progressive')} "
+            f"mpd={sum(1 for c in candidatos if c['tipo'] == 'mpd')} "
             f"pagina_bytes={total}"
         )
+
+        if not candidatos:
+            raise RuntimeError("FACEBOOK_RELAY_PREFETCH_SEM_CANDIDATOS")
 
         return url_final, candidatos
 
@@ -6683,6 +6896,67 @@ def _baixar_hls_facebook_target(url_hls, destino, referer):
     return destino
 
 
+
+def _baixar_mpd_facebook_target(url_mpd, destino, referer):
+    """
+    Baixa um MPD externo do Facebook via ffmpeg, sem recodificar.
+    A URL nunca é gravada nos logs.
+    """
+    if not _host_midia_facebook_permitido(url_mpd):
+        raise RuntimeError("FACEBOOK_MPD_HOST_NAO_PERMITIDO")
+    if not validar_url_http_publica(url_mpd):
+        raise RuntimeError("FACEBOOK_MPD_DESTINO_NAO_PUBLICO")
+
+    atualizar_heartbeat_worker("facebook_mpd")
+
+    headers = (
+        f"Referer: {referer}\r\n"
+        "User-Agent: facebookexternalhit/1.1\r\n"
+    )
+
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-v", "error",
+        "-headers", headers,
+        "-i", url_mpd,
+        "-map", "0:v:0",
+        "-map", "0:a:0?",
+        "-c", "copy",
+        "-movflags", "+faststart",
+        "-shortest",
+        destino,
+    ]
+
+    try:
+        resultado = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=FFMPEG_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError(
+            f"FACEBOOK_MPD_TIMEOUT timeout={FFMPEG_TIMEOUT_SECONDS}s"
+        ) from e
+
+    if resultado.returncode != 0:
+        raise RuntimeError(
+            f"FACEBOOK_MPD_FFMPEG_FALHOU codigo={resultado.returncode}"
+        )
+
+    if not os.path.isfile(destino) or os.path.getsize(destino) <= 0:
+        raise RuntimeError("FACEBOOK_MPD_SEM_ARQUIVO")
+
+    logger.info(
+        "[FACEBOOK_VIDEODELIVERY_MPD_BAIXADO] "
+        f"bytes={os.path.getsize(destino)} "
+        f"arquivo_ref={referencia_arquivo_log(destino)}"
+    )
+    return destino
+
+
 def baixar_facebook_videodelivery_target(
     url,
     prefix,
@@ -6694,7 +6968,8 @@ def baixar_facebook_videodelivery_target(
 
     Ordem:
     1. HLS do VideoDeliveryResponse;
-    2. progressive_url do mesmo objeto.
+    2. progressive_url do mesmo objeto;
+    3. MPD URL externo/legacy do mesmo vídeo alvo.
 
     Só aceita arquivo com vídeo + áudio audível + duração completa.
     """
@@ -6754,6 +7029,12 @@ def baixar_facebook_videodelivery_target(
 
             if candidato["tipo"] == "hls":
                 _baixar_hls_facebook_target(
+                    candidato["url"],
+                    saida,
+                    referer=referer,
+                )
+            elif candidato["tipo"] == "mpd":
+                _baixar_mpd_facebook_target(
                     candidato["url"],
                     saida,
                     referer=referer,
