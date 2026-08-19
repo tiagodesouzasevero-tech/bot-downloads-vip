@@ -4805,6 +4805,8 @@ def diagnosticar_dash_manifest_facebook(texto_pagina, origem="desconhecida"):
     bitrates_audio = []
     bitrates_video = []
     decodificacoes_ok = set()
+    candidatos_audio = []
+    candidatos_video = []
 
     def nome_local(tag):
         return str(tag or "").split("}", 1)[-1].lower()
@@ -4832,7 +4834,7 @@ def diagnosticar_dash_manifest_facebook(texto_pagina, origem="desconhecida"):
 
         return "desconhecido"
 
-    for manifesto in manifests:
+    for manifesto_indice, manifesto in enumerate(manifests, start=1):
         raiz = manifesto["raiz"]
         decodificacoes_ok.add(manifesto["decodificacao"])
         manifesto_tem_audio = False
@@ -4879,11 +4881,27 @@ def diagnosticar_dash_manifest_facebook(texto_pagina, origem="desconhecida"):
                 except (TypeError, ValueError):
                     bandwidth = None
 
-                tem_baseurl = any(
-                    nome_local(filho.tag) == "baseurl"
-                    and bool(str(filho.text or "").strip())
-                    for filho in rep
+                baseurl_valor = next(
+                    (
+                        str(filho.text or "").strip()
+                        for filho in rep
+                        if nome_local(filho.tag) == "baseurl"
+                        and bool(str(filho.text or "").strip())
+                    ),
+                    None,
                 )
+                tem_baseurl = bool(baseurl_valor)
+
+                largura = rep.attrib.get("width")
+                altura = rep.attrib.get("height")
+                try:
+                    largura = int(largura) if largura is not None else None
+                except (TypeError, ValueError):
+                    largura = None
+                try:
+                    altura = int(altura) if altura is not None else None
+                except (TypeError, ValueError):
+                    altura = None
 
                 if categoria == "audio":
                     total_audio += 1
@@ -4896,6 +4914,15 @@ def diagnosticar_dash_manifest_facebook(texto_pagina, origem="desconhecida"):
                         bitrates_audio.append(bandwidth)
                     if tem_baseurl:
                         baseurl_audio += 1
+                        candidatos_audio.append(
+                            {
+                                "manifesto": manifesto_indice,
+                                "url": baseurl_valor,
+                                "mime": str(mime or ""),
+                                "codecs": str(codecs or ""),
+                                "bandwidth": int(bandwidth or 0),
+                            }
+                        )
 
                 elif categoria == "video":
                     total_video += 1
@@ -4908,6 +4935,17 @@ def diagnosticar_dash_manifest_facebook(texto_pagina, origem="desconhecida"):
                         bitrates_video.append(bandwidth)
                     if tem_baseurl:
                         baseurl_video += 1
+                        candidatos_video.append(
+                            {
+                                "manifesto": manifesto_indice,
+                                "url": baseurl_valor,
+                                "mime": str(mime or ""),
+                                "codecs": str(codecs or ""),
+                                "bandwidth": int(bandwidth or 0),
+                                "width": largura,
+                                "height": altura,
+                            }
+                        )
 
                 else:
                     total_desconhecido += 1
@@ -4955,6 +4993,9 @@ def diagnosticar_dash_manifest_facebook(texto_pagina, origem="desconhecida"):
         "audio_codecs": sorted(codecs_audio),
         "video_codecs": sorted(codecs_video),
         "decodificacoes_ok": sorted(decodificacoes_ok),
+        # Uso interno do fallback. Estes valores nunca são escritos nos logs.
+        "_candidatos_audio": candidatos_audio,
+        "_candidatos_video": candidatos_video,
     }
 
 
@@ -5114,6 +5155,442 @@ def diagnosticar_pagina_facebook_audio(url, origem="desconhecida"):
                 resposta.close()
             except Exception:
                 pass
+
+
+
+def _host_midia_facebook_permitido(url):
+    """Restringe o fallback DASH aos CDNs oficiais usados pelo Facebook."""
+    try:
+        host = (urlparse(str(url or "").strip()).hostname or "").lower().rstrip(".")
+    except Exception:
+        return False
+
+    return (
+        hostname_permitido(host, "fbcdn.net")
+        or hostname_permitido(host, "facebook.com")
+        or hostname_permitido(host, "fbsbx.com")
+    )
+
+
+def _baixar_url_facebook_dash(url_midia, destino, referer, tipo):
+    """
+    Baixa uma faixa DASH oficial com redirects validados e limite de tamanho.
+    Nunca registra a URL assinada.
+    """
+    atual = str(url_midia or "").strip()
+    resposta = None
+    total = 0
+
+    headers = {
+        **DEFAULT_HEADERS,
+        "Accept": (
+            "audio/mp4,audio/*;q=0.9,*/*;q=0.8"
+            if tipo == "audio"
+            else "video/mp4,video/*;q=0.9,*/*;q=0.8"
+        ),
+        "Referer": referer,
+    }
+
+    try:
+        for _ in range(6):
+            if not _host_midia_facebook_permitido(atual):
+                raise RuntimeError("FACEBOOK_DASH_HOST_NAO_PERMITIDO")
+            if not validar_url_http_publica(atual):
+                raise RuntimeError("FACEBOOK_DASH_DESTINO_NAO_PUBLICO")
+
+            resposta = requests.get(
+                atual,
+                headers=headers,
+                stream=True,
+                allow_redirects=False,
+                timeout=(7, 30),
+            )
+
+            if resposta.status_code in (301, 302, 303, 307, 308):
+                destino_redirect = urljoin(
+                    atual,
+                    resposta.headers.get("Location") or "",
+                )
+                resposta.close()
+                resposta = None
+                if not destino_redirect or destino_redirect == atual:
+                    raise RuntimeError("FACEBOOK_DASH_REDIRECT_INVALIDO")
+                atual = destino_redirect
+                continue
+
+            resposta.raise_for_status()
+
+            tamanho_header = resposta.headers.get("Content-Length")
+            if tamanho_header:
+                try:
+                    if int(tamanho_header) > MAX_SOURCE_FILE_BYTES:
+                        raise RuntimeError(
+                            "ARQUIVO_MIDIA_MUITO_GRANDE fase=facebook_dash"
+                        )
+                except ValueError:
+                    pass
+
+            with open(destino, "wb") as arquivo:
+                for chunk in resposta.iter_content(chunk_size=256 * 1024):
+                    atualizar_heartbeat_worker(f"facebook_dash_{tipo}")
+                    if not chunk:
+                        continue
+                    total += len(chunk)
+                    if total > MAX_SOURCE_FILE_BYTES:
+                        raise RuntimeError(
+                            "ARQUIVO_MIDIA_MUITO_GRANDE fase=facebook_dash"
+                        )
+                    arquivo.write(chunk)
+
+            if total <= 0:
+                raise RuntimeError("FACEBOOK_DASH_ARQUIVO_VAZIO")
+
+            logger.info(
+                "[FACEBOOK_DASH_FAIXA_OK] "
+                f"tipo={tipo} bytes={total} "
+                f"arquivo_ref={referencia_arquivo_log(destino)}"
+            )
+            return total
+
+        raise RuntimeError("FACEBOOK_DASH_MUITOS_REDIRECTS")
+
+    finally:
+        if resposta is not None:
+            resposta.close()
+
+
+def _extrair_candidatos_dash_facebook(url):
+    """
+    Lê a página original e reaproveita o parser DASH já validado.
+    As URLs das faixas permanecem somente em memória.
+    """
+    resposta = None
+    try:
+        resposta, url_final = seguir_redirecionamentos_seguros(
+            url,
+            headers={
+                **DEFAULT_HEADERS,
+                "Accept": (
+                    "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                    "*/*;q=0.8"
+                ),
+            },
+            max_redirects=5,
+        )
+
+        limite_bytes = 5 * 1024 * 1024
+        partes = []
+        total = 0
+
+        for bloco in resposta.iter_content(chunk_size=65536):
+            if not bloco:
+                continue
+            restante = limite_bytes - total
+            if restante <= 0:
+                break
+            if len(bloco) > restante:
+                bloco = bloco[:restante]
+            partes.append(bloco)
+            total += len(bloco)
+
+        charset = resposta.encoding or "utf-8"
+        try:
+            texto = b"".join(partes).decode(charset, errors="replace")
+        except LookupError:
+            texto = b"".join(partes).decode("utf-8", errors="replace")
+
+        resultado = diagnosticar_dash_manifest_facebook(
+            html.unescape(texto),
+            origem="fallback_download",
+        ) or {}
+
+        audios = []
+        videos = []
+
+        for item in resultado.get("_candidatos_audio", []):
+            url_item = urljoin(url_final, str(item.get("url") or "").strip())
+            if not url_item or not _host_midia_facebook_permitido(url_item):
+                continue
+            copia = dict(item)
+            copia["url"] = url_item
+            audios.append(copia)
+
+        for item in resultado.get("_candidatos_video", []):
+            url_item = urljoin(url_final, str(item.get("url") or "").strip())
+            if not url_item or not _host_midia_facebook_permitido(url_item):
+                continue
+            copia = dict(item)
+            copia["url"] = url_item
+            videos.append(copia)
+
+        logger.info(
+            "[FACEBOOK_DASH_CANDIDATOS] "
+            f"audio={len(audios)} video={len(videos)} "
+            f"pagina_bytes={total}"
+        )
+        return url_final, audios, videos
+
+    finally:
+        if resposta is not None:
+            resposta.close()
+
+
+def _montar_pares_dash_facebook(audios, videos):
+    """
+    Forma pares do mesmo manifest e prioriza:
+    - vídeo AVC/H.264 até 720x1280 (ou 1280x720);
+    - maior resolução/bitrate;
+    - áudio AAC/mp4a, preferindo LC (mp4a.40.2) e maior bitrate.
+    """
+    por_manifesto_audio = {}
+    por_manifesto_video = {}
+
+    for audio in audios:
+        por_manifesto_audio.setdefault(audio.get("manifesto"), []).append(audio)
+
+    for video in videos:
+        por_manifesto_video.setdefault(video.get("manifesto"), []).append(video)
+
+    pares = []
+
+    for manifesto, lista_audio in por_manifesto_audio.items():
+        lista_video = por_manifesto_video.get(manifesto) or []
+        if not lista_video:
+            continue
+
+        audios_validos = [
+            a for a in lista_audio
+            if (
+                "audio/mp4" in str(a.get("mime") or "").lower()
+                or str(a.get("codecs") or "").lower().startswith(("mp4a", "aac"))
+            )
+        ]
+        if not audios_validos:
+            continue
+
+        videos_validos = []
+        for v in lista_video:
+            codec = str(v.get("codecs") or "").lower()
+            mime = str(v.get("mime") or "").lower()
+            largura = int(v.get("width") or 0)
+            altura = int(v.get("height") or 0)
+
+            if "video/mp4" not in mime and not codec.startswith(("avc", "h264")):
+                continue
+
+            # Mantém o limite atual do bot em ambas as orientações.
+            dentro_limite = (
+                (largura <= 720 and altura <= 1280)
+                or (largura <= 1280 and altura <= 720)
+            )
+            if largura and altura and not dentro_limite:
+                continue
+
+            videos_validos.append(v)
+
+        if not videos_validos:
+            continue
+
+        audios_validos.sort(
+            key=lambda a: (
+                1 if str(a.get("codecs") or "").lower().startswith("mp4a.40.2") else 0,
+                int(a.get("bandwidth") or 0),
+            ),
+            reverse=True,
+        )
+
+        videos_validos.sort(
+            key=lambda v: (
+                int(v.get("width") or 0) * int(v.get("height") or 0),
+                int(v.get("bandwidth") or 0),
+            ),
+            reverse=True,
+        )
+
+        melhor_audio = audios_validos[0]
+        melhor_video = videos_validos[0]
+
+        pares.append(
+            {
+                "manifesto": manifesto,
+                "audio": melhor_audio,
+                "video": melhor_video,
+                "score": (
+                    int(melhor_video.get("width") or 0)
+                    * int(melhor_video.get("height") or 0),
+                    int(melhor_video.get("bandwidth") or 0),
+                    int(melhor_audio.get("bandwidth") or 0),
+                ),
+            }
+        )
+
+    pares.sort(key=lambda p: p["score"], reverse=True)
+
+    logger.info(
+        "[FACEBOOK_DASH_PARES] "
+        f"total={len(pares)} "
+        + (
+            "melhor_video="
+            f"{pares[0]['video'].get('width')}x{pares[0]['video'].get('height')} "
+            f"video_bitrate={pares[0]['video'].get('bandwidth')} "
+            f"audio_codec={str(pares[0]['audio'].get('codecs') or '')[:40]} "
+            f"audio_bitrate={pares[0]['audio'].get('bandwidth')}"
+            if pares
+            else "nenhum=True"
+        )
+    )
+    return pares
+
+
+def _muxar_facebook_dash(video_path, audio_path, saida_path):
+    """Junta vídeo e áudio sem reconversão."""
+    atualizar_heartbeat_worker("facebook_dash_mux")
+
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-v", "error",
+        "-i", video_path,
+        "-i", audio_path,
+        "-map", "0:v:0",
+        "-map", "1:a:0",
+        "-c", "copy",
+        "-movflags", "+faststart",
+        "-shortest",
+        saida_path,
+    ]
+
+    try:
+        resultado = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=FFMPEG_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError(
+            f"FACEBOOK_DASH_MUX_TIMEOUT timeout={FFMPEG_TIMEOUT_SECONDS}s"
+        ) from e
+
+    if resultado.returncode != 0:
+        raise RuntimeError(
+            f"FACEBOOK_DASH_MUX_FALHOU codigo={resultado.returncode}"
+        )
+
+    if not os.path.isfile(saida_path) or os.path.getsize(saida_path) <= 0:
+        raise RuntimeError("FACEBOOK_DASH_MUX_NAO_GEROU_SAIDA")
+
+    info = obter_info_midia(saida_path)
+    if not info or not arquivo_possui_audio(info):
+        raise RuntimeError("FACEBOOK_DASH_MUX_SAIDA_SEM_AUDIO")
+    if not info.get("vcodec"):
+        raise RuntimeError("FACEBOOK_DASH_MUX_SAIDA_SEM_VIDEO")
+
+    logger.info(
+        "[FACEBOOK_DASH_MUX_OK] "
+        f"width={info.get('width')} height={info.get('height')} "
+        f"vcodec={info.get('vcodec')} acodec={info.get('acodec')} "
+        f"bytes={os.path.getsize(saida_path)}"
+    )
+    return saida_path
+
+
+def baixar_facebook_dash_com_audio(url, prefix):
+    """
+    Fallback final do Facebook:
+    página pública -> DASH reparado -> vídeo + áudio -> ffmpeg stream copy.
+    """
+    atualizar_heartbeat_worker("facebook_dash_preparando")
+
+    url_final, audios, videos = _extrair_candidatos_dash_facebook(url)
+    pares = _montar_pares_dash_facebook(audios, videos)
+
+    if not pares:
+        raise RuntimeError("FACEBOOK_DASH_SEM_PAR_COMPATIVEL")
+
+    ultimo_erro = None
+
+    # Evita deixar os MP4 mudos tentados antes no mesmo prefixo.
+    cleanup_prefix(prefix)
+
+    for tentativa, par in enumerate(pares[:6], start=1):
+        video_path = f"{prefix}_fb_dash_video.mp4"
+        audio_path = f"{prefix}_fb_dash_audio.m4a"
+        saida_path = f"{prefix}_fb_dash_mux.mp4"
+
+        for caminho in (video_path, audio_path, saida_path):
+            try:
+                if os.path.exists(caminho):
+                    os.remove(caminho)
+            except OSError:
+                pass
+
+        try:
+            video = par["video"]
+            audio = par["audio"]
+
+            logger.info(
+                "[FACEBOOK_DASH_TENTATIVA] "
+                f"tentativa={tentativa}/{min(len(pares), 6)} "
+                f"manifesto={par.get('manifesto')} "
+                f"video={video.get('width')}x{video.get('height')} "
+                f"video_bitrate={video.get('bandwidth')} "
+                f"audio_codec={str(audio.get('codecs') or '')[:40]} "
+                f"audio_bitrate={audio.get('bandwidth')}"
+            )
+
+            _baixar_url_facebook_dash(
+                video["url"],
+                video_path,
+                referer=url_final,
+                tipo="video",
+            )
+            _baixar_url_facebook_dash(
+                audio["url"],
+                audio_path,
+                referer=url_final,
+                tipo="audio",
+            )
+
+            info_video = obter_info_midia(video_path)
+            info_audio = obter_info_midia(audio_path)
+
+            if not info_video.get("vcodec"):
+                raise RuntimeError("FACEBOOK_DASH_FAIXA_VIDEO_INVALIDA")
+            if not arquivo_possui_audio(info_audio):
+                raise RuntimeError("FACEBOOK_DASH_FAIXA_AUDIO_INVALIDA")
+
+            _muxar_facebook_dash(video_path, audio_path, saida_path)
+
+            # Remove as faixas separadas; deixa somente o MP4 final.
+            for caminho in (video_path, audio_path):
+                try:
+                    if os.path.exists(caminho):
+                        os.remove(caminho)
+                except OSError:
+                    pass
+
+            return saida_path
+
+        except Exception as e:
+            ultimo_erro = e
+            logger.warning(
+                "[FACEBOOK_DASH_TENTATIVA_FALHA] "
+                f"tentativa={tentativa} "
+                f"erro={sanitizar_erro_log(e)}"
+            )
+            for caminho in (video_path, audio_path, saida_path):
+                try:
+                    if os.path.exists(caminho):
+                        os.remove(caminho)
+                except OSError:
+                    pass
+
+    raise RuntimeError(
+        "FACEBOOK_DASH_FALLBACK_FALHOU "
+        + sanitizar_erro_log(ultimo_erro or "sem_detalhe", limite=200)
+    )
 
 
 def extrair_info_facebook_com_fallback(url):
@@ -12202,6 +12679,36 @@ def _processar_download(message, url, status_msg, reserva_download=None):
 
             if baixou:
                 break
+
+        if not baixou and is_facebook_reel:
+            logger.info(
+                "[FACEBOOK_DASH_FALLBACK_INICIO] "
+                f"url_ref={referencia_url_log(url)}"
+            )
+            try:
+                arquivo_dash = baixar_facebook_dash_com_audio(url, prefix)
+                if arquivo_dash and os.path.exists(arquivo_dash):
+                    info_dash = obter_info_midia(arquivo_dash)
+                    if not arquivo_possui_audio(info_dash):
+                        raise RuntimeError("FACEBOOK_DASH_FINAL_SEM_AUDIO")
+                    baixou = True
+                    logger.info(
+                        "[FACEBOOK_DASH_FALLBACK_OK] "
+                        f"arquivo_ref={referencia_arquivo_log(arquivo_dash)} "
+                        f"width={info_dash.get('width')} "
+                        f"height={info_dash.get('height')} "
+                        f"vcodec={info_dash.get('vcodec')} "
+                        f"acodec={info_dash.get('acodec')}"
+                    )
+            except Exception as e:
+                ultimo_erro = (
+                    "FACEBOOK_DASH_FALLBACK_FALHOU "
+                    + sanitizar_erro_log(e, limite=300)
+                )
+                logger.warning(
+                    "[FACEBOOK_DASH_FALLBACK_FALHA] "
+                    f"erro={sanitizar_erro_log(e)}"
+                )
 
         if not baixou:
             raise FalhaComponenteDownload(
