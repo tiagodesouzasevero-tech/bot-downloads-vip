@@ -217,7 +217,7 @@ MEDIA_PROFILE_VERSION = (
     f"720x1280_30fps_h264_crf{VIDEO_CRF}_audio{AUDIO_BITRATE}_sem_marca_v2"
 )
 INSTAGRAM_AUDIO_CACHE_VERSION = "instagram_audio_v5_nocookies"
-FACEBOOK_AUDIO_CACHE_VERSION = "facebook_audio_v4"
+FACEBOOK_AUDIO_CACHE_VERSION = "facebook_audio_v5"
 ML_CLIPS_CACHE_VERSION = "ml_clips_hls_720_v1"
 
 TIKTOK_COOKIES_TEXT = os.environ.get("TIKTOK_COOKIES_TEXT", "")
@@ -5789,6 +5789,388 @@ def _baixar_url_facebook_dash(url_midia, destino, referer, tipo):
     finally:
         if resposta is not None:
             resposta.close()
+
+
+
+def _decodificar_string_json_facebook(valor_json):
+    """Decodifica string JSON/HTML do Facebook sem executar conteúdo."""
+    if not valor_json:
+        return None
+
+    try:
+        valor = json.loads(valor_json)
+    except Exception:
+        valor = str(valor_json).strip().strip('"')
+
+    if not isinstance(valor, str):
+        return None
+
+    valor = html.unescape(valor).strip()
+    if not valor:
+        return None
+
+    # Fallback defensivo para escapes residuais.
+    valor = re.sub(
+        r"\\u([0-9a-fA-F]{4})",
+        lambda m: chr(int(m.group(1), 16)),
+        valor,
+    )
+    valor = valor.replace("\\/", "/")
+    return valor.strip()
+
+
+def _extrair_browser_native_target_facebook(url, target_video_id):
+    """
+    Localiza o manifest cujo contexto contém o ID exato do Reel alvo e,
+    SOMENTE nesse contexto, coleta browser_native_hd_url/sd_url.
+
+    URLs nunca são gravadas nos logs.
+    """
+    resposta = None
+    try:
+        target_video_id = str(target_video_id or "").strip()
+        if not re.fullmatch(r"\d{5,30}", target_video_id):
+            raise RuntimeError("FACEBOOK_BROWSER_NATIVE_SEM_TARGET_ID")
+
+        resposta, url_final = seguir_redirecionamentos_seguros(
+            url,
+            headers={
+                **DEFAULT_HEADERS,
+                "Accept": (
+                    "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                    "*/*;q=0.8"
+                ),
+            },
+            max_redirects=5,
+        )
+
+        limite_bytes = 5 * 1024 * 1024
+        partes = []
+        total = 0
+
+        for bloco in resposta.iter_content(chunk_size=65536):
+            if not bloco:
+                continue
+            restante = limite_bytes - total
+            if restante <= 0:
+                break
+            if len(bloco) > restante:
+                bloco = bloco[:restante]
+            partes.append(bloco)
+            total += len(bloco)
+
+        charset = resposta.encoding or "utf-8"
+        try:
+            texto = b"".join(partes).decode(charset, errors="replace")
+        except LookupError:
+            texto = b"".join(partes).decode("utf-8", errors="replace")
+
+        texto = html.unescape(texto)
+
+        padroes_manifest = (
+            r'"dash_manifest"\s*:\s*("(?:\\.|[^"\\])*")',
+            r'"dash_manifest_xml_string"\s*:\s*("(?:\\.|[^"\\])*")',
+            r'"manifest_xml"\s*:\s*("(?:\\.|[^"\\])*")',
+        )
+
+        ocorrencias = []
+        vistos = set()
+        for padrao in padroes_manifest:
+            for match in re.finditer(padrao, texto, flags=re.IGNORECASE):
+                bruto = match.group(1)
+                assinatura = hashlib.sha256(
+                    bruto.encode("utf-8", errors="ignore")
+                ).hexdigest()
+                if assinatura in vistos:
+                    continue
+                vistos.add(assinatura)
+                ocorrencias.append(
+                    {
+                        "indice": len(ocorrencias) + 1,
+                        "inicio": match.start(),
+                        "fim": match.end(),
+                    }
+                )
+                if len(ocorrencias) >= 20:
+                    break
+            if len(ocorrencias) >= 20:
+                break
+
+        if not ocorrencias:
+            raise RuntimeError("FACEBOOK_BROWSER_NATIVE_SEM_MANIFEST")
+
+        # Identifica o manifest com a menor distância até o ID alvo.
+        alvo_manifest = None
+        for ocorrencia in ocorrencias:
+            inicio_ctx = max(0, ocorrencia["inicio"] - 9000)
+            fim_ctx = min(len(texto), ocorrencia["fim"] + 5000)
+            contexto = texto[inicio_ctx:fim_ctx]
+
+            distancias = []
+            for match_target in re.finditer(
+                re.escape(target_video_id),
+                contexto,
+            ):
+                pos_abs = inicio_ctx + match_target.start()
+                distancias.append(abs(pos_abs - ocorrencia["inicio"]))
+
+            if not distancias:
+                continue
+
+            distancia_min = min(distancias)
+            if (
+                alvo_manifest is None
+                or distancia_min < alvo_manifest["target_dist"]
+            ):
+                alvo_manifest = {
+                    **ocorrencia,
+                    "target_dist": distancia_min,
+                }
+
+        if alvo_manifest is None:
+            raise RuntimeError("FACEBOOK_BROWSER_NATIVE_TARGET_NAO_LOCALIZADO")
+
+        # Contexto mais estreito do manifest alvo.
+        inicio_ctx = max(0, alvo_manifest["inicio"] - 5500)
+        fim_ctx = min(len(texto), alvo_manifest["fim"] + 3500)
+        contexto = texto[inicio_ctx:fim_ctx]
+
+        candidatos = []
+        vistos_url = set()
+
+        # Preferência HD -> SD.
+        for chave, qualidade, prioridade in (
+            ("browser_native_hd_url", "hd", 2),
+            ("browser_native_sd_url", "sd", 1),
+        ):
+            padrao = (
+                r'"'
+                + re.escape(chave)
+                + r'"\s*:\s*("(?:\\.|[^"\\])*")'
+            )
+
+            for match in re.finditer(
+                padrao,
+                contexto,
+                flags=re.IGNORECASE,
+            ):
+                valor = _decodificar_string_json_facebook(match.group(1))
+                if not valor:
+                    continue
+
+                valor = urljoin(url_final, valor)
+
+                if valor in vistos_url:
+                    continue
+                vistos_url.add(valor)
+
+                if not _host_midia_facebook_permitido(valor):
+                    continue
+                if not validar_url_http_publica(valor):
+                    continue
+
+                pos_abs = inicio_ctx + match.start()
+                distancia_manifest = abs(
+                    pos_abs - alvo_manifest["inicio"]
+                )
+
+                candidatos.append(
+                    {
+                        "url": valor,
+                        "qualidade": qualidade,
+                        "prioridade": prioridade,
+                        "distancia_manifest": distancia_manifest,
+                        "manifesto": alvo_manifest["indice"],
+                    }
+                )
+
+        candidatos.sort(
+            key=lambda item: (
+                item["prioridade"],
+                -item["distancia_manifest"],
+            ),
+            reverse=True,
+        )
+
+        logger.info(
+            "[FACEBOOK_BROWSER_NATIVE_TARGET] "
+            f"manifesto={alvo_manifest['indice']} "
+            f"target_dist={alvo_manifest['target_dist']} "
+            f"candidatos={len(candidatos)} "
+            f"hd={sum(1 for c in candidatos if c['qualidade'] == 'hd')} "
+            f"sd={sum(1 for c in candidatos if c['qualidade'] == 'sd')} "
+            f"pagina_bytes={total}"
+        )
+
+        return url_final, candidatos
+
+    finally:
+        if resposta is not None:
+            try:
+                resposta.close()
+            except Exception:
+                pass
+
+
+def baixar_facebook_browser_native_target(
+    url,
+    prefix,
+    target_video_id,
+    duracao_esperada=None,
+):
+    """
+    Tenta MP4 progressivo browser_native SOMENTE do Reel alvo.
+
+    Aceita apenas se:
+    - contém vídeo;
+    - contém áudio real;
+    - áudio não é quase totalmente silencioso;
+    - duração é compatível com o Reel original.
+    """
+    atualizar_heartbeat_worker("facebook_browser_native")
+
+    try:
+        duracao_esperada = float(duracao_esperada or 0)
+    except (TypeError, ValueError):
+        duracao_esperada = 0.0
+
+    if duracao_esperada <= 0:
+        duracao_esperada = None
+
+    referer, candidatos = _extrair_browser_native_target_facebook(
+        url,
+        target_video_id,
+    )
+
+    if not candidatos:
+        raise RuntimeError("FACEBOOK_BROWSER_NATIVE_SEM_CANDIDATOS")
+
+    def duracao_compativel(valor, referencia):
+        if not referencia:
+            return True
+        try:
+            valor = float(valor or 0)
+            referencia = float(referencia or 0)
+        except (TypeError, ValueError):
+            return False
+        if valor <= 0 or referencia <= 0:
+            return False
+        tolerancia = max(3.0, referencia * 0.06)
+        return abs(valor - referencia) <= tolerancia
+
+    cleanup_prefix(prefix)
+    ultimo_erro = None
+
+    for tentativa, candidato in enumerate(candidatos[:4], start=1):
+        saida = (
+            f"{prefix}_fb_browser_native_"
+            f"{candidato['qualidade']}_{tentativa}.mp4"
+        )
+
+        try:
+            if os.path.exists(saida):
+                os.remove(saida)
+
+            logger.info(
+                "[FACEBOOK_BROWSER_NATIVE_TENTATIVA] "
+                f"tentativa={tentativa}/{min(len(candidatos), 4)} "
+                f"manifesto={candidato.get('manifesto')} "
+                f"qualidade={candidato.get('qualidade')} "
+                f"dist_manifest={candidato.get('distancia_manifest')}"
+            )
+
+            _baixar_url_facebook_dash(
+                candidato["url"],
+                saida,
+                referer=referer,
+                tipo="video",
+            )
+
+            info = obter_info_midia(saida)
+            if not info or not info.get("vcodec"):
+                raise RuntimeError(
+                    "FACEBOOK_BROWSER_NATIVE_SEM_VIDEO"
+                )
+
+            if not arquivo_possui_audio(info):
+                raise RuntimeError(
+                    "FACEBOOK_BROWSER_NATIVE_SEM_AUDIO"
+                )
+
+            qualidade_audio = _avaliar_faixa_audio_facebook_dash(
+                saida,
+                codec_manifesto=info.get("acodec"),
+            )
+            if not qualidade_audio.get("audivel"):
+                raise RuntimeError(
+                    "FACEBOOK_BROWSER_NATIVE_AUDIO_QUASE_MUDO "
+                    f"silencio_pct="
+                    f"{qualidade_audio.get('silencio_pct', 0):.1f}"
+                )
+
+            duracao = float(
+                info.get("duration")
+                or qualidade_audio.get("duracao")
+                or 0
+            )
+
+            if not duracao_compativel(
+                duracao,
+                duracao_esperada,
+            ):
+                raise RuntimeError(
+                    "FACEBOOK_BROWSER_NATIVE_DURACAO_INCOMPATIVEL "
+                    f"arquivo={duracao:.3f} "
+                    f"esperada={duracao_esperada}"
+                )
+
+            logger.info(
+                "[FACEBOOK_BROWSER_NATIVE_OK] "
+                f"qualidade={candidato.get('qualidade')} "
+                f"duracao={duracao:.3f} "
+                f"duracao_esperada={duracao_esperada} "
+                f"width={info.get('width')} "
+                f"height={info.get('height')} "
+                f"vcodec={info.get('vcodec')} "
+                f"acodec={info.get('acodec')} "
+                f"bytes={os.path.getsize(saida)}"
+            )
+
+            # Remove quaisquer restos de tentativas anteriores, preservando só
+            # o arquivo correto.
+            for arq in glob.glob(f"{prefix}*"):
+                if arq == saida:
+                    continue
+                try:
+                    if os.path.isfile(arq):
+                        os.remove(arq)
+                except OSError:
+                    pass
+
+            return saida
+
+        except Exception as e:
+            ultimo_erro = e
+            logger.warning(
+                "[FACEBOOK_BROWSER_NATIVE_FALHA] "
+                f"tentativa={tentativa} "
+                f"qualidade={candidato.get('qualidade')} "
+                f"erro={sanitizar_erro_log(e)}"
+            )
+            try:
+                if os.path.exists(saida):
+                    os.remove(saida)
+            except OSError:
+                pass
+
+    cleanup_prefix(prefix)
+    raise RuntimeError(
+        "FACEBOOK_BROWSER_NATIVE_TARGET_FALHOU "
+        + sanitizar_erro_log(
+            ultimo_erro or "sem_detalhe",
+            limite=220,
+        )
+    )
 
 
 def _extrair_candidatos_dash_facebook(url):
@@ -13618,38 +14000,80 @@ def _processar_download(message, url, status_msg, reserva_download=None):
                 break
 
         if not baixou and is_facebook_reel:
+            target_video_id = extrair_id_facebook_para_fallback(info, url)
+
             logger.info(
-                "[FACEBOOK_DASH_FALLBACK_INICIO] "
-                f"url_ref={referencia_url_log(url)}"
+                "[FACEBOOK_BROWSER_NATIVE_INICIO] "
+                f"url_ref={referencia_url_log(url)} "
+                f"target_disponivel={bool(target_video_id)}"
             )
+
             try:
-                arquivo_dash = baixar_facebook_dash_com_audio(
+                arquivo_browser = baixar_facebook_browser_native_target(
                     url,
                     prefix,
+                    target_video_id=target_video_id,
                     duracao_esperada=duracao,
                 )
-                if arquivo_dash and os.path.exists(arquivo_dash):
-                    info_dash = obter_info_midia(arquivo_dash)
-                    if not arquivo_possui_audio(info_dash):
-                        raise RuntimeError("FACEBOOK_DASH_FINAL_SEM_AUDIO")
+                if arquivo_browser and os.path.exists(arquivo_browser):
+                    info_browser = obter_info_midia(arquivo_browser)
+                    if not arquivo_possui_audio(info_browser):
+                        raise RuntimeError(
+                            "FACEBOOK_BROWSER_NATIVE_FINAL_SEM_AUDIO"
+                        )
                     baixou = True
                     logger.info(
-                        "[FACEBOOK_DASH_FALLBACK_OK] "
-                        f"arquivo_ref={referencia_arquivo_log(arquivo_dash)} "
-                        f"width={info_dash.get('width')} "
-                        f"height={info_dash.get('height')} "
-                        f"vcodec={info_dash.get('vcodec')} "
-                        f"acodec={info_dash.get('acodec')}"
+                        "[FACEBOOK_BROWSER_NATIVE_FALLBACK_OK] "
+                        f"arquivo_ref={referencia_arquivo_log(arquivo_browser)} "
+                        f"width={info_browser.get('width')} "
+                        f"height={info_browser.get('height')} "
+                        f"vcodec={info_browser.get('vcodec')} "
+                        f"acodec={info_browser.get('acodec')} "
+                        f"duration={info_browser.get('duration')}"
                     )
             except Exception as e:
                 ultimo_erro = (
-                    "FACEBOOK_DASH_FALLBACK_FALHOU "
+                    "FACEBOOK_BROWSER_NATIVE_TARGET_FALHOU "
                     + sanitizar_erro_log(e, limite=300)
                 )
                 logger.warning(
-                    "[FACEBOOK_DASH_FALLBACK_FALHA] "
+                    "[FACEBOOK_BROWSER_NATIVE_FALLBACK_FALHA] "
                     f"erro={sanitizar_erro_log(e)}"
                 )
+
+            if not baixou:
+                logger.info(
+                    "[FACEBOOK_DASH_FALLBACK_INICIO] "
+                    f"url_ref={referencia_url_log(url)}"
+                )
+                try:
+                    arquivo_dash = baixar_facebook_dash_com_audio(
+                        url,
+                        prefix,
+                        duracao_esperada=duracao,
+                    )
+                    if arquivo_dash and os.path.exists(arquivo_dash):
+                        info_dash = obter_info_midia(arquivo_dash)
+                        if not arquivo_possui_audio(info_dash):
+                            raise RuntimeError("FACEBOOK_DASH_FINAL_SEM_AUDIO")
+                        baixou = True
+                        logger.info(
+                            "[FACEBOOK_DASH_FALLBACK_OK] "
+                            f"arquivo_ref={referencia_arquivo_log(arquivo_dash)} "
+                            f"width={info_dash.get('width')} "
+                            f"height={info_dash.get('height')} "
+                            f"vcodec={info_dash.get('vcodec')} "
+                            f"acodec={info_dash.get('acodec')}"
+                        )
+                except Exception as e:
+                    ultimo_erro = (
+                        "FACEBOOK_DASH_FALLBACK_FALHOU "
+                        + sanitizar_erro_log(e, limite=300)
+                    )
+                    logger.warning(
+                        "[FACEBOOK_DASH_FALLBACK_FALHA] "
+                        f"erro={sanitizar_erro_log(e)}"
+                    )
 
         if not baixou:
             raise FalhaComponenteDownload(
