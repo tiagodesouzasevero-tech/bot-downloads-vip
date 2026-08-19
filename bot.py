@@ -4807,9 +4807,50 @@ def diagnosticar_dash_manifest_facebook(texto_pagina, origem="desconhecida"):
     decodificacoes_ok = set()
     candidatos_audio = []
     candidatos_video = []
+    diagnosticos_manifestos = []
 
     def nome_local(tag):
         return str(tag or "").split("}", 1)[-1].lower()
+
+    def parsear_duracao_mpd(valor):
+        """
+        Converte durações ISO-8601 usadas em MPD, por exemplo:
+        PT60.858S, PT1M0.858S, PT1H2M3.5S.
+
+        Retorna segundos ou None.
+        """
+        texto_duracao = str(valor or "").strip().upper()
+        if not texto_duracao:
+            return None
+
+        match = re.fullmatch(
+            r"P"
+            r"(?:(?P<days>\d+(?:\.\d+)?)D)?"
+            r"(?:T"
+            r"(?:(?P<hours>\d+(?:\.\d+)?)H)?"
+            r"(?:(?P<minutes>\d+(?:\.\d+)?)M)?"
+            r"(?:(?P<seconds>\d+(?:\.\d+)?)S)?"
+            r")?",
+            texto_duracao,
+        )
+        if not match:
+            return None
+
+        try:
+            dias = float(match.group("days") or 0)
+            horas = float(match.group("hours") or 0)
+            minutos = float(match.group("minutes") or 0)
+            segundos = float(match.group("seconds") or 0)
+        except (TypeError, ValueError):
+            return None
+
+        total = (
+            dias * 86400
+            + horas * 3600
+            + minutos * 60
+            + segundos
+        )
+        return total if total > 0 else None
 
     def classificar(mime_type, content_type, codecs):
         mime = str(mime_type or "").lower()
@@ -4839,6 +4880,28 @@ def diagnosticar_dash_manifest_facebook(texto_pagina, origem="desconhecida"):
         decodificacoes_ok.add(manifesto["decodificacao"])
         manifesto_tem_audio = False
         manifesto_tem_video = False
+
+        manifesto_audio_total = 0
+        manifesto_video_total = 0
+        manifesto_audio_codecs = set()
+        manifesto_video_codecs = set()
+
+        duracao_manifesto = parsear_duracao_mpd(
+            raiz.attrib.get("mediaPresentationDuration")
+            or raiz.attrib.get("mediapresentationduration")
+        )
+
+        # Alguns MPDs colocam a duração no Period em vez da raiz.
+        if duracao_manifesto is None:
+            for elemento in raiz.iter():
+                if nome_local(elemento.tag) != "period":
+                    continue
+                duracao_periodo = parsear_duracao_mpd(
+                    elemento.attrib.get("duration")
+                )
+                if duracao_periodo is not None:
+                    duracao_manifesto = duracao_periodo
+                    break
 
         for adaptation in raiz.iter():
             if nome_local(adaptation.tag) != "adaptationset":
@@ -4905,9 +4968,12 @@ def diagnosticar_dash_manifest_facebook(texto_pagina, origem="desconhecida"):
 
                 if categoria == "audio":
                     total_audio += 1
+                    manifesto_audio_total += 1
                     manifesto_tem_audio = True
                     if codecs:
-                        codecs_audio.add(str(codecs)[:80])
+                        codec_limpo = str(codecs)[:80]
+                        codecs_audio.add(codec_limpo)
+                        manifesto_audio_codecs.add(codec_limpo)
                     if mime:
                         mimes_audio.add(str(mime)[:80])
                     if bandwidth:
@@ -4926,9 +4992,12 @@ def diagnosticar_dash_manifest_facebook(texto_pagina, origem="desconhecida"):
 
                 elif categoria == "video":
                     total_video += 1
+                    manifesto_video_total += 1
                     manifesto_tem_video = True
                     if codecs:
-                        codecs_video.add(str(codecs)[:80])
+                        codec_limpo = str(codecs)[:80]
+                        codecs_video.add(codec_limpo)
+                        manifesto_video_codecs.add(codec_limpo)
                     if mime:
                         mimes_video.add(str(mime)[:80])
                     if bandwidth:
@@ -4954,6 +5023,30 @@ def diagnosticar_dash_manifest_facebook(texto_pagina, origem="desconhecida"):
             manifests_com_audio += 1
         if manifesto_tem_video:
             manifests_com_video += 1
+
+        diagnostico_manifesto = {
+            "manifesto": manifesto_indice,
+            "duracao": duracao_manifesto,
+            "audio_representations": manifesto_audio_total,
+            "video_representations": manifesto_video_total,
+            "audio_codecs": sorted(manifesto_audio_codecs),
+            "video_codecs": sorted(manifesto_video_codecs),
+            "decodificacao": manifesto.get("decodificacao"),
+        }
+        diagnosticos_manifestos.append(diagnostico_manifesto)
+
+        logger.info(
+            "[FACEBOOK_DASH_MANIFESTO] "
+            f"origem={origem} "
+            f"manifesto={manifesto_indice} "
+            f"duracao={duracao_manifesto} "
+            f"audio_representations={manifesto_audio_total} "
+            f"video_representations={manifesto_video_total} "
+            f"audio_codecs="
+            f"{','.join(sorted(manifesto_audio_codecs)) if manifesto_audio_codecs else 'nenhum'} "
+            f"video_codecs="
+            f"{','.join(sorted(manifesto_video_codecs)) if manifesto_video_codecs else 'nenhum'}"
+        )
 
     def resumir_conjunto(valores, limite=6):
         if not valores:
@@ -4996,6 +5089,7 @@ def diagnosticar_dash_manifest_facebook(texto_pagina, origem="desconhecida"):
         # Uso interno do fallback. Estes valores nunca são escritos nos logs.
         "_candidatos_audio": candidatos_audio,
         "_candidatos_video": candidatos_video,
+        "_diagnosticos_manifestos": diagnosticos_manifestos,
     }
 
 
