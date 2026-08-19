@@ -217,7 +217,7 @@ MEDIA_PROFILE_VERSION = (
     f"720x1280_30fps_h264_crf{VIDEO_CRF}_audio{AUDIO_BITRATE}_sem_marca_v2"
 )
 INSTAGRAM_AUDIO_CACHE_VERSION = "instagram_audio_v5_nocookies"
-FACEBOOK_AUDIO_CACHE_VERSION = "facebook_audio_v3"
+FACEBOOK_AUDIO_CACHE_VERSION = "facebook_audio_v4"
 ML_CLIPS_CACHE_VERSION = "ml_clips_hls_720_v1"
 
 TIKTOK_COOKIES_TEXT = os.environ.get("TIKTOK_COOKIES_TEXT", "")
@@ -5632,12 +5632,28 @@ def _muxar_facebook_dash(video_path, audio_path, saida_path):
     return saida_path
 
 
-def baixar_facebook_dash_com_audio(url, prefix):
+def baixar_facebook_dash_com_audio(url, prefix, duracao_esperada=None):
     """
     Fallback final do Facebook:
-    página pública -> DASH reparado -> vídeo + áudio -> ffmpeg stream copy.
+    página pública -> DASH reparado -> escolhe áudio completo -> baixa vídeo
+    correspondente -> ffmpeg stream copy.
+
+    Estratégia:
+    1. baixa somente as faixas de áudio candidatas (arquivos pequenos);
+    2. rejeita áudio quase mudo;
+    3. prioriza a duração mais próxima da duração original do Reel;
+    4. sem duração original confiável, prioriza a faixa audível mais longa;
+    5. só depois baixa a faixa de vídeo do mesmo manifest;
+    6. rejeita vídeo/mux truncado antes de entregar.
     """
     atualizar_heartbeat_worker("facebook_dash_preparando")
+
+    try:
+        duracao_esperada = float(duracao_esperada or 0)
+    except (TypeError, ValueError):
+        duracao_esperada = 0.0
+    if duracao_esperada <= 0:
+        duracao_esperada = None
 
     url_final, audios, videos = _extrair_candidatos_dash_facebook(url)
     pares = _montar_pares_dash_facebook(audios, videos)
@@ -5646,16 +5662,211 @@ def baixar_facebook_dash_com_audio(url, prefix):
         raise RuntimeError("FACEBOOK_DASH_SEM_PAR_COMPATIVEL")
 
     ultimo_erro = None
-
-    # Evita deixar os MP4 mudos tentados antes no mesmo prefixo.
     cleanup_prefix(prefix)
 
-    for tentativa, par in enumerate(pares[:10], start=1):
-        video_path = f"{prefix}_fb_dash_video.mp4"
-        audio_path = f"{prefix}_fb_dash_audio.m4a"
-        saida_path = f"{prefix}_fb_dash_mux.mp4"
+    candidatos_audio_validos = []
+    caminhos_temporarios = set()
+    urls_audio_vistas = set()
 
-        for caminho in (video_path, audio_path, saida_path):
+    def remover_temporarios(exceto=None):
+        exceto = set(exceto or [])
+        for caminho in list(caminhos_temporarios):
+            if caminho in exceto:
+                continue
+            try:
+                if os.path.exists(caminho):
+                    os.remove(caminho)
+            except OSError:
+                pass
+            caminhos_temporarios.discard(caminho)
+
+    def duracao_compativel(valor, referencia, tolerancia_pct=0.08, tolerancia_min=3.0):
+        try:
+            valor = float(valor or 0)
+            referencia = float(referencia or 0)
+        except (TypeError, ValueError):
+            return False
+        if valor <= 0 or referencia <= 0:
+            return False
+        tolerancia = max(tolerancia_min, referencia * tolerancia_pct)
+        return abs(valor - referencia) <= tolerancia
+
+    # --------------------------------------------------------
+    # FASE 1: testa apenas os áudios. É barato e evita baixar
+    # vários vídeos grandes só para descobrir a duração.
+    # --------------------------------------------------------
+    for indice, par in enumerate(pares[:10], start=1):
+        audio = par["audio"]
+        url_audio = str(audio.get("url") or "").strip()
+
+        if not url_audio or url_audio in urls_audio_vistas:
+            continue
+        urls_audio_vistas.add(url_audio)
+
+        audio_path = f"{prefix}_fb_dash_audio_probe_{indice}.m4a"
+        caminhos_temporarios.add(audio_path)
+
+        try:
+            if os.path.exists(audio_path):
+                os.remove(audio_path)
+
+            _baixar_url_facebook_dash(
+                url_audio,
+                audio_path,
+                referer=url_final,
+                tipo="audio",
+            )
+
+            info_audio = obter_info_midia(audio_path)
+            if not arquivo_possui_audio(info_audio):
+                raise RuntimeError("FACEBOOK_DASH_FAIXA_AUDIO_INVALIDA")
+
+            qualidade = _avaliar_faixa_audio_facebook_dash(
+                audio_path,
+                codec_manifesto=audio.get("codecs"),
+            )
+            if not qualidade.get("audivel"):
+                raise RuntimeError(
+                    "FACEBOOK_DASH_FAIXA_AUDIO_QUASE_MUDA "
+                    f"codec={str(audio.get('codecs') or '')[:40]} "
+                    f"silencio_pct={qualidade.get('silencio_pct', 0):.1f}"
+                )
+
+            duracao_audio = float(
+                qualidade.get("duracao")
+                or info_audio.get("duration")
+                or 0
+            )
+            if duracao_audio <= 0:
+                raise RuntimeError("FACEBOOK_DASH_AUDIO_SEM_DURACAO")
+
+            diferenca = (
+                abs(duracao_audio - duracao_esperada)
+                if duracao_esperada
+                else None
+            )
+            compativel_original = (
+                duracao_compativel(duracao_audio, duracao_esperada)
+                if duracao_esperada
+                else None
+            )
+
+            logger.info(
+                "[FACEBOOK_DASH_AUDIO_CANDIDATO] "
+                f"manifesto={par.get('manifesto')} "
+                f"codec={str(audio.get('codecs') or '')[:40]} "
+                f"bitrate={audio.get('bandwidth')} "
+                f"duracao={duracao_audio:.3f} "
+                f"duracao_esperada={duracao_esperada} "
+                f"compativel_original={compativel_original}"
+            )
+
+            candidatos_audio_validos.append(
+                {
+                    "par": par,
+                    "audio_path": audio_path,
+                    "duracao": duracao_audio,
+                    "qualidade": qualidade,
+                    "diferenca_esperada": diferenca,
+                    "compativel_original": compativel_original,
+                }
+            )
+
+        except Exception as e:
+            ultimo_erro = e
+            logger.warning(
+                "[FACEBOOK_DASH_AUDIO_CANDIDATO_FALHA] "
+                f"manifesto={par.get('manifesto')} "
+                f"codec={str(audio.get('codecs') or '')[:40]} "
+                f"erro={sanitizar_erro_log(e)}"
+            )
+            try:
+                if os.path.exists(audio_path):
+                    os.remove(audio_path)
+            except OSError:
+                pass
+            caminhos_temporarios.discard(audio_path)
+
+    if not candidatos_audio_validos:
+        remover_temporarios()
+        raise RuntimeError(
+            "FACEBOOK_DASH_SEM_AUDIO_AUDIVEL "
+            + sanitizar_erro_log(ultimo_erro or "sem_detalhe", limite=180)
+        )
+
+    # Com duração original conhecida, escolhe primeiro a faixa compatível
+    # e mais próxima. Sem ela, escolhe a faixa audível mais longa.
+    def score_candidato(item):
+        par = item["par"]
+        audio = par["audio"]
+        codec = audio.get("codecs")
+
+        if duracao_esperada:
+            return (
+                1 if item.get("compativel_original") else 0,
+                -float(item.get("diferenca_esperada") or 10**9),
+                float(item.get("duracao") or 0),
+                _prioridade_codec_audio_facebook(codec),
+                int(audio.get("bandwidth") or 0),
+            )
+
+        return (
+            float(item.get("duracao") or 0),
+            _prioridade_codec_audio_facebook(codec),
+            int(audio.get("bandwidth") or 0),
+        )
+
+    candidatos_audio_validos.sort(key=score_candidato, reverse=True)
+
+    melhor_previa = candidatos_audio_validos[0]
+    logger.info(
+        "[FACEBOOK_DASH_AUDIO_ESCOLHIDO] "
+        f"manifesto={melhor_previa['par'].get('manifesto')} "
+        f"codec={str(melhor_previa['par']['audio'].get('codecs') or '')[:40]} "
+        f"duracao={melhor_previa.get('duracao'):.3f} "
+        f"duracao_esperada={duracao_esperada} "
+        f"compativel_original={melhor_previa.get('compativel_original')}"
+    )
+
+    # Se temos duração confiável do Reel e nenhuma faixa chegou perto dela,
+    # é melhor falhar do que entregar outro vídeo truncado.
+    if (
+        duracao_esperada
+        and not any(
+            item.get("compativel_original")
+            for item in candidatos_audio_validos
+        )
+    ):
+        maior = max(
+            float(item.get("duracao") or 0)
+            for item in candidatos_audio_validos
+        )
+        remover_temporarios()
+        raise RuntimeError(
+            "FACEBOOK_DASH_NENHUM_AUDIO_COM_DURACAO_COMPLETA "
+            f"esperada={duracao_esperada:.3f} maior_audio={maior:.3f}"
+        )
+
+    # --------------------------------------------------------
+    # FASE 2: agora baixa somente o vídeo dos melhores áudios,
+    # validando duração antes do mux.
+    # --------------------------------------------------------
+    for tentativa, candidato in enumerate(candidatos_audio_validos, start=1):
+        par = candidato["par"]
+        video = par["video"]
+        audio = par["audio"]
+        audio_path = candidato["audio_path"]
+        duracao_audio = float(candidato["duracao"])
+
+        # Se existe duração original, ignora candidatos já considerados curtos.
+        if duracao_esperada and not candidato.get("compativel_original"):
+            continue
+
+        video_path = f"{prefix}_fb_dash_video.mp4"
+        saida_path = f"{prefix}_fb_dash_mux.mp4"
+        caminhos_temporarios.update((video_path, saida_path))
+
+        for caminho in (video_path, saida_path):
             try:
                 if os.path.exists(caminho):
                     os.remove(caminho)
@@ -5663,17 +5874,15 @@ def baixar_facebook_dash_com_audio(url, prefix):
                 pass
 
         try:
-            video = par["video"]
-            audio = par["audio"]
-
             logger.info(
                 "[FACEBOOK_DASH_TENTATIVA] "
-                f"tentativa={tentativa}/{min(len(pares), 10)} "
+                f"tentativa={tentativa}/{len(candidatos_audio_validos)} "
                 f"manifesto={par.get('manifesto')} "
                 f"video={video.get('width')}x{video.get('height')} "
                 f"video_bitrate={video.get('bandwidth')} "
                 f"audio_codec={str(audio.get('codecs') or '')[:40]} "
-                f"audio_bitrate={audio.get('bandwidth')}"
+                f"audio_bitrate={audio.get('bandwidth')} "
+                f"audio_duracao={duracao_audio:.3f}"
             )
 
             _baixar_url_facebook_dash(
@@ -5682,42 +5891,86 @@ def baixar_facebook_dash_com_audio(url, prefix):
                 referer=url_final,
                 tipo="video",
             )
-            _baixar_url_facebook_dash(
-                audio["url"],
-                audio_path,
-                referer=url_final,
-                tipo="audio",
-            )
 
             info_video = obter_info_midia(video_path)
-            info_audio = obter_info_midia(audio_path)
-
             if not info_video.get("vcodec"):
                 raise RuntimeError("FACEBOOK_DASH_FAIXA_VIDEO_INVALIDA")
-            if not arquivo_possui_audio(info_audio):
-                raise RuntimeError("FACEBOOK_DASH_FAIXA_AUDIO_INVALIDA")
 
-            qualidade_audio = _avaliar_faixa_audio_facebook_dash(
-                audio_path,
-                codec_manifesto=audio.get("codecs"),
-            )
-            if not qualidade_audio.get("audivel"):
+            try:
+                duracao_video = float(info_video.get("duration") or 0)
+            except (TypeError, ValueError):
+                duracao_video = 0.0
+
+            if duracao_video <= 0:
+                raise RuntimeError("FACEBOOK_DASH_VIDEO_SEM_DURACAO")
+
+            # Vídeo e áudio do mesmo manifest devem cobrir praticamente
+            # o mesmo período. Rejeita o teaser/corte de 43s.
+            if not duracao_compativel(
+                duracao_video,
+                duracao_audio,
+                tolerancia_pct=0.08,
+                tolerancia_min=3.0,
+            ):
                 raise RuntimeError(
-                    "FACEBOOK_DASH_FAIXA_AUDIO_QUASE_MUDA "
-                    f"codec={str(audio.get('codecs') or '')[:40]} "
-                    f"silencio_pct={qualidade_audio.get('silencio_pct', 0):.1f}"
+                    "FACEBOOK_DASH_VIDEO_AUDIO_DURACAO_DIVERGENTE "
+                    f"video={duracao_video:.3f} audio={duracao_audio:.3f}"
                 )
+
+            if (
+                duracao_esperada
+                and not duracao_compativel(
+                    duracao_video,
+                    duracao_esperada,
+                    tolerancia_pct=0.08,
+                    tolerancia_min=3.0,
+                )
+            ):
+                raise RuntimeError(
+                    "FACEBOOK_DASH_VIDEO_TRUNCADO "
+                    f"video={duracao_video:.3f} esperada={duracao_esperada:.3f}"
+                )
+
+            logger.info(
+                "[FACEBOOK_DASH_DURACAO_OK] "
+                f"manifesto={par.get('manifesto')} "
+                f"video={duracao_video:.3f} "
+                f"audio={duracao_audio:.3f} "
+                f"esperada={duracao_esperada}"
+            )
 
             _muxar_facebook_dash(video_path, audio_path, saida_path)
 
-            # Remove as faixas separadas; deixa somente o MP4 final.
-            for caminho in (video_path, audio_path):
-                try:
-                    if os.path.exists(caminho):
-                        os.remove(caminho)
-                except OSError:
-                    pass
+            info_saida = obter_info_midia(saida_path)
+            try:
+                duracao_saida = float(info_saida.get("duration") or 0)
+            except (TypeError, ValueError):
+                duracao_saida = 0.0
 
+            if duracao_saida <= 0:
+                raise RuntimeError("FACEBOOK_DASH_MUX_SEM_DURACAO")
+
+            referencia_final = duracao_esperada or duracao_audio
+            if not duracao_compativel(
+                duracao_saida,
+                referencia_final,
+                tolerancia_pct=0.08,
+                tolerancia_min=3.0,
+            ):
+                raise RuntimeError(
+                    "FACEBOOK_DASH_MUX_TRUNCADO "
+                    f"saida={duracao_saida:.3f} referencia={referencia_final:.3f}"
+                )
+
+            logger.info(
+                "[FACEBOOK_DASH_DURACAO_FINAL_OK] "
+                f"duracao={duracao_saida:.3f} "
+                f"referencia={referencia_final:.3f}"
+            )
+
+            # Mantém somente o MP4 final.
+            remover_temporarios(exceto={saida_path})
+            caminhos_temporarios.discard(saida_path)
             return saida_path
 
         except Exception as e:
@@ -5725,18 +5978,21 @@ def baixar_facebook_dash_com_audio(url, prefix):
             logger.warning(
                 "[FACEBOOK_DASH_TENTATIVA_FALHA] "
                 f"tentativa={tentativa} "
+                f"manifesto={par.get('manifesto')} "
                 f"erro={sanitizar_erro_log(e)}"
             )
-            for caminho in (video_path, audio_path, saida_path):
+            for caminho in (video_path, saida_path):
                 try:
                     if os.path.exists(caminho):
                         os.remove(caminho)
                 except OSError:
                     pass
+                caminhos_temporarios.discard(caminho)
 
+    remover_temporarios()
     raise RuntimeError(
         "FACEBOOK_DASH_FALLBACK_FALHOU "
-        + sanitizar_erro_log(ultimo_erro or "sem_detalhe", limite=200)
+        + sanitizar_erro_log(ultimo_erro or "sem_detalhe", limite=220)
     )
 
 
@@ -12833,7 +13089,11 @@ def _processar_download(message, url, status_msg, reserva_download=None):
                 f"url_ref={referencia_url_log(url)}"
             )
             try:
-                arquivo_dash = baixar_facebook_dash_com_audio(url, prefix)
+                arquivo_dash = baixar_facebook_dash_com_audio(
+                    url,
+                    prefix,
+                    duracao_esperada=duracao,
+                )
                 if arquivo_dash and os.path.exists(arquivo_dash):
                     info_dash = obter_info_midia(arquivo_dash)
                     if not arquivo_possui_audio(info_dash):
