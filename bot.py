@@ -220,6 +220,11 @@ INSTAGRAM_AUDIO_CACHE_VERSION = "instagram_audio_v5_nocookies"
 FACEBOOK_AUDIO_CACHE_VERSION = "facebook_audio_v2"
 ML_CLIPS_CACHE_VERSION = "ml_clips_hls_720_v1"
 
+# Desativação temporária para o lançamento/ADS.
+# O código das plataformas continua preservado para reativação futura.
+INSTAGRAM_DOWNLOADS_ENABLED = False
+FACEBOOK_REELS_DOWNLOADS_ENABLED = False
+
 TIKTOK_COOKIES_TEXT = os.environ.get("TIKTOK_COOKIES_TEXT", "")
 TIKTOK_DEVICE_ID_TEXT = os.environ.get("TIKTOK_DEVICE_ID", "")
 TIKWM_API_URL = os.environ.get("TIKWM_API_URL", "https://www.tikwm.com/api/").strip()
@@ -6781,8 +6786,7 @@ def mostrar_planos_chat(chat_id, user_id):
         "VIP Mensal por *R$ 10,00* com 30 dias de acesso.\n\n"
         "✅ Sem limite diário\n"
         "✅ Prioridade no processamento\n"
-        "✅ TikTok, Pinterest, Instagram, Facebook Reels, Shopee Video, "
-        "Mercado Livre Clips e RedNote\n"
+        "✅ TikTok, Pinterest, Shopee Video, Mercado Livre Clips e RedNote\n"
         "✅ Pagamento exclusivamente via Pix\n"
         "✅ Liberação após conferência do pagamento\n\n"
         f"Sua ID: `{user_id}`"
@@ -7468,14 +7472,20 @@ def montar_relatorio_diagnostico():
         linhas.append("⚠️ TikTok sem marca: pausa automática temporária")
         problemas.append("Circuito TikTok temporariamente pausado")
 
-    linhas.append("✅ Instagram: modo público/anônimo, sem cookies")
+    if INSTAGRAM_DOWNLOADS_ENABLED:
+        linhas.append("✅ Instagram: modo público/anônimo, sem cookies")
+    else:
+        linhas.append("⏸️ Instagram: temporariamente desativado")
     linhas.append(
         "✅ Cookies do TikTok: configurados"
         if TIKTOK_COOKIES_TEXT.strip()
         else "ℹ️ Cookies do TikTok: não configurados (opcional)"
     )
     linhas.append("✅ Pinterest: suporte ativo")
-    linhas.append("✅ Facebook Reels: links públicos, sem cookies")
+    if FACEBOOK_REELS_DOWNLOADS_ENABLED:
+        linhas.append("✅ Facebook Reels: links públicos, sem cookies")
+    else:
+        linhas.append("⏸️ Facebook Reels: temporariamente desativado")
     linhas.append("✅ Shopee Vídeo: suporte ativo")
     linhas.append(
         "✅ Mercado Livre Clips: HLS público, sem login, cookies ou token"
@@ -8530,7 +8540,7 @@ def start(message):
 
     texto = (
         "📥 *Baixar Vídeos HD*\n\n"
-        "Baixe vídeos do TikTok, Pinterest, Instagram, Facebook Reels, Shopee Video, Mercado Livre Clips e RedNote.\n\n"
+        "Baixe vídeos do TikTok, Pinterest, Shopee Video, Mercado Livre Clips e RedNote.\n\n"
         "• Qualidade: até 720×1280\n"
         f"• Duração máxima: {MAX_DURATION_SECONDS} segundos\n"
         f"• ID de usuário: `{message.from_user.id}`\n\n"
@@ -10767,6 +10777,30 @@ def _processar_download(message, url, status_msg, reserva_download=None):
             is_mercado_livre_clips,
         )
 
+        if is_instagram and not INSTAGRAM_DOWNLOADS_ENABLED:
+            texto_pausado = (
+                "🚧 Instagram está temporariamente indisponível enquanto ajustamos "
+                "a compatibilidade dos downloads com áudio. Por enquanto, envie links "
+                "do TikTok, Pinterest, Shopee Video, Mercado Livre Clips ou RedNote."
+            )
+            if status_msg:
+                safe_edit_message(message.chat.id, status_msg.message_id, texto_pausado)
+            else:
+                safe_send_message(message.chat.id, texto_pausado)
+            return
+
+        if is_facebook_reel and not FACEBOOK_REELS_DOWNLOADS_ENABLED:
+            texto_pausado = (
+                "🚧 Facebook Reels está temporariamente indisponível enquanto ajustamos "
+                "a compatibilidade dos downloads com áudio. Por enquanto, envie links "
+                "do TikTok, Pinterest, Shopee Video, Mercado Livre Clips ou RedNote."
+            )
+            if status_msg:
+                safe_edit_message(message.chat.id, status_msg.message_id, texto_pausado)
+            else:
+                safe_send_message(message.chat.id, texto_pausado)
+            return
+
         if is_instagram:
             url = normalizar_url_instagram(url)
         elif is_facebook_reel:
@@ -10790,7 +10824,7 @@ def _processar_download(message, url, status_msg, reserva_download=None):
         ):
             texto_nao_reconhecido = (
                 "❌ Link não reconhecido. Envie um link do TikTok, Pinterest, "
-                "Instagram, Facebook Reels, Shopee Video, Mercado Livre Clips ou RedNote."
+                "Shopee Video, Mercado Livre Clips ou RedNote."
             )
             if status_msg:
                 safe_edit_message(message.chat.id, status_msg.message_id, texto_nao_reconhecido)
@@ -11972,11 +12006,33 @@ def handle_download(message):
         safe_reply_to(message, "❌ Não encontrei um link válido na sua mensagem.")
         return
 
-    if not any(detectar_plataforma(url)):
+    plataformas = detectar_plataforma(url)
+    is_instagram = plataformas[2]
+    is_facebook_reel = plataformas[4]
+
+    if is_instagram and not INSTAGRAM_DOWNLOADS_ENABLED:
+        safe_reply_to(
+            message,
+            "🚧 Instagram está temporariamente indisponível enquanto ajustamos "
+            "a compatibilidade dos downloads com áudio. Por enquanto, envie links "
+            "do TikTok, Pinterest, Shopee Video, Mercado Livre Clips ou RedNote.",
+        )
+        return
+
+    if is_facebook_reel and not FACEBOOK_REELS_DOWNLOADS_ENABLED:
+        safe_reply_to(
+            message,
+            "🚧 Facebook Reels está temporariamente indisponível enquanto ajustamos "
+            "a compatibilidade dos downloads com áudio. Por enquanto, envie links "
+            "do TikTok, Pinterest, Shopee Video, Mercado Livre Clips ou RedNote.",
+        )
+        return
+
+    if not any(plataformas):
         safe_reply_to(
             message,
             "❌ Link não reconhecido. Envie um link do TikTok, Pinterest, "
-            "Instagram, Facebook Reels, Shopee Video, Mercado Livre Clips ou RedNote.",
+            "Shopee Video, Mercado Livre Clips ou RedNote.",
         )
         return
 
@@ -12379,17 +12435,24 @@ if __name__ == "__main__":
             parse_mode="HTML",
         )
     logger.info("[PAGAMENTO_CONFIG] modo=manual_pix configurado=True")
-    logger.info(
-        "[INSTAGRAM_AUDIO_CONFIG] validacao=True "
-        f"cache_version={INSTAGRAM_AUDIO_CACHE_VERSION} "
-        "prefer_h264=True fallback_com_audio=True"
-    )
-    logger.info(
-        "[FACEBOOK_REELS_CONFIG] publico_somente=True cookies=False "
-        "max_duration_compartilhado=True prefer_h264=True "
-        "validacao_audio=True fallback_publico=True rejeita_sem_audio=True "
-        f"cache_version={FACEBOOK_AUDIO_CACHE_VERSION}"
-    )
+    if INSTAGRAM_DOWNLOADS_ENABLED:
+        logger.info(
+            "[INSTAGRAM_AUDIO_CONFIG] ativo=True validacao=True "
+            f"cache_version={INSTAGRAM_AUDIO_CACHE_VERSION} "
+            "prefer_h264=True fallback_com_audio=True"
+        )
+    else:
+        logger.warning("[INSTAGRAM_CONFIG] ativo=False motivo=pausa_temporaria_audio")
+
+    if FACEBOOK_REELS_DOWNLOADS_ENABLED:
+        logger.info(
+            "[FACEBOOK_REELS_CONFIG] ativo=True publico_somente=True cookies=False "
+            "max_duration_compartilhado=True prefer_h264=True "
+            "validacao_audio=True fallback_publico=True rejeita_sem_audio=True "
+            f"cache_version={FACEBOOK_AUDIO_CACHE_VERSION}"
+        )
+    else:
+        logger.warning("[FACEBOOK_REELS_CONFIG] ativo=False motivo=pausa_temporaria_audio")
     if TIKTOK_IMPERSONATION_DISPONIVEL:
         logger.info(f"[TIKTOK_DEPENDENCIAS] curl_cffi={CURL_CFFI_VERSION}")
     else:
