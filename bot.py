@@ -5360,12 +5360,30 @@ def confirmar_download_gratis(
         return True
 
     reserva["delivered"] = True
+    agora_utc = datetime.now(timezone.utc).replace(tzinfo=None)
     resultado = _atualizar_reserva_com_retentativas(
         {
             "_id": str(user_id),
             "download_reserva.token": reserva["token"],
         },
-        {"$unset": {"download_reserva": ""}},
+        [
+            {
+                "$set": {
+                    # O primeiro download é um sinal de ativação importante para
+                    # medir se o tráfego dos anúncios realmente usou o bot.
+                    "primeiro_download_em": {
+                        "$ifNull": ["$primeiro_download_em", agora_utc]
+                    },
+                    "downloads_total_usuario": {
+                        "$add": [
+                            {"$ifNull": ["$downloads_total_usuario", 0]},
+                            1,
+                        ]
+                    },
+                    "download_reserva": "$$REMOVE",
+                }
+            }
+        ],
         "CONFIRMAR",
     )
     if resultado is None:
@@ -6311,10 +6329,13 @@ def _parsear_payload_aquisicao(payload):
     prefixo = partes[0] if partes else ""
 
     mapa_origem = {
-        "fbads": "facebook_ads",
-        "facebook": "facebook_ads",
-        "meta": "facebook_ads",
-        "igads": "instagram_ads",
+        # Todos os placements pagos da Meta entram na mesma origem. A campanha
+        # e o anúncio continuam separados, então o relatório consegue comparar
+        # criativos sem misturar tráfego orgânico do Instagram/Facebook.
+        "fbads": "meta_ads",
+        "facebook": "meta_ads",
+        "meta": "meta_ads",
+        "igads": "meta_ads",
         "instagram": "instagram",
         "yt": "youtube",
         "youtube": "youtube",
@@ -7709,7 +7730,7 @@ def diagnostico_admin(message):
 
 
 @bot.message_handler(commands=["linkads"])
-def gerar_link_facebook_ads(message):
+def gerar_link_meta_ads(message):
     if not exigir_admin_privado(message):
         return
 
@@ -7717,9 +7738,10 @@ def gerar_link_facebook_ads(message):
     if len(partes) < 2:
         safe_reply_to(
             message,
-            "📣 *Gerar link rastreável*\n\n"
+            "📣 *Gerar link rastreável para Meta Ads*\n\n"
             "Use: `/linkads campanha anuncio`\n"
-            "Exemplo: `/linkads escala01 shopee01`",
+            "Exemplo: `/linkads escala01 shopee01`\n\n"
+            "Crie um link diferente para cada anúncio que quiser comparar.",
             parse_mode="Markdown",
         )
         return
@@ -7733,7 +7755,7 @@ def gerar_link_facebook_ads(message):
         safe_reply_to(message, "❌ Use nomes simples para campanha e anúncio.")
         return
 
-    payload = f"fbads_{campanha}_{anuncio}"
+    payload = f"meta_{campanha}_{anuncio}"
     if len(payload) > 64:
         safe_reply_to(message, "❌ Campanha/anúncio ficaram longos demais.")
         return
@@ -7745,7 +7767,7 @@ def gerar_link_facebook_ads(message):
         link = f"https://t.me/{username}?start={payload}"
         safe_send_message(
             message.chat.id,
-            "📣 <b>Link rastreável criado</b>\n\n"
+            "📣 <b>Link rastreável para Meta Ads criado</b>\n\n"
             f"Campanha: <code>{html.escape(campanha)}</code>\n"
             f"Anúncio: <code>{html.escape(anuncio)}</code>\n\n"
             f"<code>{html.escape(link)}</code>\n\n"
@@ -7769,9 +7791,18 @@ def relatorio_origens_aquisicao(message):
     if not exigir_admin_privado(message):
         return
 
-    status = safe_reply_to(message, "📊 Calculando origens e conversões...")
+    status = safe_reply_to(message, "📊 Calculando funil de aquisição...")
 
     try:
+        # Pedido criado = intenção de compra. Pagamento aprovado = conversão.
+        iniciaram_pagamento = {
+            str(uid)
+            for uid in pedidos_col.distinct(
+                "user_id",
+                {"plano_key": {"$exists": True}},
+            )
+            if uid is not None
+        }
         pagantes = {
             str(uid)
             for uid in pedidos_col.distinct(
@@ -7782,10 +7813,19 @@ def relatorio_origens_aquisicao(message):
         }
 
         grupos = {}
+        grupos_meta = {}
         total = 0
+        total_ativados = 0
+        total_iniciaram_pagamento = 0
         total_pagantes = 0
         total_vips_ativos = 0
         rastreados = 0
+
+        def normalizar_origem_relatorio(valor):
+            origem = str(valor or "legado_sem_origem")
+            if origem in {"facebook_ads", "instagram_ads", "meta_ads"}:
+                return "meta_ads"
+            return origem
 
         cursor = usuarios_col.find(
             {},
@@ -7795,34 +7835,83 @@ def relatorio_origens_aquisicao(message):
                 "campanha": 1,
                 "anuncio": 1,
                 "vip_ate": 1,
+                "primeiro_download_em": 1,
+                "downloads_total_usuario": 1,
+                "downloads_hoje": 1,
+                "ultima_data": 1,
             },
         )
         for usuario in cursor:
             total += 1
             uid = str(usuario.get("_id"))
-            origem = str(usuario.get("origem") or "legado_sem_origem")
-            if origem != "legado_sem_origem":
+            origem_original = str(usuario.get("origem") or "legado_sem_origem")
+            origem = normalizar_origem_relatorio(origem_original)
+            if origem_original != "legado_sem_origem":
                 rastreados += 1
+
+            # Compatibilidade com usuários anteriores à métrica de ativação:
+            # quem já baixou hoje também conta como ativado.
+            ativado = bool(
+                usuario.get("primeiro_download_em")
+                or int(usuario.get("downloads_total_usuario") or 0) > 0
+                or (
+                    usuario.get("ultima_data") == hoje_str()
+                    and int(usuario.get("downloads_hoje") or 0) > 0
+                )
+            )
+            iniciou_pagamento = uid in iniciaram_pagamento
+            pagou = uid in pagantes
+            vip_ativo = is_vip_user(usuario)
 
             grupo = grupos.setdefault(
                 origem,
-                {"usuarios": 0, "pagantes": 0, "vips_ativos": 0},
+                {
+                    "usuarios": 0,
+                    "ativados": 0,
+                    "iniciaram_pagamento": 0,
+                    "pagantes": 0,
+                    "vips_ativos": 0,
+                },
             )
             grupo["usuarios"] += 1
+            grupo["ativados"] += int(ativado)
+            grupo["iniciaram_pagamento"] += int(iniciou_pagamento)
+            grupo["pagantes"] += int(pagou)
+            grupo["vips_ativos"] += int(vip_ativo)
 
-            if uid in pagantes:
-                grupo["pagantes"] += 1
-                total_pagantes += 1
+            total_ativados += int(ativado)
+            total_iniciaram_pagamento += int(iniciou_pagamento)
+            total_pagantes += int(pagou)
+            total_vips_ativos += int(vip_ativo)
 
-            if is_vip_user(usuario):
-                grupo["vips_ativos"] += 1
-                total_vips_ativos += 1
+            if origem == "meta_ads":
+                campanha = str(usuario.get("campanha") or "sem-campanha")[:24]
+                anuncio = str(usuario.get("anuncio") or "geral")[:32]
+                chave_meta = (campanha, anuncio)
+                meta = grupos_meta.setdefault(
+                    chave_meta,
+                    {
+                        "usuarios": 0,
+                        "ativados": 0,
+                        "iniciaram_pagamento": 0,
+                        "pagantes": 0,
+                    },
+                )
+                meta["usuarios"] += 1
+                meta["ativados"] += int(ativado)
+                meta["iniciaram_pagamento"] += int(iniciou_pagamento)
+                meta["pagantes"] += int(pagou)
+
+        def percentual(parte, base):
+            return (parte * 100 / base) if base else 0.0
 
         linhas = [
-            "📊 *Origem dos usuários*",
+            "📊 *Funil de aquisição*",
             "",
             f"👥 Usuários: `{total}`",
             f"🏷️ Com origem rastreada: `{rastreados}`",
+            f"▶️ Ativados rastreados (baixaram): `{total_ativados}`",
+            f"🧾 Iniciaram Pix: `{total_iniciaram_pagamento}`",
             f"💳 Pagantes únicos: `{total_pagantes}`",
             f"💎 VIPs ativos: `{total_vips_ativos}`",
             "",
@@ -7833,17 +7922,34 @@ def relatorio_origens_aquisicao(message):
             grupos.items(),
             key=lambda item: item[1]["usuarios"],
             reverse=True,
-        )[:12]:
+        )[:10]:
             usuarios = dados["usuarios"]
-            pag = dados["pagantes"]
-            taxa = (pag * 100 / usuarios) if usuarios else 0.0
             linhas.append(
                 f"• `{origem}` — {usuarios} usuários | "
-                f"{pag} pagantes ({taxa:.1f}%) | "
-                f"{dados['vips_ativos']} VIPs ativos"
+                f"{dados['ativados']} baixaram ({percentual(dados['ativados'], usuarios):.1f}%) | "
+                f"{dados['iniciaram_pagamento']} Pix | "
+                f"{dados['pagantes']} pagos ({percentual(dados['pagantes'], usuarios):.1f}%)"
             )
 
+        if grupos_meta:
+            linhas.extend(["", "*Meta Ads — campanha / anúncio:* "])
+            for (campanha, anuncio), dados in sorted(
+                grupos_meta.items(),
+                key=lambda item: item[1]["usuarios"],
+                reverse=True,
+            )[:12]:
+                usuarios = dados["usuarios"]
+                linhas.append(
+                    f"• `{campanha}` / `{anuncio}` — {usuarios} usuários | "
+                    f"{dados['ativados']} baixaram | "
+                    f"{dados['iniciaram_pagamento']} Pix | "
+                    f"{dados['pagantes']} pagos ({percentual(dados['pagantes'], usuarios):.1f}%)"
+                )
+
         texto = "\n".join(linhas)
+        if len(texto) > 3900:
+            texto = texto[:3850] + "\n\n… relatório resumido para caber no Telegram."
+
         if status and getattr(status, "message_id", None):
             safe_edit_message(
                 message.chat.id,
@@ -7856,8 +7962,10 @@ def relatorio_origens_aquisicao(message):
 
         logger.info(
             "[ORIGENS_RELATORIO] "
-            f"usuarios={total} rastreados={rastreados} "
-            f"pagantes={total_pagantes} vips_ativos={total_vips_ativos}"
+            f"usuarios={total} rastreados={rastreados} ativados={total_ativados} "
+            f"pix_iniciados={total_iniciaram_pagamento} "
+            f"pagantes={total_pagantes} vips_ativos={total_vips_ativos} "
+            f"meta_grupos={len(grupos_meta)}"
         )
     except Exception as e:
         logger.error(
@@ -8519,7 +8627,21 @@ def start(message):
             f"erro={sanitizar_erro_log(e)}"
         )
 
-    user = obter_usuario(message.from_user.id)
+    try:
+        user = obter_usuario(message.from_user.id)
+    except Exception as e:
+        logger.error(
+            "[START_USUARIO_ERRO] "
+            f"user_ref={referencia_usuario_log(message.from_user.id)} "
+            f"erro={sanitizar_erro_log(e)}"
+        )
+        safe_send_message(
+            message.chat.id,
+            "⏳ O bot está online, mas o sistema de cadastro está temporariamente "
+            "indisponível. Aguarde alguns instantes e toque em /start novamente.",
+        )
+        return
+
     vip = is_vip_user(user)
 
     if vip:
@@ -11998,7 +12120,21 @@ def handle_download(message):
         )
         return
 
-    user = obter_usuario(message.from_user.id)
+    try:
+        user = obter_usuario(message.from_user.id)
+    except Exception as e:
+        logger.error(
+            "[DOWNLOAD_USUARIO_ERRO] "
+            f"user_ref={referencia_usuario_log(message.from_user.id)} "
+            f"erro={sanitizar_erro_log(e)}"
+        )
+        safe_reply_to(
+            message,
+            "⏳ O sistema de cadastro está temporariamente indisponível. "
+            "Aguarde alguns instantes e envie o link novamente.",
+        )
+        return
+
     vip_status = is_vip_user(user)
 
     url = extrair_primeira_url(message.text)
@@ -12353,7 +12489,11 @@ if __name__ == "__main__":
     logger.info("[VIP_SYNC_POLICY] paid_sozinho_nao_reativa=True exige_vip_aplicado_ao_pedido=True respeita_bloqueio_admin=True")
     logger.info("[START_FIX] mongo_update_conflict=False tracking_nao_bloqueia_start=True vip_e_gratis=True")
     logger.info("[BACKUP_MENU_CONFIG] backupvips=True backupgeral=True")
-    logger.info("[AQUISICAO_CONFIG] deep_link=True linkads=True origens=True origem_imutavel=True")
+    logger.info("[AQUISICAO_CONFIG] deep_link=True linkads=True origens=True origem_imutavel=True funil_ativacao=True meta_breakdown=True")
+    logger.info(
+        "[PLATAFORMAS_LANCAMENTO] ativas=TikTok,Pinterest,ShopeeVideo,MercadoLivreClips,RedNote "
+        "instagram=False facebook_reels=False"
+    )
     logger.info("[BACKUP_VERIFY_CONFIG] schema=2 json_roundtrip=True dry_run=True db_writes=0")
     logger.info("[VIP_PLAN_CONFIG] novos=mensal anual=historico_nao_vendavel")
     logger.info("[QUEUE_PRIORITY_CONFIG] admin=-1 vip=0 gratis=1 worker_compartilhado=True")
