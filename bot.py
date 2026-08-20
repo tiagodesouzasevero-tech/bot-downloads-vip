@@ -1147,6 +1147,22 @@ def informar_download_pausado_por_espaco(message, status_msg):
     safe_send_message(message.chat.id, texto)
 
 
+def loop_watchdog_worker():
+    """Monitora o worker em uma thread dedicada, isolada da manutenção geral."""
+    logger.info(
+        f"[WORKER_WATCHDOG_LOOP] iniciado intervalo="
+        f"{WORKER_WATCHDOG_INTERVAL_SECONDS}s"
+    )
+    while not SHUTDOWN_EVENT.is_set():
+        try:
+            verificar_travamento_worker()
+        except Exception as e:
+            logger.warning(f"[WORKER_WATCHDOG] erro={sanitizar_erro_log(e)}")
+        SHUTDOWN_EVENT.wait(WORKER_WATCHDOG_INTERVAL_SECONDS)
+
+    logger.info("[WORKER_WATCHDOG_LOOP] encerrado durante drenagem")
+
+
 def cleanup_download_dir_periodicamente(interval_minutes=60, max_age_hours=6):
     intervalo_segundos = max(300, int(interval_minutes * 60))
     proxima_limpeza = time.monotonic() + intervalo_segundos
@@ -1158,26 +1174,26 @@ def cleanup_download_dir_periodicamente(interval_minutes=60, max_age_hours=6):
     logger.info(
         f"[MAINTENANCE_LOOP] iniciado cleanup_minutes={interval_minutes} "
         f"max_age_hours={max_age_hours} "
-        f"watchdog_seconds={WORKER_WATCHDOG_INTERVAL_SECONDS} "
         f"vip_notice_check_seconds={VIP_EXPIRATION_NOTICE_CHECK_SECONDS} "
         f"queue_recovery_delay_seconds={QUEUE_RECOVERY_DELAY_SECONDS} "
         f"queue_recovery_ttl_hours={QUEUE_RECOVERY_TTL_HOURS} "
-        "queue_recovery_contains_urls=False"
+        "watchdog_separado=True queue_recovery_contains_urls=False"
     )
 
     while not SHUTDOWN_EVENT.is_set():
-        try:
-            verificar_travamento_worker()
-        except Exception as e:
-            logger.warning(f"[WORKER_WATCHDOG] erro={sanitizar_erro_log(e)}")
-
         agora_monotonic = time.monotonic()
         if (
             not recuperacao_fila_executada
             and agora_monotonic >= recuperar_fila_em
         ):
-            recuperar_fila_interrompida()
-            recuperacao_fila_executada = True
+            try:
+                recuperar_fila_interrompida()
+                recuperacao_fila_executada = True
+            except Exception as e:
+                logger.warning(
+                    f"[FILA_RECUPERACAO_LOOP] erro={sanitizar_erro_log(e)}"
+                )
+                recuperar_fila_em = time.monotonic() + 60
 
         if agora_monotonic >= proxima_limpeza:
             try:
@@ -1203,7 +1219,7 @@ def cleanup_download_dir_periodicamente(interval_minutes=60, max_age_hours=6):
         espera = max(
             0.25,
             min(
-                WORKER_WATCHDOG_INTERVAL_SECONDS,
+                60,
                 proxima_atividade - time.monotonic(),
             ),
         )
@@ -12625,12 +12641,20 @@ if __name__ == "__main__":
     Thread(
         target=cleanup_download_dir_periodicamente,
         kwargs={"interval_minutes": 60, "max_age_hours": 6},
-        daemon=True
+        daemon=True,
+        name="maintenance-loop",
+    ).start()
+
+    Thread(
+        target=loop_watchdog_worker,
+        daemon=True,
+        name="worker-watchdog",
     ).start()
 
     Thread(
         target=loop_fila_downloads,
         daemon=True,
+        name="download-worker",
     ).start()
 
     Thread(
