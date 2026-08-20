@@ -18,7 +18,7 @@ import stat
 from collections import defaultdict, deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from queue import Empty, Full, PriorityQueue
-from threading import Event, Lock, Thread
+from threading import Event, Lock, Thread, enumerate as enumerate_threads
 from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlparse
 from zoneinfo import ZoneInfo
@@ -12447,6 +12447,74 @@ def montar_payload_health():
     }
 
 
+def thread_critica_esta_viva(nome):
+    """Confere threads críticas pelo nome sem expor detalhes internos no endpoint."""
+    return any(
+        thread.name == nome and thread.is_alive()
+        for thread in enumerate_threads()
+    )
+
+
+def verificar_mongodb_readiness():
+    """Executa um ping simples para o readiness sem alterar métricas/monitoramento."""
+    try:
+        client.admin.command("ping")
+        return True
+    except Exception:
+        return False
+
+
+def montar_payload_ready():
+    """Readiness real: responde 200 só quando o bot pode operar normalmente."""
+    estado, ultima_atividade = obter_estado_bot()
+    worker = obter_saude_worker()
+    encerrando = SHUTDOWN_EVENT.is_set()
+    threads = {
+        "download_worker": thread_critica_esta_viva("download-worker"),
+        "watchdog": thread_critica_esta_viva("worker-watchdog"),
+        "maintenance": thread_critica_esta_viva("maintenance-loop"),
+    }
+    mongodb_ok = verificar_mongodb_readiness()
+
+    motivos = []
+    if encerrando:
+        motivos.append("shutdown_em_andamento")
+    if estado != "polling":
+        motivos.append("telegram_polling_inativo")
+    if not worker["running"] or not threads["download_worker"]:
+        motivos.append("download_worker_inativo")
+    if worker["stalled"]:
+        motivos.append("download_worker_travado")
+    if not threads["watchdog"]:
+        motivos.append("watchdog_inativo")
+    if not threads["maintenance"]:
+        motivos.append("maintenance_inativa")
+    if not mongodb_ok:
+        motivos.append("mongodb_indisponivel")
+
+    pronto = not motivos
+    return {
+        "status": "ready" if pronto else "not_ready",
+        "service": SERVICE_NAME,
+        "bot": estado,
+        "accepting_downloads": not encerrando,
+        "worker": {
+            "status": worker.get("status"),
+            "running": worker.get("running"),
+            "busy": worker.get("busy"),
+            "stalled": worker.get("stalled"),
+            "phase": worker.get("phase"),
+            "queue_size": worker.get("queue_size"),
+            "queue_capacity": worker.get("queue_capacity"),
+        },
+        "threads": threads,
+        "mongodb": "ok" if mongodb_ok else "unavailable",
+        "reasons": motivos,
+        "started_at": APP_STARTED_AT,
+        "last_update_at": ultima_atividade,
+    }
+
+
 class HealthRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         caminho = urlparse(self.path).path
@@ -12462,6 +12530,13 @@ class HealthRequestHandler(BaseHTTPRequestHandler):
             # O endpoint é de vida do contêiner. Polling ou worker degradados
             # aparecem no JSON sem provocar ciclos automáticos de reinício.
             status = 200
+        elif caminho == "/ready":
+            payload = montar_payload_ready()
+            corpo = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            content_type = "application/json; charset=utf-8"
+            # Readiness é separado do liveness: 503 indica que o processo está
+            # vivo, porém não está pronto para atender downloads normalmente.
+            status = 200 if payload.get("status") == "ready" else 503
         else:
             corpo = b"NOT FOUND"
             content_type = "text/plain; charset=utf-8"
@@ -12518,6 +12593,10 @@ if __name__ == "__main__":
         "instagram=False facebook_reels=False"
     )
     logger.info("[BACKUP_VERIFY_CONFIG] schema=2 json_roundtrip=True dry_run=True db_writes=0")
+    logger.info(
+        "[READY_CONFIG] endpoint=/ready liveness_separado=True "
+        "checks=polling,download_worker,watchdog,maintenance,mongodb"
+    )
     logger.info("[VIP_PLAN_CONFIG] novos=mensal anual=historico_nao_vendavel")
     logger.info("[QUEUE_PRIORITY_CONFIG] admin=-1 vip=0 gratis=1 worker_compartilhado=True")
     logger.info("[ML_CLIPS_CONFIG] enabled=True login=False cookies=False token=False source=public_mobile_html_hls dns_guard=host_allowlist")
