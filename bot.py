@@ -12093,17 +12093,24 @@ def loop_fila_downloads():
                 DOWNLOAD_QUEUE.task_done()
     finally:
         definir_estado_worker_download(False)
+
         if SHUTDOWN_EVENT.is_set():
             logger.info("[DOWNLOAD_QUEUE] worker encerrado durante drenagem")
         else:
-            logger.error("[DOWNLOAD_QUEUE] worker encerrado inesperadamente")
+            logger.critical(
+                "[DOWNLOAD_QUEUE] worker encerrado inesperadamente; "
+                "reinicio_do_processo=True"
+            )
+
             safe_send_message(
                 ADMIN_ID,
-                "❌ <b>Worker de downloads encerrado</b>\n\n"
-                "O processo principal continua ativo, mas a fila não será "
-                "processada até o serviço ser reiniciado.",
+                "🚨 <b>Worker de downloads encerrado inesperadamente</b>\n\n"
+                "O processo será reiniciado automaticamente para restaurar "
+                "o processamento da fila.",
                 parse_mode="HTML",
             )
+
+            _encerrar_processo_para_reinicio()
 
 
 @bot.message_handler(func=lambda message: message.text and "http" in message.text.lower())
