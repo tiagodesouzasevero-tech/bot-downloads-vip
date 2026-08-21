@@ -7935,8 +7935,7 @@ def montar_html_landing_ads(payload):
     <p class="lead">Baixe vídeos direto pelo Telegram de forma simples.</p>
     <div class="beneficios">
       ✅ 3 downloads gratuitos<br>
-      ✅ TikTok, Pinterest e Shopee<br>
-      ✅ Mercado Livre Clips e RedNote
+      ✅ TikTok • Pinterest • Shopee Vídeos • Mercado Livre Clips • RedNote
     </div>
     <a class="btn" href="{caminho_abrir}">ABRIR NO TELEGRAM</a>
     <p class="instrucao">
