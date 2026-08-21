@@ -17,6 +17,7 @@ import shutil
 import stat
 from collections import defaultdict, deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.cookies import SimpleCookie
 from queue import Empty, Full, PriorityQueue
 from threading import Event, Lock, Thread, enumerate as enumerate_threads
 from datetime import datetime, timedelta, timezone
@@ -112,6 +113,20 @@ ENVIRONMENT_NAME = get_first_env(
     ["RAILWAY_ENVIRONMENT_NAME", "RAILWAY_ENVIRONMENT", "ENVIRONMENT"],
     default="production"
 )
+
+# URL pública usada pela landing page dos anúncios. Railway costuma expor
+# RAILWAY_PUBLIC_DOMAIN automaticamente; o fallback abaixo mantém o domínio
+# atual do projeto funcionando sem exigir uma nova variável.
+PUBLIC_BASE_URL = str(os.environ.get("PUBLIC_BASE_URL", "") or "").strip().rstrip("/")
+if not PUBLIC_BASE_URL:
+    railway_public_domain = str(
+        os.environ.get("RAILWAY_PUBLIC_DOMAIN", "") or ""
+    ).strip().strip("/")
+    if railway_public_domain:
+        PUBLIC_BASE_URL = f"https://{railway_public_domain}"
+if not PUBLIC_BASE_URL:
+    PUBLIC_BASE_URL = "https://bot-downloads-vip-production.up.railway.app"
+
 APP_STARTED_AT = datetime.now(TZ).isoformat()
 APP_INSTANCE_ID = uuid.uuid4().hex
 
@@ -252,6 +267,8 @@ SHUTDOWN_SIGNAL = None
 SHUTDOWN_DEADLINE_MONOTONIC = None
 HEALTH_SERVER_LOCK = Lock()
 HEALTH_SERVER = None
+BOT_PUBLIC_USERNAME_LOCK = Lock()
+BOT_PUBLIC_USERNAME = None
 TIKWM_CIRCUIT_LOCK = Lock()
 TIKWM_CIRCUIT_STATE = {"failures": 0, "open_until": 0.0}
 BOT_STATE_LOCK = Lock()
@@ -489,6 +506,7 @@ auditoria_sistema_col = db["auditoria_sistema"]
 fila_recuperacao_col = db["fila_recuperacao"]
 limites_globais_col = db["limites_globais"]
 limites_usuarios_col = db["limites_usuarios"]
+aquisicao_web_col = db["aquisicao_web"]
 
 try:
     usuarios_col.create_index("vip_ate")
@@ -7745,6 +7763,201 @@ def diagnostico_admin(message):
     ).start()
 
 
+# =========================================
+# LANDING PAGE / META ADS
+# =========================================
+def _payload_tracking_publico_valido(payload):
+    payload = str(payload or "").strip()
+    return bool(
+        payload
+        and len(payload) <= 64
+        and re.fullmatch(r"[A-Za-z0-9_-]+", payload)
+    )
+
+
+def _obter_username_bot_publico():
+    """Resolve e mantém em cache o username público do bot."""
+    global BOT_PUBLIC_USERNAME
+
+    with BOT_PUBLIC_USERNAME_LOCK:
+        if BOT_PUBLIC_USERNAME:
+            return BOT_PUBLIC_USERNAME
+
+    username = str(bot.get_me().username or "").strip().lstrip("@")
+    if not username or not re.fullmatch(r"[A-Za-z0-9_]{5,64}", username):
+        raise RuntimeError("username público do bot indisponível")
+
+    with BOT_PUBLIC_USERNAME_LOCK:
+        BOT_PUBLIC_USERNAME = username
+    return username
+
+
+def _eh_crawler_landing(user_agent):
+    """Evita que prévias/crawlers da Meta sejam contados como pessoas."""
+    ua = str(user_agent or "").lower()
+    marcadores = (
+        "facebookexternalhit",
+        "facebot",
+        "meta-externalagent",
+        "meta-externalfetcher",
+        "googlebot",
+        "bingbot",
+        "twitterbot",
+        "linkedinbot",
+        "whatsapp",
+        "telegrambot",
+        "slackbot",
+    )
+    return any(marcador in ua for marcador in marcadores)
+
+
+def _extrair_visit_id_cookie(cookie_header):
+    try:
+        cookie = SimpleCookie()
+        cookie.load(str(cookie_header or ""))
+        morsel = cookie.get("bvhd_visit")
+        if morsel:
+            valor = str(morsel.value or "").strip().lower()
+            if re.fullmatch(r"[0-9a-f]{32}", valor):
+                return valor
+    except Exception:
+        pass
+    return None
+
+
+def _id_visita_landing(visit_id, payload):
+    material = f"{visit_id}:{payload}".encode("utf-8", errors="ignore")
+    return hashlib.sha256(material).hexdigest()
+
+
+def _documento_base_visita_landing(visit_id, payload):
+    atribuicao = _parsear_payload_aquisicao(payload)
+    return {
+        "_id": _id_visita_landing(visit_id, payload),
+        "payload": str(payload)[:64],
+        "origem": atribuicao.get("origem"),
+        "campanha": atribuicao.get("campanha"),
+        "anuncio": atribuicao.get("anuncio"),
+        "created_at": agora_tz(),
+        # Identificador aleatório do navegador, sem IP, nome, Telegram ID ou URL.
+        "visitor_ref": referencia_privada_log("web", visit_id),
+    }
+
+
+def registrar_visita_landing(payload, visit_id):
+    if not _payload_tracking_publico_valido(payload):
+        return False
+    agora = agora_tz()
+    base = _documento_base_visita_landing(visit_id, payload)
+    aquisicao_web_col.update_one(
+        {"_id": base["_id"]},
+        {
+            "$setOnInsert": base,
+            "$set": {
+                "last_view_at": agora,
+                "page_seen": True,
+            },
+            "$inc": {"page_views": 1},
+        },
+        upsert=True,
+    )
+    return True
+
+
+def registrar_abertura_telegram_landing(payload, visit_id):
+    if not _payload_tracking_publico_valido(payload):
+        return False
+    agora = agora_tz()
+    base = _documento_base_visita_landing(visit_id, payload)
+    aquisicao_web_col.update_one(
+        {"_id": base["_id"]},
+        {
+            "$setOnInsert": base,
+            "$set": {
+                "last_telegram_open_at": agora,
+                "telegram_opened": True,
+            },
+            "$inc": {"telegram_open_count": 1},
+        },
+        upsert=True,
+    )
+    return True
+
+
+def montar_html_landing_ads(payload):
+    payload_seguro = html.escape(str(payload), quote=True)
+    caminho_abrir = f"/t/{payload_seguro}"
+    return f"""<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="robots" content="noindex,nofollow">
+  <title>Baixar Vídeos HD</title>
+  <style>
+    *{{box-sizing:border-box}}
+    body{{
+      margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
+      padding:24px;font-family:Arial,Helvetica,sans-serif;color:#12212b;
+      background:linear-gradient(150deg,#eff8ff 0%,#f6fff7 100%);
+    }}
+    .card{{
+      width:min(100%,430px);background:#fff;border-radius:24px;padding:30px 24px;
+      box-shadow:0 18px 55px rgba(19,51,74,.12);text-align:center;
+      border:1px solid rgba(20,80,120,.08);
+    }}
+    .logo{{
+      width:78px;height:78px;border-radius:22px;margin:0 auto 18px;
+      display:grid;place-items:center;font-size:42px;
+      background:linear-gradient(145deg,#0b67d0,#2ea9df);color:#fff;
+      box-shadow:0 10px 28px rgba(11,103,208,.22);
+    }}
+    h1{{font-size:27px;line-height:1.15;margin:0 0 10px}}
+    .lead{{font-size:17px;line-height:1.5;color:#4a5d69;margin:0 0 20px}}
+    .beneficios{{
+      margin:0 0 22px;padding:16px 18px;background:#f7fafc;border-radius:16px;
+      text-align:left;font-size:15px;line-height:1.8;
+    }}
+    .btn{{
+      display:block;width:100%;padding:17px 18px;border-radius:14px;
+      background:#1689d8;color:#fff;text-decoration:none;font-weight:700;
+      font-size:18px;box-shadow:0 9px 24px rgba(22,137,216,.22);
+    }}
+    .instrucao{{font-size:14px;color:#61737d;line-height:1.5;margin:18px 2px 0}}
+    .start{{font-weight:700;color:#17242c}}
+    .seguro{{font-size:12px;color:#82919a;margin:18px 0 0}}
+  </style>
+</head>
+<body>
+  <main class="card">
+    <div class="logo" aria-hidden="true">▶</div>
+    <h1>Baixar Vídeos HD</h1>
+    <p class="lead">Baixe vídeos direto pelo Telegram de forma simples.</p>
+    <div class="beneficios">
+      ✅ 3 downloads gratuitos<br>
+      ✅ TikTok, Pinterest e Shopee<br>
+      ✅ Mercado Livre Clips e RedNote
+    </div>
+    <a class="btn" href="{caminho_abrir}">ABRIR NO TELEGRAM</a>
+    <p class="instrucao">
+      Depois que o Telegram abrir, toque em <span class="start">START</span>
+      para começar.
+    </p>
+    <p class="seguro">Você será direcionado ao Telegram.</p>
+  </main>
+</body>
+</html>"""
+
+
+def montar_html_erro_landing():
+    return """<!doctype html><html lang="pt-BR"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Baixar Vídeos HD</title></head>
+<body style="font-family:Arial,sans-serif;padding:32px;text-align:center">
+<h2>Link indisponível</h2><p>Este link não é válido. Volte ao anúncio e tente novamente.</p>
+</body></html>"""
+
+
 @bot.message_handler(commands=["linkads"])
 def gerar_link_meta_ads(message):
     if not exigir_admin_privado(message):
@@ -7757,7 +7970,8 @@ def gerar_link_meta_ads(message):
             "📣 *Gerar link rastreável para Meta Ads*\n\n"
             "Use: `/linkads campanha anuncio`\n"
             "Exemplo: `/linkads escala01 shopee01`\n\n"
-            "Crie um link diferente para cada anúncio que quiser comparar.",
+            "O link gerado abre primeiro a landing page para medir visita, "
+            "clique no Telegram e START separadamente.",
             parse_mode="Markdown",
         )
         return
@@ -7777,22 +7991,26 @@ def gerar_link_meta_ads(message):
         return
 
     try:
-        username = str(bot.get_me().username or "").strip()
-        if not username:
-            raise RuntimeError("username do bot indisponível")
-        link = f"https://t.me/{username}?start={payload}"
+        username = _obter_username_bot_publico()
+        link_landing = f"{PUBLIC_BASE_URL}/go/{payload}"
+        link_direto = f"https://t.me/{username}?start={payload}"
         safe_send_message(
             message.chat.id,
             "📣 <b>Link rastreável para Meta Ads criado</b>\n\n"
             f"Campanha: <code>{html.escape(campanha)}</code>\n"
             f"Anúncio: <code>{html.escape(anuncio)}</code>\n\n"
-            f"<code>{html.escape(link)}</code>\n\n"
-            "Use este link somente nesse anúncio para medir a conversão.",
+            "🌐 <b>Use este no anúncio:</b>\n"
+            f"<code>{html.escape(link_landing)}</code>\n\n"
+            "🔗 <b>Telegram direto (fallback):</b>\n"
+            f"<code>{html.escape(link_direto)}</code>\n\n"
+            "O /origens mostrará visitas da página, cliques para abrir o "
+            "Telegram e usuários que concluíram o START.",
             parse_mode="HTML",
         )
         logger.info(
             "[LINK_ADS_CRIADO] "
-            f"campanha={campanha} anuncio={anuncio} payload_len={len(payload)}"
+            f"campanha={campanha} anuncio={anuncio} payload_len={len(payload)} "
+            "landing=True"
         )
     except Exception as e:
         logger.error(
@@ -7918,6 +8136,42 @@ def relatorio_origens_aquisicao(message):
                 meta["iniciaram_pagamento"] += int(iniciou_pagamento)
                 meta["pagantes"] += int(pagou)
 
+        web_visitas_total = 0
+        web_aberturas_total = 0
+        grupos_web = {}
+        try:
+            cursor_web = aquisicao_web_col.find(
+                {},
+                {
+                    "campanha": 1,
+                    "anuncio": 1,
+                    "page_seen": 1,
+                    "telegram_opened": 1,
+                },
+            )
+            for visita in cursor_web:
+                viu_pagina = bool(visita.get("page_seen"))
+                abriu_telegram = bool(visita.get("telegram_opened"))
+                if not viu_pagina and not abriu_telegram:
+                    continue
+
+                web_visitas_total += int(viu_pagina)
+                web_aberturas_total += int(abriu_telegram)
+                campanha_web = str(visita.get("campanha") or "sem-campanha")[:24]
+                anuncio_web = str(visita.get("anuncio") or "geral")[:32]
+                chave_web = (campanha_web, anuncio_web)
+                grupo_web = grupos_web.setdefault(
+                    chave_web,
+                    {"visitas": 0, "aberturas": 0},
+                )
+                grupo_web["visitas"] += int(viu_pagina)
+                grupo_web["aberturas"] += int(abriu_telegram)
+        except Exception as e:
+            logger.warning(
+                "[ORIGENS_LANDING_ERRO] "
+                f"erro={sanitizar_erro_log(e)}"
+            )
+
         def percentual(parte, base):
             return (parte * 100 / base) if base else 0.0
 
@@ -7930,6 +8184,10 @@ def relatorio_origens_aquisicao(message):
             f"🧾 Iniciaram Pix: `{total_iniciaram_pagamento}`",
             f"💳 Pagantes únicos: `{total_pagantes}`",
             f"💎 VIPs ativos: `{total_vips_ativos}`",
+            "",
+            f"🌐 Landing Ads — visitas únicas: `{web_visitas_total}`",
+            f"📲 Clicaram em abrir Telegram: `{web_aberturas_total}` "
+            f"({percentual(web_aberturas_total, web_visitas_total):.1f}%)",
             "",
             "*Por origem:*",
         ]
@@ -7947,19 +8205,38 @@ def relatorio_origens_aquisicao(message):
                 f"{dados['pagantes']} pagos ({percentual(dados['pagantes'], usuarios):.1f}%)"
             )
 
-        if grupos_meta:
+        chaves_meta = set(grupos_meta) | set(grupos_web)
+        if chaves_meta:
             linhas.extend(["", "*Meta Ads — campanha / anúncio:* "])
-            for (campanha, anuncio), dados in sorted(
-                grupos_meta.items(),
-                key=lambda item: item[1]["usuarios"],
+            ordenadas = sorted(
+                chaves_meta,
+                key=lambda chave: (
+                    grupos_web.get(chave, {}).get("visitas", 0),
+                    grupos_meta.get(chave, {}).get("usuarios", 0),
+                ),
                 reverse=True,
-            )[:12]:
+            )
+            for campanha, anuncio in ordenadas[:12]:
+                dados = grupos_meta.get(
+                    (campanha, anuncio),
+                    {
+                        "usuarios": 0,
+                        "ativados": 0,
+                        "iniciaram_pagamento": 0,
+                        "pagantes": 0,
+                    },
+                )
+                web = grupos_web.get(
+                    (campanha, anuncio),
+                    {"visitas": 0, "aberturas": 0},
+                )
                 usuarios = dados["usuarios"]
                 linhas.append(
-                    f"• `{campanha}` / `{anuncio}` — {usuarios} usuários | "
-                    f"{dados['ativados']} baixaram | "
+                    f"• `{campanha}` / `{anuncio}` — "
+                    f"{web['visitas']} landing | {web['aberturas']} abriram TG | "
+                    f"{usuarios} START | {dados['ativados']} baixaram | "
                     f"{dados['iniciaram_pagamento']} Pix | "
-                    f"{dados['pagantes']} pagos ({percentual(dados['pagantes'], usuarios):.1f}%)"
+                    f"{dados['pagantes']} pagos"
                 )
 
         texto = "\n".join(linhas)
@@ -7981,7 +8258,8 @@ def relatorio_origens_aquisicao(message):
             f"usuarios={total} rastreados={rastreados} ativados={total_ativados} "
             f"pix_iniciados={total_iniciaram_pagamento} "
             f"pagantes={total_pagantes} vips_ativos={total_vips_ativos} "
-            f"meta_grupos={len(grupos_meta)}"
+            f"meta_grupos={len(grupos_meta)} landing_visitas={web_visitas_total} "
+            f"landing_aberturas={web_aberturas_total}"
         )
     except Exception as e:
         logger.error(
@@ -12516,38 +12794,147 @@ def montar_payload_ready():
 
 
 class HealthRequestHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        caminho = urlparse(self.path).path
-        if caminho == "/":
-            corpo = b"ONLINE"
-            content_type = "text/plain; charset=utf-8"
-            status = 200
-        elif caminho == "/health":
-            corpo = json.dumps(
-                montar_payload_health(), ensure_ascii=False
-            ).encode("utf-8")
-            content_type = "application/json; charset=utf-8"
-            # O endpoint é de vida do contêiner. Polling ou worker degradados
-            # aparecem no JSON sem provocar ciclos automáticos de reinício.
-            status = 200
-        elif caminho == "/ready":
-            payload = montar_payload_ready()
-            corpo = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-            content_type = "application/json; charset=utf-8"
-            # Readiness é separado do liveness: 503 indica que o processo está
-            # vivo, porém não está pronto para atender downloads normalmente.
-            status = 200 if payload.get("status") == "ready" else 503
-        else:
-            corpo = b"NOT FOUND"
-            content_type = "text/plain; charset=utf-8"
-            status = 404
-
+    def _enviar_resposta(
+        self,
+        status,
+        corpo,
+        content_type="text/plain; charset=utf-8",
+        headers_extras=None,
+    ):
+        if isinstance(corpo, str):
+            corpo = corpo.encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(corpo)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Frame-Options", "DENY")
+        for nome, valor in (headers_extras or {}).items():
+            self.send_header(nome, valor)
         self.end_headers()
         self.wfile.write(corpo)
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        caminho = parsed.path
+
+        if caminho == "/":
+            return self._enviar_resposta(200, b"ONLINE")
+
+        if caminho == "/health":
+            corpo = json.dumps(
+                montar_payload_health(), ensure_ascii=False
+            ).encode("utf-8")
+            # O endpoint é de vida do contêiner. Polling ou worker degradados
+            # aparecem no JSON sem provocar ciclos automáticos de reinício.
+            return self._enviar_resposta(
+                200,
+                corpo,
+                "application/json; charset=utf-8",
+            )
+
+        if caminho == "/ready":
+            payload = montar_payload_ready()
+            corpo = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            # Readiness é separado do liveness: 503 indica que o processo está
+            # vivo, porém não está pronto para atender downloads normalmente.
+            status = 200 if payload.get("status") == "ready" else 503
+            return self._enviar_resposta(
+                status,
+                corpo,
+                "application/json; charset=utf-8",
+            )
+
+        if caminho.startswith("/go/"):
+            payload = caminho[len("/go/"):].strip("/")
+            if not _payload_tracking_publico_valido(payload):
+                return self._enviar_resposta(
+                    404,
+                    montar_html_erro_landing(),
+                    "text/html; charset=utf-8",
+                )
+
+            visit_id = _extrair_visit_id_cookie(self.headers.get("Cookie"))
+            cookie_novo = False
+            if not visit_id:
+                visit_id = uuid.uuid4().hex
+                cookie_novo = True
+
+            if not _eh_crawler_landing(self.headers.get("User-Agent")):
+                try:
+                    registrar_visita_landing(payload, visit_id)
+                except Exception as e:
+                    logger.warning(
+                        "[LANDING_VIEW_ERRO] "
+                        f"payload_ref={referencia_privada_log('payload', payload)} "
+                        f"erro={sanitizar_erro_log(e)}"
+                    )
+
+            headers = {}
+            if cookie_novo:
+                headers["Set-Cookie"] = (
+                    f"bvhd_visit={visit_id}; Path=/; Max-Age=2592000; "
+                    "SameSite=Lax; Secure; HttpOnly"
+                )
+            return self._enviar_resposta(
+                200,
+                montar_html_landing_ads(payload),
+                "text/html; charset=utf-8",
+                headers,
+            )
+
+        if caminho.startswith("/t/"):
+            payload = caminho[len("/t/"):].strip("/")
+            if not _payload_tracking_publico_valido(payload):
+                return self._enviar_resposta(
+                    404,
+                    montar_html_erro_landing(),
+                    "text/html; charset=utf-8",
+                )
+
+            visit_id = _extrair_visit_id_cookie(self.headers.get("Cookie"))
+            if not visit_id:
+                visit_id = uuid.uuid4().hex
+
+            if not _eh_crawler_landing(self.headers.get("User-Agent")):
+                try:
+                    registrar_abertura_telegram_landing(payload, visit_id)
+                except Exception as e:
+                    logger.warning(
+                        "[LANDING_TELEGRAM_ERRO] "
+                        f"payload_ref={referencia_privada_log('payload', payload)} "
+                        f"erro={sanitizar_erro_log(e)}"
+                    )
+
+            try:
+                username = _obter_username_bot_publico()
+            except Exception as e:
+                logger.error(
+                    "[LANDING_USERNAME_ERRO] "
+                    f"erro={sanitizar_erro_log(e)}"
+                )
+                return self._enviar_resposta(
+                    503,
+                    "<h2>Telegram temporariamente indisponível</h2>"
+                    "<p>Tente novamente em alguns instantes.</p>",
+                    "text/html; charset=utf-8",
+                )
+
+            destino = f"https://t.me/{username}?start={payload}"
+            return self._enviar_resposta(
+                302,
+                b"",
+                headers_extras={
+                    "Location": destino,
+                    "Set-Cookie": (
+                        f"bvhd_visit={visit_id}; Path=/; Max-Age=2592000; "
+                        "SameSite=Lax; Secure; HttpOnly"
+                    ),
+                },
+            )
+
+        return self._enviar_resposta(404, b"NOT FOUND")
 
     def log_message(self, _format, *_args):
         return
@@ -12588,6 +12975,11 @@ if __name__ == "__main__":
     logger.info("[START_FIX] mongo_update_conflict=False tracking_nao_bloqueia_start=True vip_e_gratis=True")
     logger.info("[BACKUP_MENU_CONFIG] backupvips=True backupgeral=True")
     logger.info("[AQUISICAO_CONFIG] deep_link=True linkads=True origens=True origem_imutavel=True funil_ativacao=True meta_breakdown=True")
+    logger.info(
+        f"[LANDING_ADS_CONFIG] enabled=True base_url={PUBLIC_BASE_URL} "
+        "routes=/go/<payload>,/t/<payload> tracking=landing,telegram_open,start "
+        "stores_ip=False crawler_filter=True"
+    )
     logger.info(
         "[PLATAFORMAS_LANCAMENTO] ativas=TikTok,Pinterest,ShopeeVideo,MercadoLivreClips,RedNote "
         "instagram=False facebook_reels=False"
