@@ -12908,19 +12908,47 @@ class HealthRequestHandler(BaseHTTPRequestHandler):
                     "text/html; charset=utf-8",
                 )
 
-            visit_id = _extrair_visit_id_cookie(self.headers.get("Cookie"))
-            if not visit_id:
-                visit_id = uuid.uuid4().hex
+            # /t/ também é usado como destino direto do Meta Ads. Uma simples
+            # requisição HTTP nessa rota não prova que uma pessoa abriu o Telegram:
+            # validadores/prévias da Meta podem seguir o link várias vezes.
+            #
+            # Por isso, "abriu Telegram" só é registrado quando existe o cookie
+            # criado por /go/ E a mesma visita/payload já viu a landing page.
+            # Cliques diretos continuam recebendo o 302 com o payload intacto;
+            # a conversão confiável deles passa a ser o START recebido pelo bot.
+            visit_id_cookie = _extrair_visit_id_cookie(self.headers.get("Cookie"))
+            crawler = _eh_crawler_landing(self.headers.get("User-Agent"))
+            visita_landing_confirmada = False
 
-            if not _eh_crawler_landing(self.headers.get("User-Agent")):
+            if visit_id_cookie and not crawler:
                 try:
-                    registrar_abertura_telegram_landing(payload, visit_id)
+                    visita_landing_confirmada = bool(
+                        aquisicao_web_col.find_one(
+                            {
+                                "_id": _id_visita_landing(visit_id_cookie, payload),
+                                "page_seen": True,
+                            },
+                            {"_id": 1},
+                        )
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "[LANDING_TELEGRAM_VALIDACAO_ERRO] "
+                        f"payload_ref={referencia_privada_log('payload', payload)} "
+                        f"erro={sanitizar_erro_log(e)}"
+                    )
+
+            if visita_landing_confirmada:
+                try:
+                    registrar_abertura_telegram_landing(payload, visit_id_cookie)
                 except Exception as e:
                     logger.warning(
                         "[LANDING_TELEGRAM_ERRO] "
                         f"payload_ref={referencia_privada_log('payload', payload)} "
                         f"erro={sanitizar_erro_log(e)}"
                     )
+
+            visit_id = visit_id_cookie or uuid.uuid4().hex
 
             try:
                 username = _obter_username_bot_publico()
@@ -12993,7 +13021,8 @@ if __name__ == "__main__":
     logger.info(
         f"[LANDING_ADS_CONFIG] enabled=True base_url={PUBLIC_BASE_URL} "
         "routes=/go/<payload>,/t/<payload> tracking=landing,telegram_open,start "
-        "stores_ip=False crawler_filter=True"
+        "stores_ip=False crawler_filter=True "
+        "direct_open_tracking=requires_landing_cookie"
     )
     logger.info(
         "[PLATAFORMAS_LANCAMENTO] ativas=TikTok,Pinterest,ShopeeVideo,MercadoLivreClips,RedNote "
