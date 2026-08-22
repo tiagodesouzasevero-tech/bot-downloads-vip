@@ -7920,8 +7920,11 @@ def montar_html_landing_ads(payload):
       margin:0 0 22px;padding:16px 18px;background:#f7fafc;border-radius:16px;
       text-align:left;font-size:15px;line-height:1.8;
     }}
-    .plataformas-linha{{white-space:nowrap}}
-    .plataformas-continuacao{{display:inline-block;margin-left:26px}}
+    .beneficio-item{{display:flex;align-items:flex-start;gap:8px}}
+    .beneficio-item + .beneficio-item{{margin-top:2px}}
+    .beneficio-check{{flex:0 0 auto;line-height:1.8}}
+    .beneficio-texto{{min-width:0;line-height:1.8}}
+    .plataforma-parte{{display:block;white-space:nowrap}}
     .btn{{
       display:block;width:100%;padding:17px 18px;border-radius:14px;
       background:#1689d8;color:#fff;text-decoration:none;font-weight:700;
@@ -7938,9 +7941,17 @@ def montar_html_landing_ads(payload):
     <h1>Baixar Vídeos HD</h1>
     <p class="lead">Baixe vídeos direto pelo Telegram de forma simples.</p>
     <div class="beneficios">
-      ✅ 3 downloads gratuitos<br>
-      ✅ <span class="plataformas-linha">TikTok • Pinterest • Shopee Vídeos</span><br>
-      <span class="plataformas-continuacao">Mercado Livre Clips • RedNote</span>
+      <div class="beneficio-item">
+        <span class="beneficio-check">✅</span>
+        <span class="beneficio-texto">3 downloads gratuitos</span>
+      </div>
+      <div class="beneficio-item">
+        <span class="beneficio-check">✅</span>
+        <span class="beneficio-texto">
+          <span class="plataforma-parte">TikTok • Pinterest • Shopee Vídeos</span>
+          <span class="plataforma-parte">Mercado Livre Clips • RedNote</span>
+        </span>
+      </div>
     </div>
     <a class="btn" href="{caminho_abrir}">ABRIR NO TELEGRAM</a>
     <p class="instrucao">
