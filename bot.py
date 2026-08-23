@@ -534,6 +534,9 @@ try:
     )
     limites_globais_col.create_index("expires_at", expireAfterSeconds=0)
     limites_usuarios_col.create_index("expires_at", expireAfterSeconds=0)
+    aquisicao_web_col.create_index(
+        [("record_type", 1), ("campanha", 1), ("anuncio", 1)]
+    )
 except Exception as e:
     erro_inicio = re.sub(
         r"(?i)(mongodb(?:\+srv)?|https?)://[^\s]+",
@@ -5618,6 +5621,7 @@ def registrar_download_diario(
     tipo_entrega="upload",
     bytes_upload=0,
     admin_status=False,
+    user_id=None,
 ):
     """Registra o download e sua forma de entrega na mesma escrita diária."""
     try:
@@ -5676,6 +5680,18 @@ def registrar_download_diario(
             f"erro={sanitizar_erro_log(e)}"
         )
         registrar_falha_componente("MongoDB", e)
+
+    # A entrega já aconteceu no Telegram. O rastreamento de campanha é
+    # auxiliar e nunca pode transformar um download concluído em falha.
+    if user_id is not None and not admin_status:
+        try:
+            registrar_evento_funil_ads(user_id, "download")
+        except Exception as e:
+            logger.warning(
+                "[FUNIL_ADS_DOWNLOAD_ERRO] "
+                f"user_ref={referencia_usuario_log(user_id)} "
+                f"erro={sanitizar_erro_log(e)}"
+            )
 
 
 def formatar_tamanho_bytes(total_bytes):
@@ -6235,6 +6251,20 @@ def finalizar_aprovacao_pix_em_processamento(order_nsu):
             pedido_final,
             origem="finalizacao_pagamento",
         )
+        atribuicao_paga = pedido_final.get("atribuicao_ads")
+        if isinstance(atribuicao_paga, dict):
+            try:
+                registrar_evento_funil_ads(
+                    pedido_final.get("user_id"),
+                    "paid",
+                    atribuicao=atribuicao_paga,
+                )
+            except Exception as e:
+                logger.warning(
+                    "[FUNIL_ADS_PAGO_ERRO] "
+                    f"pedido_ref={referencia_pedido_log(order_nsu)} "
+                    f"erro={sanitizar_erro_log(e)}"
+                )
         return {
             "pedido": pedido_final,
             "plano": plano,
@@ -6473,6 +6503,191 @@ def registrar_inicio_e_origem(user_id, payload=""):
             )
 
     return atribuicao
+
+
+# O Meta usa uma janela de atribuição por clique de 7 dias nesta campanha.
+# O mesmo intervalo limita até quando download/Pix/pagamento podem ser ligados
+# ao último START rastreável, sem alterar a origem histórica do usuário.
+FUNIL_ADS_JANELA_DIAS = 7
+FUNIL_ADS_EVENTOS = {
+    "start": "telegram_start",
+    "download": "downloaded",
+    "pix_started": "pix_started",
+    "paid": "paid",
+}
+
+
+def _normalizar_datetime_utc_naive(valor):
+    if not isinstance(valor, datetime):
+        return None
+    if valor.tzinfo is not None:
+        return valor.astimezone(timezone.utc).replace(tzinfo=None)
+    return valor
+
+
+def _id_evento_funil_ads(user_id, campanha, anuncio):
+    material = f"{str(user_id)}:{campanha}:{anuncio}"
+    return referencia_privada_log("adsfunil", material, tamanho=40)
+
+
+def _atribuir_funil_ads_ativo_ao_usuario(user_id):
+    usuario = usuarios_col.find_one(
+        {"_id": str(user_id)},
+        {"ultima_atribuicao_ads": 1},
+    ) or {}
+    atribuicao = usuario.get("ultima_atribuicao_ads") or {}
+    campanha = _normalizar_codigo_tracking(atribuicao.get("campanha"), 24)
+    anuncio = _normalizar_codigo_tracking(atribuicao.get("anuncio"), 32)
+    toque_em = _normalizar_datetime_utc_naive(atribuicao.get("toque_em"))
+    agora_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+
+    if not campanha or not anuncio or not toque_em:
+        return None
+    if toque_em > agora_utc + timedelta(minutes=5):
+        return None
+    if toque_em < agora_utc - timedelta(days=FUNIL_ADS_JANELA_DIAS):
+        return None
+
+    return {
+        "origem": "meta_ads",
+        "campanha": campanha,
+        "anuncio": anuncio,
+        "evento_id": _id_evento_funil_ads(user_id, campanha, anuncio),
+        "toque_em": toque_em,
+    }
+
+
+def registrar_evento_funil_ads(
+    user_id,
+    evento,
+    payload=None,
+    atribuicao=None,
+):
+    """Registra eventos da campanha sem sobrescrever a primeira origem.
+
+    Cada usuário conta uma única vez por campanha/anúncio em cada etapa. Os
+    contadores de repetição ficam apenas para diagnóstico e não entram no
+    relatório de usuários únicos.
+    """
+    evento = str(evento or "").strip().lower()
+    campo_evento = FUNIL_ADS_EVENTOS.get(evento)
+    if not campo_evento:
+        raise ValueError("EVENTO_FUNIL_ADS_INVALIDO")
+
+    uid = str(user_id)
+    agora_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+    mesma_origem_historica = False
+
+    if evento == "start":
+        dados = _parsear_payload_aquisicao(payload)
+        campanha = _normalizar_codigo_tracking(dados.get("campanha"), 24)
+        anuncio = _normalizar_codigo_tracking(dados.get("anuncio"), 32)
+        if dados.get("origem") != "meta_ads" or not campanha or not anuncio:
+            return None
+
+        usuario = usuarios_col.find_one(
+            {"_id": uid},
+            {"origem": 1, "campanha": 1, "anuncio": 1},
+        ) or {}
+        origem_historica = str(usuario.get("origem") or "")
+        mesma_origem_historica = bool(
+            origem_historica in {
+                "meta_ads",
+                "facebook_ads",
+                "instagram_ads",
+            }
+            and str(usuario.get("campanha") or "") == campanha
+            and str(usuario.get("anuncio") or "") == anuncio
+        )
+        dados_evento = {
+            "origem": "meta_ads",
+            "campanha": campanha,
+            "anuncio": anuncio,
+            "evento_id": _id_evento_funil_ads(uid, campanha, anuncio),
+            "toque_em": agora_utc,
+        }
+    elif atribuicao:
+        campanha = _normalizar_codigo_tracking(atribuicao.get("campanha"), 24)
+        anuncio = _normalizar_codigo_tracking(atribuicao.get("anuncio"), 32)
+        if not campanha or not anuncio:
+            return None
+        dados_evento = {
+            "origem": "meta_ads",
+            "campanha": campanha,
+            "anuncio": anuncio,
+            "evento_id": _id_evento_funil_ads(uid, campanha, anuncio),
+            "toque_em": _normalizar_datetime_utc_naive(
+                atribuicao.get("toque_em")
+            ) or agora_utc,
+        }
+    else:
+        dados_evento = _atribuir_funil_ads_ativo_ao_usuario(uid)
+        if not dados_evento:
+            return None
+
+    evento_id = dados_evento["evento_id"]
+    base = {
+        "_id": evento_id,
+        "record_type": "telegram_funnel",
+        "origem": "meta_ads",
+        "campanha": dados_evento["campanha"],
+        "anuncio": dados_evento["anuncio"],
+        "user_ref": referencia_privada_log("usr", uid, tamanho=24),
+        "created_at": agora_utc,
+    }
+    atualizacao = {
+        "$set": {
+            campo_evento: True,
+            f"last_{campo_evento}_at": agora_utc,
+            "last_event_at": agora_utc,
+        },
+        "$inc": {f"{campo_evento}_count": 1},
+    }
+
+    if evento == "start":
+        base.update(
+            {
+                "first_telegram_start_at": agora_utc,
+                "incluido_origem_historica": mesma_origem_historica,
+            }
+        )
+        atualizacao["$setOnInsert"] = base
+        resultado = aquisicao_web_col.update_one(
+            {"_id": evento_id},
+            atualizacao,
+            upsert=True,
+        )
+        usuarios_col.update_one(
+            {"_id": uid},
+            {
+                "$set": {
+                    "ultima_atribuicao_ads": {
+                        "origem": "meta_ads",
+                        "campanha": dados_evento["campanha"],
+                        "anuncio": dados_evento["anuncio"],
+                        "evento_id": evento_id,
+                        "toque_em": agora_utc,
+                    }
+                }
+            },
+        )
+    else:
+        # Uma etapa posterior só pode existir para um START real previamente
+        # confirmado pelo bot. Isso impede atribuição por clique isolado.
+        resultado = aquisicao_web_col.update_one(
+            {"_id": evento_id, "telegram_start": True},
+            atualizacao,
+        )
+        if not resultado.matched_count:
+            return None
+
+    logger.info(
+        "[FUNIL_ADS_EVENTO] "
+        f"evento={evento} campanha={dados_evento['campanha']} "
+        f"anuncio={dados_evento['anuncio']} "
+        f"user_ref={referencia_usuario_log(uid)}"
+    )
+    return dados_evento
 
 
 def atualizar_ultimo_acesso_usuario(user_id, forcar=False):
@@ -8063,6 +8278,7 @@ def relatorio_origens_aquisicao(message):
 
         grupos = {}
         grupos_meta = {}
+        grupos_funil = {}
         total = 0
         total_ativados = 0
         total_iniciaram_pagamento = 0
@@ -8162,19 +8378,54 @@ def relatorio_origens_aquisicao(message):
                     "anuncio": 1,
                     "page_seen": 1,
                     "telegram_opened": 1,
+                    "telegram_start": 1,
+                    "downloaded": 1,
+                    "pix_started": 1,
+                    "paid": 1,
+                    "incluido_origem_historica": 1,
                 },
             )
             for visita in cursor_web:
                 viu_pagina = bool(visita.get("page_seen"))
                 abriu_telegram = bool(visita.get("telegram_opened"))
+                iniciou_bot = bool(visita.get("telegram_start"))
+                baixou = bool(visita.get("downloaded"))
+                iniciou_pix = bool(visita.get("pix_started"))
+                pagou_funil = bool(visita.get("paid"))
+                campanha_web = str(visita.get("campanha") or "sem-campanha")[:24]
+                anuncio_web = str(visita.get("anuncio") or "geral")[:32]
+                chave_web = (campanha_web, anuncio_web)
+
+                # Usuários cuja primeira origem já é esta mesma campanha estão
+                # em grupos_meta. Somamos aqui apenas os retornantes, evitando
+                # duplicidade e finalmente atribuindo o START atual deles.
+                if iniciou_bot or baixou or iniciou_pix or pagou_funil:
+                    incremental = not bool(
+                        visita.get("incluido_origem_historica")
+                    )
+                    grupo_funil = grupos_funil.setdefault(
+                        chave_web,
+                        {
+                            "usuarios": 0,
+                            "ativados": 0,
+                            "iniciaram_pagamento": 0,
+                            "pagantes": 0,
+                        },
+                    )
+                    grupo_funil["usuarios"] += int(iniciou_bot and incremental)
+                    grupo_funil["ativados"] += int(baixou and incremental)
+                    grupo_funil["iniciaram_pagamento"] += int(
+                        iniciou_pix and incremental
+                    )
+                    grupo_funil["pagantes"] += int(
+                        pagou_funil and incremental
+                    )
+
                 if not viu_pagina and not abriu_telegram:
                     continue
 
                 web_visitas_total += int(viu_pagina)
                 web_aberturas_total += int(abriu_telegram)
-                campanha_web = str(visita.get("campanha") or "sem-campanha")[:24]
-                anuncio_web = str(visita.get("anuncio") or "geral")[:32]
-                chave_web = (campanha_web, anuncio_web)
                 grupo_web = grupos_web.setdefault(
                     chave_web,
                     {"visitas": 0, "aberturas": 0},
@@ -8220,14 +8471,15 @@ def relatorio_origens_aquisicao(message):
                 f"{dados['pagantes']} pagos ({percentual(dados['pagantes'], usuarios):.1f}%)"
             )
 
-        chaves_meta = set(grupos_meta) | set(grupos_web)
+        chaves_meta = set(grupos_meta) | set(grupos_web) | set(grupos_funil)
         if chaves_meta:
             linhas.extend(["", "*Meta Ads — campanha / anúncio:* "])
             ordenadas = sorted(
                 chaves_meta,
                 key=lambda chave: (
                     grupos_web.get(chave, {}).get("visitas", 0),
-                    grupos_meta.get(chave, {}).get("usuarios", 0),
+                    grupos_meta.get(chave, {}).get("usuarios", 0)
+                    + grupos_funil.get(chave, {}).get("usuarios", 0),
                 ),
                 reverse=True,
             )
@@ -8245,13 +8497,27 @@ def relatorio_origens_aquisicao(message):
                     (campanha, anuncio),
                     {"visitas": 0, "aberturas": 0},
                 )
-                usuarios = dados["usuarios"]
+                adicionais = grupos_funil.get(
+                    (campanha, anuncio),
+                    {
+                        "usuarios": 0,
+                        "ativados": 0,
+                        "iniciaram_pagamento": 0,
+                        "pagantes": 0,
+                    },
+                )
+                usuarios = dados["usuarios"] + adicionais["usuarios"]
+                ativados_meta = dados["ativados"] + adicionais["ativados"]
+                pix_meta = (
+                    dados["iniciaram_pagamento"]
+                    + adicionais["iniciaram_pagamento"]
+                )
+                pagantes_meta = dados["pagantes"] + adicionais["pagantes"]
                 linhas.append(
                     f"• `{campanha}` / `{anuncio}` — "
                     f"{web['visitas']} landing | {web['aberturas']} abriram TG | "
-                    f"{usuarios} START | {dados['ativados']} baixaram | "
-                    f"{dados['iniciaram_pagamento']} Pix | "
-                    f"{dados['pagantes']} pagos"
+                    f"{usuarios} START | {ativados_meta} baixaram | "
+                    f"{pix_meta} Pix | {pagantes_meta} pagos"
                 )
 
         texto = "\n".join(linhas)
@@ -8273,7 +8539,8 @@ def relatorio_origens_aquisicao(message):
             f"usuarios={total} rastreados={rastreados} ativados={total_ativados} "
             f"pix_iniciados={total_iniciaram_pagamento} "
             f"pagantes={total_pagantes} vips_ativos={total_vips_ativos} "
-            f"meta_grupos={len(grupos_meta)} landing_visitas={web_visitas_total} "
+            f"meta_grupos={len(grupos_meta)} funil_grupos={len(grupos_funil)} "
+            f"landing_visitas={web_visitas_total} "
             f"landing_aberturas={web_aberturas_total}"
         )
     except Exception as e:
@@ -8924,11 +9191,15 @@ def start(message):
         return
 
     payload = _extrair_payload_start(message)
+    atribuicao_inicio = None
 
     # Rastreamento é auxiliar: uma falha de analytics nunca pode impedir
     # o usuário (VIP ou gratuito) de receber a tela inicial.
     try:
-        registrar_inicio_e_origem(message.from_user.id, payload)
+        atribuicao_inicio = registrar_inicio_e_origem(
+            message.from_user.id,
+            payload,
+        )
     except Exception as e:
         logger.error(
             "[START_TRACKING_ERRO] "
@@ -8988,11 +9259,29 @@ def start(message):
     )
 
     if enviado:
+        dados_funil = None
+        if payload:
+            try:
+                dados_funil = registrar_evento_funil_ads(
+                    message.from_user.id,
+                    "start",
+                    payload=payload,
+                )
+            except Exception as e:
+                logger.warning(
+                    "[FUNIL_ADS_START_ERRO] "
+                    f"user_ref={referencia_usuario_log(message.from_user.id)} "
+                    f"erro={sanitizar_erro_log(e)}"
+                )
+
+        dados_log = dados_funil or atribuicao_inicio or {}
         logger.info(
             "[START_OK] "
             f"user_ref={referencia_usuario_log(message.from_user.id)} "
             f"plano={'vip' if vip else 'gratis'} "
-            f"payload={'sim' if payload else 'nao'}"
+            f"payload={'sim' if payload else 'nao'} "
+            f"campanha={dados_log.get('campanha') or 'na'} "
+            f"anuncio={dados_log.get('anuncio') or 'na'}"
         )
     else:
         logger.warning(
@@ -9434,6 +9723,19 @@ def iniciar_pagamento_pix_manual(call):
             safe_send_message(call.message.chat.id, "❌ Plano inválido.")
             return
 
+        atribuicao_pix = None
+        try:
+            atribuicao_pix = registrar_evento_funil_ads(
+                call.from_user.id,
+                "pix_started",
+            )
+        except Exception as e:
+            logger.warning(
+                "[FUNIL_ADS_PIX_ERRO] "
+                f"user_ref={referencia_usuario_log(call.from_user.id)} "
+                f"erro={sanitizar_erro_log(e)}"
+            )
+
         pedido_ativo = buscar_pedido_pix_ativo(call.from_user.id)
         if pedido_ativo and pedido_ativo.get("status") in (
             "receipt_submitted",
@@ -9454,6 +9756,11 @@ def iniciar_pagamento_pix_manual(call):
             pedido_ativo = None
 
         if pedido_ativo and pedido_ativo.get("plano_key") == valor:
+            if atribuicao_pix:
+                pedidos_col.update_one(
+                    {"order_nsu": pedido_ativo["order_nsu"]},
+                    {"$set": {"atribuicao_ads": atribuicao_pix}},
+                )
             if not enviar_instrucoes_pix(call.message.chat.id, pedido_ativo, plano):
                 raise RuntimeError("falha ao reenviar instruções Pix")
             return
@@ -9485,6 +9792,8 @@ def iniciar_pagamento_pix_manual(call):
             "expires_at": agora + timedelta(hours=PIX_ORDER_EXPIRATION_HOURS),
             "payment_verification_status": "awaiting_manual_receipt",
         }
+        if atribuicao_pix:
+            pedido["atribuicao_ads"] = atribuicao_pix
         pedidos_col.insert_one(pedido)
         if not enviar_instrucoes_pix(call.message.chat.id, pedido, plano):
             pedidos_col.update_one(
@@ -10516,6 +10825,7 @@ def processar_download_mercado_livre_clips(
                 vip_status,
                 tipo_entrega="cache_url",
                 admin_status=message.from_user.id == ADMIN_ID,
+                user_id=message.from_user.id,
             )
             if reserva_download:
                 confirmar_download_gratis(
@@ -10571,6 +10881,7 @@ def processar_download_mercado_livre_clips(
                 vip_status,
                 tipo_entrega="cache_midia",
                 admin_status=message.from_user.id == ADMIN_ID,
+                user_id=message.from_user.id,
             )
             if reserva_download:
                 confirmar_download_gratis(
@@ -10641,6 +10952,7 @@ def processar_download_mercado_livre_clips(
             tipo_entrega="upload",
             bytes_upload=bytes_upload,
             admin_status=message.from_user.id == ADMIN_ID,
+            user_id=message.from_user.id,
         )
         if reserva_download:
             confirmar_download_gratis(
@@ -10923,6 +11235,7 @@ def processar_download_shopee(message, url, status_msg, vip_status, reserva_down
                 vip_status,
                 tipo_entrega="cache_url",
                 admin_status=message.from_user.id == ADMIN_ID,
+                user_id=message.from_user.id,
             )
             if reserva_download:
                 confirmar_download_gratis(
@@ -10980,6 +11293,7 @@ def processar_download_shopee(message, url, status_msg, vip_status, reserva_down
                 vip_status,
                 tipo_entrega="cache_midia",
                 admin_status=message.from_user.id == ADMIN_ID,
+                user_id=message.from_user.id,
             )
             if reserva_download:
                 confirmar_download_gratis(
@@ -11076,6 +11390,7 @@ def processar_download_shopee(message, url, status_msg, vip_status, reserva_down
             tipo_entrega="upload",
             bytes_upload=bytes_upload,
             admin_status=message.from_user.id == ADMIN_ID,
+            user_id=message.from_user.id,
         )
         if reserva_download:
             confirmar_download_gratis(
@@ -11311,6 +11626,7 @@ def _processar_download(message, url, status_msg, reserva_download=None):
                     vip_status,
                     tipo_entrega="cache_url",
                     admin_status=message.from_user.id == ADMIN_ID,
+                    user_id=message.from_user.id,
                 )
                 if reserva_download:
                     confirmar_download_gratis(
@@ -11370,6 +11686,7 @@ def _processar_download(message, url, status_msg, reserva_download=None):
                         vip_status,
                         tipo_entrega="cache_midia",
                         admin_status=message.from_user.id == ADMIN_ID,
+                        user_id=message.from_user.id,
                     )
                     if reserva_download:
                         confirmar_download_gratis(
@@ -11452,6 +11769,7 @@ def _processar_download(message, url, status_msg, reserva_download=None):
                     tipo_entrega="upload",
                     bytes_upload=bytes_upload,
                     admin_status=message.from_user.id == ADMIN_ID,
+                    user_id=message.from_user.id,
                 )
                 if reserva_download:
                     confirmar_download_gratis(
@@ -11520,6 +11838,7 @@ def _processar_download(message, url, status_msg, reserva_download=None):
                 vip_status,
                 tipo_entrega="cache_url",
                 admin_status=message.from_user.id == ADMIN_ID,
+                user_id=message.from_user.id,
             )
             if reserva_download:
                 confirmar_download_gratis(
@@ -11617,6 +11936,7 @@ def _processar_download(message, url, status_msg, reserva_download=None):
                 vip_status,
                 tipo_entrega="cache_midia",
                 admin_status=message.from_user.id == ADMIN_ID,
+                user_id=message.from_user.id,
             )
             if reserva_download:
                 confirmar_download_gratis(
@@ -11876,6 +12196,7 @@ def _processar_download(message, url, status_msg, reserva_download=None):
             tipo_entrega="upload",
             bytes_upload=bytes_upload,
             admin_status=message.from_user.id == ADMIN_ID,
+            user_id=message.from_user.id,
         )
         if reserva_download:
             confirmar_download_gratis(
