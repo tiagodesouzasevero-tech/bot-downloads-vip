@@ -5683,7 +5683,10 @@ def registrar_download_diario(
 
     # A entrega já aconteceu no Telegram. O rastreamento de campanha é
     # auxiliar e nunca pode transformar um download concluído em falha.
-    if user_id is not None and not admin_status:
+    # O admin continua excluído das métricas gerais acima, mas, se ele iniciou
+    # uma sessão atribuída a anúncio, o funil precisa registrar o download.
+    # Isso permite validar o percurso completo sem alterar os totais diários.
+    if user_id is not None:
         try:
             registrar_evento_funil_ads(user_id, "download")
         except Exception as e:
