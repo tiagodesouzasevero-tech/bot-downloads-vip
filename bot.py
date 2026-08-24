@@ -130,6 +130,18 @@ if not PUBLIC_BASE_URL:
 APP_STARTED_AT = datetime.now(TZ).isoformat()
 APP_INSTANCE_ID = uuid.uuid4().hex
 
+# Proteção de continuidade VIP entre bots. O ID numérico é extraído apenas
+# do prefixo do token (nunca armazenamos o token completo). Se um novo bot
+# assumir o mesmo MongoDB, os dias de indisponibilidade são devolvidos aos
+# VIPs que estavam ativos quando o bot anterior parou.
+BOT_TOKEN_NUMERIC_ID = str(TOKEN_TELEGRAM).split(":", 1)[0].strip()
+if not BOT_TOKEN_NUMERIC_ID.isdigit():
+    raise RuntimeError("TOKEN_TELEGRAM possui formato inválido")
+VIP_CONTINUIDADE_DOC_ID = "vip_continuidade_v1"
+VIP_CONTINUIDADE_HEARTBEAT_SECONDS = get_env_int(
+    "VIP_CONTINUIDADE_HEARTBEAT_SECONDS", 60, 30, 600
+)
+
 FREE_DAILY_LIMIT = 3
 MAX_DURATION_SECONDS = 90
 MAX_URL_LENGTH = get_env_int("MAX_URL_LENGTH", 2048, 256, 8192)
@@ -263,6 +275,10 @@ DOWNLOAD_SEQUENCE = itertools.count()
 DISK_SPACE_ALERT_LOCK = Lock()
 DISK_SPACE_ALERT_STATE = {"active": False, "last_alert_at": 0.0}
 SHUTDOWN_EVENT = Event()
+# Fica marcado quando o polling recebe uma falha fatal de autorização do
+# Telegram. Isso impede que o heartbeat continue dizendo que o bot está
+# disponível depois de uma revogação/banimento do token.
+TELEGRAM_FATAL_EVENT = Event()
 SHUTDOWN_SIGNAL = None
 SHUTDOWN_DEADLINE_MONOTONIC = None
 HEALTH_SERVER_LOCK = Lock()
@@ -507,6 +523,7 @@ fila_recuperacao_col = db["fila_recuperacao"]
 limites_globais_col = db["limites_globais"]
 limites_usuarios_col = db["limites_usuarios"]
 aquisicao_web_col = db["aquisicao_web"]
+operacao_continuidade_col = db["operacao_continuidade"]
 
 try:
     usuarios_col.create_index("vip_ate")
@@ -6809,6 +6826,453 @@ def is_vip_user(user):
         return False
 
 
+# =========================================
+# CONTINUIDADE VIP ENTRE BOTS
+# =========================================
+def _datetime_continuidade_para_tz(valor):
+    """Normaliza datetimes vindos do MongoDB para o fuso operacional."""
+    if not isinstance(valor, datetime):
+        return None
+    if valor.tzinfo is None:
+        return valor.replace(tzinfo=timezone.utc).astimezone(TZ)
+    return valor.astimezone(TZ)
+
+
+def _evento_continuidade_id(bot_anterior, bot_atual, inicio_indisponibilidade, retomada):
+    material = (
+        f"{bot_anterior}|{bot_atual}|"
+        f"{inicio_indisponibilidade.isoformat()}|{retomada.isoformat()}"
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:40]
+
+
+def _estado_continuidade():
+    return operacao_continuidade_col.find_one(
+        {"_id": VIP_CONTINUIDADE_DOC_ID}
+    ) or {}
+
+
+def _registrar_heartbeat_continuidade():
+    """Atualiza a última evidência de vida sem permitir que um bot antigo
+    sobrescreva o estado depois que um bot novo assumir a operação.
+    """
+    if SHUTDOWN_EVENT.is_set() or TELEGRAM_FATAL_EVENT.is_set():
+        return False
+
+    agora = agora_tz()
+    resultado = operacao_continuidade_col.update_one(
+        {
+            "_id": VIP_CONTINUIDADE_DOC_ID,
+            "bot_id": BOT_TOKEN_NUMERIC_ID,
+        },
+        {
+            "$set": {
+                "last_heartbeat_at": agora,
+                "last_instance_id": APP_INSTANCE_ID,
+                "service": SERVICE_NAME,
+                "environment": ENVIRONMENT_NAME,
+                "updated_at": agora,
+            }
+        },
+    )
+    return bool(getattr(resultado, "matched_count", 0))
+
+
+def _eh_erro_fatal_polling_telegram(erro):
+    """Reconhece falha de autorização no getUpdates/infinity_polling."""
+    codigo = getattr(erro, "error_code", None)
+    try:
+        codigo = int(codigo) if codigo is not None else None
+    except Exception:
+        codigo = None
+
+    texto = str(erro or "").lower()
+    return bool(
+        codigo in {401, 403}
+        or "unauthorized" in texto
+        or "invalid token" in texto
+        or "token is invalid" in texto
+    )
+
+
+def _registrar_indisponibilidade_fatal_telegram(erro):
+    """Congela o marco de queda na primeira falha fatal do bot atual."""
+    TELEGRAM_FATAL_EVENT.set()
+    agora = agora_tz()
+    codigo = getattr(erro, "error_code", None)
+
+    try:
+        resultado = operacao_continuidade_col.update_one(
+            {
+                "_id": VIP_CONTINUIDADE_DOC_ID,
+                "bot_id": BOT_TOKEN_NUMERIC_ID,
+                "$or": [
+                    {"telegram_unavailable_at": {"$exists": False}},
+                    {"telegram_unavailable_at": None},
+                ],
+            },
+            {
+                "$set": {
+                    "telegram_unavailable_at": agora,
+                    "last_heartbeat_at": agora,
+                    "telegram_failure_code": codigo,
+                    "telegram_failure_instance_id": APP_INSTANCE_ID,
+                    "updated_at": agora,
+                }
+            },
+        )
+        gravou = bool(getattr(resultado, "modified_count", 0))
+        logger.critical(
+            "[VIP_CONTINUIDADE_QUEDA] "
+            f"registrada={gravou} codigo={codigo or 'na'} "
+            f"bot_ref={referencia_privada_log('bot', BOT_TOKEN_NUMERIC_ID)}"
+        )
+        return gravou
+    except Exception as e:
+        logger.critical(
+            "[VIP_CONTINUIDADE_QUEDA_FALHA] "
+            f"erro={sanitizar_erro_log(e)}"
+        )
+        return False
+
+
+def _aplicar_compensacao_continuidade(pendente):
+    evento_id = str(pendente.get("event_id") or "").strip()
+    bot_anterior = str(pendente.get("from_bot_id") or "").strip()
+    bot_atual = str(pendente.get("to_bot_id") or "").strip()
+    inicio = _datetime_continuidade_para_tz(pendente.get("outage_started_at"))
+    retomada = _datetime_continuidade_para_tz(pendente.get("recovery_started_at"))
+    dias = int(pendente.get("days_to_restore") or 0)
+
+    if not evento_id or not bot_anterior or bot_atual != BOT_TOKEN_NUMERIC_ID:
+        raise RuntimeError("VIP_CONTINUIDADE_EVENTO_INVALIDO")
+    if not inicio or not retomada or dias < 0:
+        raise RuntimeError("VIP_CONTINUIDADE_DATAS_INVALIDAS")
+
+    data_queda = inicio.date()
+    ajustados = 0
+    ja_processados = 0
+    elegiveis = 0
+
+    if dias > 0:
+        cursor = usuarios_col.find(
+            {"vip_ate": {"$nin": [None, "", "Vitalício"]}},
+            {
+                "_id": 1,
+                "vip_ate": 1,
+                "vip_continuidade_eventos": 1,
+            },
+        )
+
+        for usuario in cursor:
+            vip_ate = str(usuario.get("vip_ate") or "").strip()
+            try:
+                validade = datetime.strptime(vip_ate, "%Y-%m-%d").date()
+            except Exception:
+                continue
+
+            # Só devolve dias a quem estava VIP na data em que o bot anterior
+            # ficou indisponível. Quem já estava vencido não é reativado.
+            if validade < data_queda:
+                continue
+
+            elegiveis += 1
+            eventos = usuario.get("vip_continuidade_eventos") or []
+            if evento_id in eventos:
+                ja_processados += 1
+                continue
+
+            nova_validade = (validade + timedelta(days=dias)).strftime("%Y-%m-%d")
+            agora = agora_tz()
+            resultado = usuarios_col.update_one(
+                {
+                    "_id": str(usuario.get("_id")),
+                    "vip_ate": vip_ate,
+                    "vip_continuidade_eventos": {"$ne": evento_id},
+                },
+                {
+                    "$set": {
+                        "vip_ate": nova_validade,
+                        "vip_continuidade_last_event": evento_id,
+                        "vip_continuidade_last_days": dias,
+                        "vip_continuidade_last_at": agora,
+                    },
+                    "$addToSet": {
+                        "vip_continuidade_eventos": evento_id,
+                    },
+                },
+            )
+            if getattr(resultado, "modified_count", 0):
+                ajustados += 1
+            else:
+                # Se outro processo concluiu primeiro, a marca idempotente
+                # impede uma segunda soma de dias.
+                confirmado = usuarios_col.find_one(
+                    {"_id": str(usuario.get("_id"))},
+                    {"vip_continuidade_eventos": 1},
+                ) or {}
+                if evento_id in (confirmado.get("vip_continuidade_eventos") or []):
+                    ja_processados += 1
+                else:
+                    raise RuntimeError("VIP_CONTINUIDADE_ATUALIZACAO_CONCORRENTE")
+
+    finalizado_em = agora_tz()
+    operacao_continuidade_col.update_one(
+        {
+            "_id": VIP_CONTINUIDADE_DOC_ID,
+            "pending_recovery.event_id": evento_id,
+        },
+        {
+            "$set": {
+                "bot_id": BOT_TOKEN_NUMERIC_ID,
+                "last_heartbeat_at": finalizado_em,
+                "last_instance_id": APP_INSTANCE_ID,
+                "last_recovery": {
+                    "event_id": evento_id,
+                    "from_bot_id": bot_anterior,
+                    "to_bot_id": BOT_TOKEN_NUMERIC_ID,
+                    "outage_started_at": inicio,
+                    "recovery_started_at": retomada,
+                    "days_restored": dias,
+                    "eligible_users": elegiveis,
+                    "adjusted_users": ajustados,
+                    "already_processed_users": ja_processados,
+                    "completed_at": finalizado_em,
+                },
+                "service": SERVICE_NAME,
+                "environment": ENVIRONMENT_NAME,
+                "updated_at": finalizado_em,
+            },
+            "$unset": {
+                "pending_recovery": "",
+                "telegram_unavailable_at": "",
+                "telegram_failure_code": "",
+                "telegram_failure_instance_id": "",
+            },
+        },
+    )
+
+    logger.warning(
+        "[VIP_CONTINUIDADE_RECUPERADA] "
+        f"dias={dias} elegiveis={elegiveis} ajustados={ajustados} "
+        f"ja_processados={ja_processados} "
+        f"bot_anterior_ref={referencia_privada_log('bot', bot_anterior)} "
+        f"bot_atual_ref={referencia_privada_log('bot', BOT_TOKEN_NUMERIC_ID)}"
+    )
+
+    return {
+        "migracao": True,
+        "dias": dias,
+        "elegiveis": elegiveis,
+        "ajustados": ajustados,
+        "ja_processados": ja_processados,
+        "inicio": inicio,
+        "retomada": retomada,
+    }
+
+
+def inicializar_protecao_continuidade_vip(notificar_admin=True):
+    """Detecta troca de bot e devolve os dias parados aos VIPs ativos.
+
+    A operação é idempotente: cada usuário recebe cada evento no máximo uma vez.
+    Um evento pendente fica no MongoDB e pode ser retomado após reinício.
+    """
+    agora = agora_tz()
+
+    try:
+        estado = _estado_continuidade()
+
+        if not estado:
+            operacao_continuidade_col.update_one(
+                {"_id": VIP_CONTINUIDADE_DOC_ID},
+                {
+                    "$setOnInsert": {
+                        "bot_id": BOT_TOKEN_NUMERIC_ID,
+                        "first_started_at": agora,
+                        "last_heartbeat_at": agora,
+                        "last_instance_id": APP_INSTANCE_ID,
+                        "service": SERVICE_NAME,
+                        "environment": ENVIRONMENT_NAME,
+                        "created_at": agora,
+                        "updated_at": agora,
+                    }
+                },
+                upsert=True,
+            )
+            logger.info(
+                "[VIP_CONTINUIDADE_INIT] primeira_execucao=True "
+                f"heartbeat={VIP_CONTINUIDADE_HEARTBEAT_SECONDS}s"
+            )
+            return {"migracao": False, "primeira_execucao": True}
+
+        pendente = estado.get("pending_recovery") or {}
+        if (
+            pendente
+            and pendente.get("to_bot_id") == BOT_TOKEN_NUMERIC_ID
+            and pendente.get("event_id")
+        ):
+            resultado = _aplicar_compensacao_continuidade(pendente)
+        else:
+            bot_anterior = str(estado.get("bot_id") or "").strip()
+            if not bot_anterior or bot_anterior == BOT_TOKEN_NUMERIC_ID:
+                operacao_continuidade_col.update_one(
+                    {"_id": VIP_CONTINUIDADE_DOC_ID},
+                    {
+                        "$set": {
+                            "bot_id": BOT_TOKEN_NUMERIC_ID,
+                            "last_heartbeat_at": agora,
+                            "last_instance_id": APP_INSTANCE_ID,
+                            "service": SERVICE_NAME,
+                            "environment": ENVIRONMENT_NAME,
+                            "updated_at": agora,
+                        },
+                        "$unset": {
+                            "telegram_unavailable_at": "",
+                            "telegram_failure_code": "",
+                            "telegram_failure_instance_id": "",
+                        },
+                    },
+                )
+                return {"migracao": False, "primeira_execucao": False}
+
+            inicio = (
+                _datetime_continuidade_para_tz(estado.get("telegram_unavailable_at"))
+                or _datetime_continuidade_para_tz(estado.get("last_heartbeat_at"))
+                or agora
+            )
+            if inicio > agora:
+                inicio = agora
+
+            dias = max(0, (agora.date() - inicio.date()).days)
+            evento_id = _evento_continuidade_id(
+                bot_anterior,
+                BOT_TOKEN_NUMERIC_ID,
+                inicio,
+                agora,
+            )
+            pendente = {
+                "event_id": evento_id,
+                "from_bot_id": bot_anterior,
+                "to_bot_id": BOT_TOKEN_NUMERIC_ID,
+                "outage_started_at": inicio,
+                "recovery_started_at": agora,
+                "days_to_restore": dias,
+                "status": "pending",
+                "created_at": agora,
+            }
+
+            reservado = operacao_continuidade_col.update_one(
+                {
+                    "_id": VIP_CONTINUIDADE_DOC_ID,
+                    "bot_id": bot_anterior,
+                    "$or": [
+                        {"pending_recovery": {"$exists": False}},
+                        {"pending_recovery": None},
+                    ],
+                },
+                {
+                    "$set": {
+                        "pending_recovery": pendente,
+                        "updated_at": agora,
+                    }
+                },
+            )
+
+            if not getattr(reservado, "modified_count", 0):
+                estado = _estado_continuidade()
+                pendente = estado.get("pending_recovery") or {}
+                if not (
+                    pendente.get("to_bot_id") == BOT_TOKEN_NUMERIC_ID
+                    and pendente.get("event_id")
+                ):
+                    raise RuntimeError("VIP_CONTINUIDADE_RESERVA_CONCORRENTE")
+
+            resultado = _aplicar_compensacao_continuidade(pendente)
+
+        if resultado.get("migracao") and notificar_admin:
+            dias = int(resultado.get("dias") or 0)
+            ajustados = int(resultado.get("ajustados") or 0)
+            elegiveis = int(resultado.get("elegiveis") or 0)
+            safe_send_message(
+                ADMIN_ID,
+                "🛡 <b>Continuidade VIP aplicada</b>\n\n"
+                "Um bot diferente assumiu a operação usando o mesmo banco.\n"
+                f"Dias de indisponibilidade devolvidos: <b>{dias}</b>\n"
+                f"VIPs elegíveis: <b>{elegiveis}</b>\n"
+                f"VIPs ajustados agora: <b>{ajustados}</b>\n\n"
+                "Cada VIP manteve os mesmos dias que ainda possuía quando o "
+                "bot anterior ficou indisponível.",
+                parse_mode="HTML",
+            )
+
+        return resultado
+    except Exception as e:
+        registrar_falha_componente("MongoDB", e)
+        logger.error(
+            "[VIP_CONTINUIDADE_STARTUP_FALHA] "
+            f"erro={sanitizar_erro_log(e)}"
+        )
+        return {"migracao": False, "erro": True}
+
+
+def loop_heartbeat_continuidade_vip():
+    logger.info(
+        "[VIP_CONTINUIDADE_HEARTBEAT] iniciado "
+        f"intervalo={VIP_CONTINUIDADE_HEARTBEAT_SECONDS}s"
+    )
+    while not SHUTDOWN_EVENT.is_set():
+        try:
+            if not TELEGRAM_FATAL_EVENT.is_set():
+                if not _registrar_heartbeat_continuidade():
+                    # Pode ocorrer durante uma troca de bot ou após falha
+                    # transitória no startup. Tenta concluir a proteção.
+                    inicializar_protecao_continuidade_vip(notificar_admin=False)
+        except Exception as e:
+            logger.warning(
+                "[VIP_CONTINUIDADE_HEARTBEAT_FALHA] "
+                f"erro={sanitizar_erro_log(e)}"
+            )
+        SHUTDOWN_EVENT.wait(VIP_CONTINUIDADE_HEARTBEAT_SECONDS)
+
+    logger.info("[VIP_CONTINUIDADE_HEARTBEAT] encerrado")
+
+
+def texto_status_continuidade_vip():
+    estado = _estado_continuidade()
+    heartbeat = _datetime_continuidade_para_tz(estado.get("last_heartbeat_at"))
+    queda = _datetime_continuidade_para_tz(estado.get("telegram_unavailable_at"))
+    recuperacao = estado.get("last_recovery") or {}
+
+    linhas = [
+        "🛡 <b>Proteção de continuidade VIP</b>",
+        "",
+        "Status: <b>ativa</b>",
+        f"Heartbeat: <b>{VIP_CONTINUIDADE_HEARTBEAT_SECONDS}s</b>",
+        f"Última atividade: <b>{heartbeat.strftime('%d/%m/%Y %H:%M:%S') if heartbeat else 'não registrada'}</b>",
+    ]
+    if queda:
+        linhas.append(
+            f"Queda registrada: <b>{queda.strftime('%d/%m/%Y %H:%M:%S')}</b>"
+        )
+    if recuperacao:
+        linhas.extend(
+            [
+                "",
+                "<b>Última recuperação</b>",
+                f"Dias devolvidos: <b>{int(recuperacao.get('days_restored') or 0)}</b>",
+                f"VIPs ajustados: <b>{int(recuperacao.get('adjusted_users') or 0)}</b>",
+            ]
+        )
+    linhas.extend(
+        [
+            "",
+            "Se um novo bot usar este mesmo MongoDB, os VIPs ativos no momento "
+            "da queda recebem de volta os dias em que o serviço ficou fora.",
+        ]
+    )
+    return "\n".join(linhas)
+
+
 def notificar_vips_com_vencimento_proximo():
     """Envia um único lembrete no dia anterior ao vencimento do VIP."""
     data_alvo = (
@@ -7013,6 +7477,7 @@ def configurar_menu_comandos():
         types.BotCommand("avisogeral", "Enviar comunicado aos usuários"),
         types.BotCommand("diagnostico", "Verificar a saúde do bot"),
         types.BotCommand("syncvip", "Sincronizar pagamentos e VIPs"),
+        types.BotCommand("continuidade", "Ver proteção dos VIPs"),
         types.BotCommand("linkads", "Gerar link rastreável para anúncio"),
         types.BotCommand("origens", "Ver origem e conversão dos usuários"),
         types.BotCommand("backupvips", "Gerar backup dos VIPs ativos"),
@@ -8552,6 +9017,28 @@ def relatorio_origens_aquisicao(message):
             f"erro={sanitizar_erro_log(e)}"
         )
         safe_reply_to(message, "❌ Não foi possível gerar o relatório de origens.")
+
+
+@bot.message_handler(commands=["continuidade"])
+def continuidade_vip_admin(message):
+    if not exigir_admin_privado(message):
+        return
+
+    try:
+        safe_reply_to(
+            message,
+            texto_status_continuidade_vip(),
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        logger.error(
+            "[VIP_CONTINUIDADE_STATUS_FALHA] "
+            f"erro={sanitizar_erro_log(e)}"
+        )
+        safe_reply_to(
+            message,
+            "❌ Não foi possível consultar a proteção de continuidade agora.",
+        )
 
 
 @bot.message_handler(commands=["syncvip"])
@@ -13335,12 +13822,17 @@ def encerrar_healthcheck():
 # MAIN
 # =========================================
 if __name__ == "__main__":
-    logger.info("[BOT_BUILD] bot_downloads_v4_ml_clips_v12_3_start_fix")
+    logger.info("[BOT_BUILD] bot_downloads_v4_ml_clips_v12_4_vip_continuidade")
     logger.info("[VIP_SYNC_CONFIG] startup=True pos_pagamento=True bloqueio_removervip=True comando_syncvip=True")
     logger.info("[VIP_SYNC_FIX] projection_status=True formatacao_newline=True log_motivo=True")
     logger.info("[VIP_SYNC_POLICY] paid_sozinho_nao_reativa=True exige_vip_aplicado_ao_pedido=True respeita_bloqueio_admin=True")
     logger.info("[START_FIX] mongo_update_conflict=False tracking_nao_bloqueia_start=True vip_e_gratis=True")
     logger.info("[BACKUP_MENU_CONFIG] backupvips=True backupgeral=True")
+    logger.info(
+        f"[VIP_CONTINUIDADE_CONFIG] ativo=True heartbeat="
+        f"{VIP_CONTINUIDADE_HEARTBEAT_SECONDS}s troca_bot_auto=True "
+        "dias_calendario=True idempotente=True mongo_persistente=True"
+    )
     logger.info("[AQUISICAO_CONFIG] deep_link=True linkads=True origens=True origem_imutavel=True funil_ativacao=True meta_breakdown=True")
     logger.info(
         f"[LANDING_ADS_CONFIG] enabled=True base_url={PUBLIC_BASE_URL} "
@@ -13471,6 +13963,9 @@ if __name__ == "__main__":
         )
     inicializar_metricas_diarias()
     cleanup_download_dir_old_files(max_age_hours=6)
+    # Deve rodar antes do syncvip: assim um VIP que venceu enquanto o bot
+    # ficou banido/indisponível recupera os dias antes da reconciliação normal.
+    inicializar_protecao_continuidade_vip(notificar_admin=True)
     configurar_menu_comandos()
     recuperar_aprovacoes_pix_interrompidas()
     sincronizar_vips_pagos_ativos(notificar_admin=True)
@@ -13497,11 +13992,22 @@ if __name__ == "__main__":
     ).start()
 
     Thread(
+        target=loop_heartbeat_continuidade_vip,
+        daemon=True,
+        name="vip-continuity-heartbeat",
+    ).start()
+
+    Thread(
         target=servir_healthcheck,
         daemon=True
     ).start()
 
     while not SHUTDOWN_EVENT.is_set():
+        if TELEGRAM_FATAL_EVENT.is_set():
+            atualizar_estado_bot("telegram_unavailable")
+            time.sleep(60)
+            continue
+
         try:
             atualizar_estado_bot("polling")
             logger.info("Iniciando bot.infinity_polling...")
@@ -13509,6 +14015,16 @@ if __name__ == "__main__":
         except Exception as e:
             if SHUTDOWN_EVENT.is_set():
                 break
+
+            if _eh_erro_fatal_polling_telegram(e):
+                atualizar_estado_bot("telegram_unavailable")
+                _registrar_indisponibilidade_fatal_telegram(e)
+                logger.critical(
+                    "[POLLING_FATAL_TELEGRAM] autorização perdida; "
+                    "heartbeat congelado até a troca/reconfiguração do bot"
+                )
+                continue
+
             atualizar_estado_bot("reconnecting")
             logger.error(f"[POLLING] erro={sanitizar_erro_log(e)}")
             time.sleep(5)
