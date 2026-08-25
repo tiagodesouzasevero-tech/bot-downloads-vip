@@ -18,6 +18,7 @@ import stat
 from collections import defaultdict, deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from http.cookies import SimpleCookie
+from html.parser import HTMLParser
 from queue import Empty, Full, PriorityQueue
 from threading import Event, Lock, Thread, enumerate as enumerate_threads
 from datetime import datetime, timedelta, timezone
@@ -1761,6 +1762,396 @@ def safe_answer_callback(call_id, **kwargs):
         bot.answer_callback_query(call_id, **kwargs)
     except Exception as e:
         logger.warning(f"[CALLBACK_ANSWER] erro={sanitizar_erro_log(e)}")
+
+
+# =========================================
+# GERADOR DE OFERTAS (EXCLUSIVO DO ADMIN)
+# =========================================
+# Este recurso não usa fila de download, não grava imagens no disco e só pode
+# ser acionado pelo ADMIN_ID no chat privado. O link original é preservado para
+# que os parâmetros de afiliado nunca sejam removidos.
+OFFER_PAGE_MAX_BYTES = 1_500_000
+OFFER_FETCH_TIMEOUT = (5, 15)
+OFFER_PENDING_PRICE_TTL_SECONDS = 15 * 60
+OFFER_PENDING_PRICE = {}
+OFFER_PENDING_PRICE_LOCK = Lock()
+OFFER_ACTION_TTL_SECONDS = 24 * 60 * 60
+OFFER_ACTIONS = {}
+OFFER_ACTIONS_LOCK = Lock()
+OFFER_HEADERS = {
+    **DEFAULT_HEADERS,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+}
+
+
+class ExtratorMetadadosOferta(HTMLParser):
+    """Lê somente os metadados públicos usados para montar a oferta."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.metas = {}
+        self.titulo_html = ""
+        self._capturando_titulo = False
+
+    def handle_starttag(self, tag, attrs):
+        atributos = {
+            str(chave or "").lower(): str(valor or "").strip()
+            for chave, valor in attrs
+        }
+        if tag.lower() == "meta":
+            chave = (
+                atributos.get("property")
+                or atributos.get("name")
+                or atributos.get("itemprop")
+                or ""
+            ).lower()
+            valor = atributos.get("content", "").strip()
+            if chave and valor and chave not in self.metas:
+                self.metas[chave] = valor
+        elif tag.lower() == "title":
+            self._capturando_titulo = True
+
+    def handle_endtag(self, tag):
+        if tag.lower() == "title":
+            self._capturando_titulo = False
+
+    def handle_data(self, data):
+        if self._capturando_titulo and data:
+            self.titulo_html += data
+
+
+def _normalizar_texto_oferta(valor, limite=280):
+    texto = html.unescape(str(valor or ""))
+    texto = re.sub(r"\s+", " ", texto).strip()
+    return texto[:limite].rstrip()
+
+
+def _formatar_preco_oferta(valor):
+    """Aceita R$13,88, 13,88 ou 13.88 e devolve sempre R$13,88."""
+    texto = _normalizar_texto_oferta(valor, limite=40)
+    texto = re.sub(r"(?i)^r\$\s*", "", texto).strip()
+    if not texto:
+        return None
+
+    # Valor brasileiro com milhares: 1.299,90. Valor de APIs: 1299.90.
+    if "," in texto:
+        texto = texto.replace(".", "").replace(",", ".")
+    elif texto.count(".") > 1:
+        texto = texto.replace(".", "")
+
+    if not re.fullmatch(r"\d{1,7}(?:\.\d{1,2})?", texto):
+        return None
+    try:
+        numero = float(texto)
+    except ValueError:
+        return None
+    if not (0.01 <= numero <= 999999.99):
+        return None
+
+    return "R$" + f"{numero:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def _normalizar_cupom_oferta(valor):
+    """Aceita somente códigos curtos, sem texto extra no post de oferta."""
+    codigo = _normalizar_texto_oferta(valor, limite=50)
+    codigo = re.sub(r"(?i)^cupom\s*[:=-]?\s*", "", codigo).strip().upper()
+    if not re.fullmatch(r"[A-Z0-9][A-Z0-9_-]{1,39}", codigo):
+        return None
+    return codigo
+
+
+def _loja_produto_por_url(url, aceitar_link_curto=True):
+    """Classifica apenas links oficiais de produto/compartilhamento das 3 lojas."""
+    try:
+        parsed = urlparse(str(url or "").strip())
+        host = (parsed.hostname or "").lower().rstrip(".")
+        path = (parsed.path or "/").lower()
+    except Exception:
+        return None
+
+    if parsed.scheme not in ("http", "https") or not host:
+        return None
+
+    if aceitar_link_curto:
+        if host in {"s.shopee.com.br", "shope.ee", "www.shope.ee"}:
+            return "Shopee"
+        if host in {"meli.la", "www.meli.la"}:
+            return "Mercado Livre"
+        if host in {"amzn.to", "www.amzn.to"}:
+            return "Amazon"
+
+    if hostname_permitido(host, "shopee.com.br"):
+        # Links de Shopee Video continuam sendo tratados pelo downloader.
+        if "/share-video" in path or "/video/" in path:
+            return None
+        if "/product/" in path or "-i." in path:
+            return "Shopee"
+    if hostname_permitido(host, "mercadolivre.com.br"):
+        if "/clips" not in path and "/live/videos" not in path and re.search(r"mlb[-/]?\d+", path):
+            return "Mercado Livre"
+    if hostname_permitido(host, "amazon.com.br"):
+        if re.search(r"/(?:dp|gp/product)/[a-z0-9]{8,14}(?:[/?]|$)", path):
+            return "Amazon"
+    return None
+
+
+def _imagem_oferta_permitida(url):
+    try:
+        parsed = urlparse(str(url or "").strip())
+        host = (parsed.hostname or "").lower().rstrip(".")
+    except Exception:
+        return False
+    if not validar_url_http_publica(url, resolver_dns=False):
+        return False
+    return any(
+        hostname_permitido(host, dominio)
+        for dominio in (
+            "shopee.com.br",
+            "susercontent.com",
+            "mlstatic.com",
+            "amazon.com.br",
+            "media-amazon.com",
+            "ssl-images-amazon.com",
+        )
+    )
+
+
+def _ler_html_oferta(resposta):
+    tamanho = resposta.headers.get("Content-Length", "")
+    try:
+        if tamanho and int(tamanho) > OFFER_PAGE_MAX_BYTES:
+            raise RuntimeError("PAGINA_OFERTA_MUITO_GRANDE")
+    except ValueError:
+        pass
+
+    partes = []
+    total = 0
+    for parte in resposta.iter_content(chunk_size=32768):
+        if not parte:
+            continue
+        total += len(parte)
+        if total > OFFER_PAGE_MAX_BYTES:
+            raise RuntimeError("PAGINA_OFERTA_MUITO_GRANDE")
+        partes.append(parte)
+
+    conteudo = b"".join(partes)
+    return conteudo.decode(resposta.encoding or "utf-8", errors="replace")
+
+
+def _extrair_preco_oferta(metas, pagina_html):
+    for chave in (
+        "product:price:amount",
+        "og:price:amount",
+        "price",
+        "twitter:data1",
+    ):
+        preco = _formatar_preco_oferta(metas.get(chave))
+        if preco:
+            return preco
+
+    # Amazon, Shopee e Mercado Livre normalmente deixam o preço visível na
+    # página em formato brasileiro, mesmo quando a estrutura interna muda.
+    match = re.search(
+        r"R\$\s*([0-9]{1,3}(?:\.[0-9]{3})*,[0-9]{2})",
+        pagina_html,
+        flags=re.IGNORECASE,
+    )
+    return _formatar_preco_oferta(match.group(1)) if match else None
+
+
+def _montar_texto_oferta(titulo, preco, url_original, cupom=None):
+    texto = (
+        f"🛍️ <b>{html.escape(titulo)}</b>\n\n"
+        f"💰 Por apenas <b>{html.escape(preco)}</b>\n\n"
+    )
+    if cupom:
+        texto += f"🏷️ Use o cupom: <b>{html.escape(cupom)}</b>\n\n"
+    return texto + f"🛒 <b>COMPRE AQUI:</b> {html.escape(url_original)}\n\n#publi"
+
+
+def _registrar_acoes_oferta(titulo, preco, url_original, imagem_url, cupom=None):
+    """Mantém botões por 24h somente na memória do processo, sem custo extra."""
+    agora = time.time()
+    referencia = uuid.uuid4().hex[:16]
+    with OFFER_ACTIONS_LOCK:
+        expirados = [
+            chave for chave, dados in OFFER_ACTIONS.items()
+            if float(dados.get("expires_at", 0)) < agora
+        ]
+        for chave in expirados:
+            OFFER_ACTIONS.pop(chave, None)
+        OFFER_ACTIONS[referencia] = {
+            "titulo": titulo,
+            "preco": preco,
+            "url_original": url_original,
+            "imagem_url": imagem_url,
+            "cupom": cupom,
+            "expires_at": agora + OFFER_ACTION_TTL_SECONDS,
+        }
+    return referencia
+
+
+def _obter_acoes_oferta(referencia):
+    with OFFER_ACTIONS_LOCK:
+        dados = OFFER_ACTIONS.get(str(referencia or ""))
+    if not dados or float(dados.get("expires_at", 0)) < time.time():
+        return None
+    return dict(dados)
+
+
+def _botoes_oferta(referencia):
+    teclado = types.InlineKeyboardMarkup(row_width=2)
+    teclado.add(
+        types.InlineKeyboardButton(
+            "✏️ Alterar preço",
+            callback_data=f"ofp_{referencia}",
+        ),
+        types.InlineKeyboardButton(
+            "🏷️ Adicionar cupom",
+            callback_data=f"ofc_{referencia}",
+        ),
+    )
+    return teclado
+
+
+def _enviar_oferta_pronta(chat_id, titulo, preco, url_original, imagem_url=None, cupom=None):
+    texto = _montar_texto_oferta(titulo, preco, url_original, cupom=cupom)
+    referencia = _registrar_acoes_oferta(
+        titulo,
+        preco,
+        url_original,
+        imagem_url,
+        cupom=cupom,
+    )
+    botoes = _botoes_oferta(referencia)
+    if imagem_url and _imagem_oferta_permitida(imagem_url):
+        try:
+            # O Telegram busca a imagem diretamente no CDN da loja: nada é
+            # salvo na Railway e não há arquivo temporário para limpar.
+            bot.send_photo(
+                chat_id,
+                imagem_url,
+                caption=texto,
+                parse_mode="HTML",
+                reply_markup=botoes,
+            )
+            return True
+        except Exception as e:
+            logger.warning(
+                "[OFERTA_FOTO_FALHA] "
+                f"chat_ref={referencia_chat_log(chat_id)} "
+                f"erro={sanitizar_erro_log(e)}"
+            )
+    return bool(
+        safe_send_message(
+            chat_id,
+            texto,
+            parse_mode="HTML",
+            reply_markup=botoes,
+        )
+    )
+
+
+def _guardar_preco_pendente_oferta(user_id, dados):
+    with OFFER_PENDING_PRICE_LOCK:
+        OFFER_PENDING_PRICE[str(user_id)] = {
+            **dados,
+            "expires_at": time.time() + OFFER_PENDING_PRICE_TTL_SECONDS,
+        }
+
+
+def _retirar_preco_pendente_oferta(user_id):
+    with OFFER_PENDING_PRICE_LOCK:
+        dados = OFFER_PENDING_PRICE.pop(str(user_id), None)
+    if not dados or float(dados.get("expires_at", 0)) < time.time():
+        return None
+    return dados
+
+
+def processar_link_oferta_admin(message, url_original):
+    """Gera uma oferta ao colar um link, sem comandos e sem expor o recurso."""
+    status = safe_reply_to(message, "🛍️ Gerando sua oferta...")
+    resposta = None
+    try:
+        resposta, url_final = seguir_redirecionamentos_seguros(
+            url_original,
+            headers=OFFER_HEADERS,
+        )
+        loja = _loja_produto_por_url(url_final, aceitar_link_curto=False)
+        if not loja:
+            raise RuntimeError("LINK_OFERTA_NAO_RECONHECIDO")
+
+        pagina_html = _ler_html_oferta(resposta)
+        parser = ExtratorMetadadosOferta()
+        parser.feed(pagina_html)
+        parser.close()
+
+        titulo = _normalizar_texto_oferta(
+            parser.metas.get("og:title")
+            or parser.metas.get("twitter:title")
+            or parser.metas.get("title")
+            or parser.titulo_html
+        )
+        if not titulo:
+            raise RuntimeError("TITULO_OFERTA_AUSENTE")
+
+        imagem_url = _normalizar_texto_oferta(
+            parser.metas.get("og:image") or parser.metas.get("twitter:image"),
+            limite=1800,
+        )
+        if imagem_url:
+            imagem_url = urljoin(url_final, imagem_url)
+
+        preco = _extrair_preco_oferta(parser.metas, pagina_html)
+        if not preco:
+            _guardar_preco_pendente_oferta(
+                message.from_user.id,
+                {
+                    "titulo": titulo,
+                    "url_original": url_original,
+                    "imagem_url": imagem_url,
+                    "loja": loja,
+                },
+            )
+            if status:
+                safe_delete_message(message.chat.id, status.message_id)
+            safe_send_message(
+                message.chat.id,
+                "Encontrei o produto, mas não consegui confirmar o preço. "
+                "Envie somente o valor, por exemplo: <b>13,88</b>",
+                parse_mode="HTML",
+            )
+            return
+
+        if status:
+            safe_delete_message(message.chat.id, status.message_id)
+        _enviar_oferta_pronta(
+            message.chat.id,
+            titulo,
+            preco,
+            url_original,
+            imagem_url,
+        )
+        logger.info(
+            "[OFERTA_GERADA] "
+            f"loja={loja} chat_ref={referencia_chat_log(message.chat.id)}"
+        )
+    except Exception as e:
+        logger.warning(
+            "[OFERTA_GERACAO_FALHA] "
+            f"chat_ref={referencia_chat_log(message.chat.id)} "
+            f"erro={sanitizar_erro_log(e)}"
+        )
+        if status:
+            safe_delete_message(message.chat.id, status.message_id)
+        safe_send_message(
+            message.chat.id,
+            "❌ Não consegui gerar essa oferta agora. Confira se é um link de "
+            "produto da Shopee, Mercado Livre ou Amazon e tente novamente.",
+        )
+    finally:
+        if resposta is not None:
+            resposta.close()
 
 
 def normalizar_plataforma_monitoramento(plataforma):
@@ -13251,6 +13642,116 @@ def loop_fila_downloads():
             _encerrar_processo_para_reinicio()
 
 
+@bot.callback_query_handler(
+    func=lambda call: str(getattr(call, "data", "")).startswith(("ofp_", "ofc_"))
+)
+def acoes_oferta_admin(call):
+    """Permite corrigir preço ou acrescentar cupom sem comandos."""
+    mensagem = getattr(call, "message", None)
+    if (
+        not mensagem
+        or int(getattr(getattr(call, "from_user", None), "id", 0) or 0) != ADMIN_ID
+        or getattr(getattr(mensagem, "chat", None), "type", None) != "private"
+        or int(getattr(getattr(mensagem, "chat", None), "id", 0) or 0) != ADMIN_ID
+    ):
+        safe_answer_callback(call.id, text="Ação disponível apenas para o administrador.", show_alert=True)
+        return
+
+    acao, separador, referencia = str(call.data).partition("_")
+    # O primeiro prefixo é ofp/ofc; partition acima separa em 'ofp'/'ofc'.
+    dados = _obter_acoes_oferta(referencia) if separador else None
+    if not dados:
+        safe_answer_callback(call.id, text="Essa oferta expirou. Cole o link novamente.", show_alert=True)
+        return
+
+    if acao == "ofp":
+        _guardar_preco_pendente_oferta(
+            ADMIN_ID,
+            {**dados, "modo": "preco"},
+        )
+        safe_answer_callback(call.id, text="Envie o novo preço.")
+        safe_send_message(
+            mensagem.chat.id,
+            "💰 Envie somente o novo preço, por exemplo: <b>12,99</b>",
+            parse_mode="HTML",
+        )
+        return
+
+    if acao == "ofc":
+        _guardar_preco_pendente_oferta(
+            ADMIN_ID,
+            {**dados, "modo": "cupom"},
+        )
+        safe_answer_callback(call.id, text="Envie o código do cupom.")
+        safe_send_message(
+            mensagem.chat.id,
+            "🏷️ Envie somente o cupom, por exemplo: <b>PET10</b>",
+            parse_mode="HTML",
+        )
+
+
+@bot.message_handler(
+    func=lambda message: (
+        bool(getattr(message, "text", None))
+        and is_admin_privado(message)
+        and not bool(extrair_primeira_url(message.text))
+    )
+)
+def receber_preco_manual_oferta(message):
+    """Recebe preço ou cupom depois de um botão, sem exigir comandos."""
+    pendente = _retirar_preco_pendente_oferta(message.from_user.id)
+    if not pendente:
+        return
+
+    if pendente.get("modo") == "cupom":
+        cupom = _normalizar_cupom_oferta(message.text)
+        if not cupom:
+            _guardar_preco_pendente_oferta(message.from_user.id, pendente)
+            safe_reply_to(
+                message,
+                "Envie somente o código do cupom, por exemplo: <b>PET10</b>",
+                parse_mode="HTML",
+            )
+            return
+        _enviar_oferta_pronta(
+            message.chat.id,
+            pendente["titulo"],
+            pendente["preco"],
+            pendente["url_original"],
+            pendente.get("imagem_url"),
+            cupom=cupom,
+        )
+        logger.info(
+            "[OFERTA_GERADA_COM_CUPOM] "
+            f"chat_ref={referencia_chat_log(message.chat.id)}"
+        )
+        return
+
+    preco = _formatar_preco_oferta(message.text)
+    if not preco:
+        _guardar_preco_pendente_oferta(message.from_user.id, pendente)
+        safe_reply_to(
+            message,
+            "Envie somente o valor da oferta, por exemplo: <b>13,88</b>",
+            parse_mode="HTML",
+        )
+        return
+
+    _enviar_oferta_pronta(
+        message.chat.id,
+        pendente["titulo"],
+        preco,
+        pendente["url_original"],
+        pendente.get("imagem_url"),
+        cupom=pendente.get("cupom"),
+    )
+    logger.info(
+        "[OFERTA_GERADA_PRECO_MANUAL] "
+        f"loja={pendente.get('loja', 'desconhecida')} "
+        f"chat_ref={referencia_chat_log(message.chat.id)}"
+    )
+
+
 @bot.message_handler(func=lambda message: message.text and "http" in message.text.lower())
 def handle_download(message):
     if not is_chat_privado(message):
@@ -13285,6 +13786,13 @@ def handle_download(message):
     url = extrair_primeira_url(message.text)
     if not url or not validar_url_http_publica(url, resolver_dns=False):
         safe_reply_to(message, "❌ Não encontrei um link válido na sua mensagem.")
+        return
+
+    # Ao colar um link de produto no próprio chat, o administrador recebe a
+    # oferta pronta. Isso ocorre antes das regras de download e não fica
+    # disponível para nenhum usuário comum.
+    if is_admin_privado(message) and _loja_produto_por_url(url):
+        processar_link_oferta_admin(message, url)
         return
 
     plataformas = detectar_plataforma(url)
