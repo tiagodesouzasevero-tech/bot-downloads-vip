@@ -2077,7 +2077,9 @@ def processar_link_oferta_admin(message, url_original):
             url_original,
             headers=OFFER_HEADERS,
         )
-        loja = _loja_produto_por_url(url_final, aceitar_link_curto=False)
+        # Alguns links s.shopee.com.br entregam uma página pública de prévia
+        # com título e foto, em vez de redirecionar para a URL longa.
+        loja = _loja_produto_por_url(url_final, aceitar_link_curto=True)
         if not loja:
             raise RuntimeError("LINK_OFERTA_NAO_RECONHECIDO")
 
