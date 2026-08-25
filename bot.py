@@ -1895,6 +1895,27 @@ def _loja_produto_por_url(url, aceitar_link_curto=True):
     return None
 
 
+def _url_final_compativel_oferta(url, loja):
+    """Confirma que a página final ainda pertence à loja do link original."""
+    try:
+        parsed = urlparse(str(url or "").strip())
+        host = (parsed.hostname or "").lower().rstrip(".")
+    except Exception:
+        return False
+    if parsed.scheme not in ("http", "https") or not host:
+        return False
+
+    dominios_por_loja = {
+        "Shopee": ("shopee.com.br", "shope.ee"),
+        "Mercado Livre": ("mercadolivre.com.br", "mercadolivre.com", "meli.la"),
+        "Amazon": ("amazon.com.br", "amzn.to"),
+    }
+    return any(
+        hostname_permitido(host, dominio)
+        for dominio in dominios_por_loja.get(loja, ())
+    )
+
+
 def _imagem_oferta_permitida(url):
     try:
         parsed = urlparse(str(url or "").strip())
@@ -2073,15 +2094,18 @@ def processar_link_oferta_admin(message, url_original):
     status = safe_reply_to(message, "🛍️ Gerando sua oferta...")
     resposta = None
     try:
+        # A loja é definida pelo link enviado pelo administrador. Depois dos
+        # redirecionamentos, validamos o domínio oficial, sem depender do
+        # formato variável do caminho final de cada marketplace.
+        loja = _loja_produto_por_url(url_original, aceitar_link_curto=True)
+        if not loja:
+            raise RuntimeError("LINK_OFERTA_NAO_RECONHECIDO")
         resposta, url_final = seguir_redirecionamentos_seguros(
             url_original,
             headers=OFFER_HEADERS,
         )
-        # Alguns links s.shopee.com.br entregam uma página pública de prévia
-        # com título e foto, em vez de redirecionar para a URL longa.
-        loja = _loja_produto_por_url(url_final, aceitar_link_curto=True)
-        if not loja:
-            raise RuntimeError("LINK_OFERTA_NAO_RECONHECIDO")
+        if not _url_final_compativel_oferta(url_final, loja):
+            raise RuntimeError("REDIRECIONAMENTO_OFERTA_FORA_DA_LOJA")
 
         pagina_html = _ler_html_oferta(resposta)
         parser = ExtratorMetadadosOferta()
