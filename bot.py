@@ -6,6 +6,8 @@ import uuid
 import time
 import copy
 import html
+import base64
+import secrets
 import hashlib
 import hmac
 import ipaddress
@@ -21,10 +23,14 @@ from http.cookies import SimpleCookie
 from queue import Empty, Full, PriorityQueue
 from threading import Event, Lock, Thread, enumerate as enumerate_threads
 from datetime import datetime, timedelta, timezone
-from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlparse
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from io import BytesIO
+from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlparse, quote
 from zoneinfo import ZoneInfo
 
 import requests
+import qrcode
+from requests_pkcs12 import request as pkcs12_request
 import telebot
 import yt_dlp
 import subprocess
@@ -93,11 +99,20 @@ LOG_ANONYMIZATION_KEY = hashlib.sha256(
 SUPORTE_USERNAME = "@suportebaixarvideoshd"
 LINK_SUPORTE = f"https://t.me/{SUPORTE_USERNAME.lstrip('@')}"
 
-# Vendas exclusivamente por Pix manual. Nenhuma integração de checkout ou
-# cartão é carregada pelo bot. Os dados ficam somente nas variáveis do Railway.
-PIX_KEY = get_env_required("PIX_KEY")
-PIX_RECEIVER_NAME = get_env_required("PIX_RECEIVER_NAME")
-PIX_RECEIVER_BANK = get_env_required("PIX_RECEIVER_BANK")
+# Pagamentos VIP via Pix automático da Efí. Cada bot usa credenciais,
+# certificado e chave Pix próprios para manter os webhooks isolados.
+EFI_CLIENT_ID = get_env_required("EFI_CLIENT_ID")
+EFI_CLIENT_SECRET = get_env_required("EFI_CLIENT_SECRET")
+EFI_CERT_BASE64 = get_env_required("EFI_CERT_BASE64")
+EFI_PIX_KEY = get_env_required("EFI_PIX_KEY")
+EFI_API_URL = "https://pix.api.efipay.com.br"
+EFI_PIX_EXPIRATION_SECONDS = 30 * 60
+
+# Compatibilidade com pedidos manuais antigos. Novas compras não usam mais
+# estes dados e as variáveis podem ser removidas depois da validação da Efí.
+PIX_KEY = get_first_env(["PIX_KEY"], default="")
+PIX_RECEIVER_NAME = get_first_env(["PIX_RECEIVER_NAME"], default="")
+PIX_RECEIVER_BANK = get_first_env(["PIX_RECEIVER_BANK"], default="")
 
 DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", "downloads_temp")
 PRIVATE_DIR = os.path.join(DOWNLOAD_DIR, "private")
@@ -267,6 +282,7 @@ DOWNLOAD_RATE_EVENTS = defaultdict(deque)
 DOWNLOAD_GLOBAL_EVENTS = deque()
 PAYMENT_USER_LOCKS = [Lock() for _ in range(64)]
 PAYMENT_ORDER_LOCKS = [Lock() for _ in range(64)]
+EFI_TOKEN_LOCK = Lock()
 DOWNLOAD_PENDING_LOCK = Lock()
 DOWNLOAD_PENDING_USERS = set()
 DOWNLOAD_QUEUE = PriorityQueue(maxsize=DOWNLOAD_QUEUE_MAX)
@@ -5729,6 +5745,591 @@ def formatar_tamanho_bytes(total_bytes):
     return f"{tamanho} B"
 
 
+
+class EfiApiError(RuntimeError):
+    def __init__(self, message, status_code=None, code=None):
+        super().__init__(message)
+        self.status_code = status_code
+        self.code = code
+
+
+_EFI_ACCESS_TOKEN = None
+_EFI_ACCESS_TOKEN_EXPIRES_AT = 0.0
+_EFI_CERT_BYTES = None
+
+
+def efi_is_configured():
+    return bool(
+        EFI_CLIENT_ID
+        and EFI_CLIENT_SECRET
+        and EFI_CERT_BASE64
+        and EFI_PIX_KEY
+    )
+
+
+def efi_cert_bytes():
+    global _EFI_CERT_BYTES
+    if _EFI_CERT_BYTES is not None:
+        return _EFI_CERT_BYTES
+    try:
+        raw = re.sub(r"\s+", "", str(EFI_CERT_BASE64 or ""))
+        cert = base64.b64decode(raw, validate=True)
+    except Exception as exc:
+        raise EfiApiError(
+            "O certificado da Efí configurado na Railway é inválido."
+        ) from exc
+    if len(cert) < 500:
+        raise EfiApiError("O certificado da Efí parece incompleto.")
+    _EFI_CERT_BYTES = cert
+    return cert
+
+
+def parse_efi_error(response):
+    code = None
+    message = None
+    try:
+        payload = response.json()
+        code = payload.get("nome") or payload.get("title") or payload.get("type")
+        message = (
+            payload.get("mensagem")
+            or payload.get("detail")
+            or payload.get("message")
+            or payload.get("error_description")
+            or payload.get("error")
+        )
+    except Exception:
+        pass
+
+    if response.status_code in (401, 403):
+        message = message or "A Efí recusou a autenticação ou a permissão da API Pix."
+    else:
+        message = message or f"Efí retornou HTTP {response.status_code}."
+    return EfiApiError(str(message), response.status_code, code)
+
+
+def _efi_pkcs12_request(method, url, **kwargs):
+    kwargs.setdefault("timeout", 20)
+    kwargs.setdefault("verify", True)
+    return pkcs12_request(
+        method,
+        url,
+        pkcs12_data=efi_cert_bytes(),
+        pkcs12_password="",
+        **kwargs,
+    )
+
+
+def efi_get_access_token(force=False):
+    global _EFI_ACCESS_TOKEN, _EFI_ACCESS_TOKEN_EXPIRES_AT
+    if not efi_is_configured():
+        raise EfiApiError("Credenciais da API Pix Efí ainda não estão completas.")
+
+    now = time.time()
+    if not force and _EFI_ACCESS_TOKEN and now < _EFI_ACCESS_TOKEN_EXPIRES_AT:
+        return _EFI_ACCESS_TOKEN
+
+    with EFI_TOKEN_LOCK:
+        now = time.time()
+        if not force and _EFI_ACCESS_TOKEN and now < _EFI_ACCESS_TOKEN_EXPIRES_AT:
+            return _EFI_ACCESS_TOKEN
+
+        response = _efi_pkcs12_request(
+            "POST",
+            f"{EFI_API_URL}/oauth/token",
+            auth=(EFI_CLIENT_ID, EFI_CLIENT_SECRET),
+            headers={"Accept": "application/json", "Content-Type": "application/json"},
+            json={"grant_type": "client_credentials"},
+        )
+        if response.status_code != 200:
+            raise parse_efi_error(response)
+
+        data = response.json()
+        token = str(data.get("access_token") or "").strip()
+        if not token:
+            raise EfiApiError(
+                "A Efí autenticou a aplicação, mas não retornou o access_token."
+            )
+        try:
+            expires_in = int(data.get("expires_in") or 300)
+        except Exception:
+            expires_in = 300
+
+        _EFI_ACCESS_TOKEN = token
+        _EFI_ACCESS_TOKEN_EXPIRES_AT = time.time() + max(30, expires_in - 60)
+        return token
+
+
+def efi_api_request(
+    method,
+    path,
+    *,
+    json_body=None,
+    extra_headers=None,
+    timeout=20,
+    retry_auth=True,
+):
+    global _EFI_ACCESS_TOKEN, _EFI_ACCESS_TOKEN_EXPIRES_AT
+    token = efi_get_access_token()
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+    if extra_headers:
+        headers.update(extra_headers)
+
+    response = _efi_pkcs12_request(
+        method,
+        f"{EFI_API_URL}{path}",
+        headers=headers,
+        json=json_body,
+        timeout=timeout,
+    )
+    if response.status_code == 401 and retry_auth:
+        _EFI_ACCESS_TOKEN = None
+        _EFI_ACCESS_TOKEN_EXPIRES_AT = 0.0
+        efi_get_access_token(force=True)
+        return efi_api_request(
+            method,
+            path,
+            json_body=json_body,
+            extra_headers=extra_headers,
+            timeout=timeout,
+            retry_auth=False,
+        )
+    if not 200 <= response.status_code < 300:
+        raise parse_efi_error(response)
+    return response
+
+
+def efi_webhook_hash():
+    material = (
+        f"{EFI_CLIENT_SECRET}|{TOKEN_TELEGRAM}|downloads-efi-webhook"
+    ).encode("utf-8")
+    return hashlib.sha256(material).hexdigest()
+
+
+def efi_webhook_url():
+    if not PUBLIC_BASE_URL:
+        return ""
+    params = urlencode({"hmac": efi_webhook_hash(), "ignorar": ""})
+    return f"{PUBLIC_BASE_URL}/efi/webhook?{params}"
+
+
+def registrar_webhook_efi():
+    if not efi_is_configured():
+        raise EfiApiError("API Pix Efí não configurada.")
+    if not PUBLIC_BASE_URL:
+        raise EfiApiError("Domínio público do bot não configurado.")
+
+    response = efi_api_request(
+        "PUT",
+        f"/v2/webhook/{quote(EFI_PIX_KEY, safe='')}",
+        json_body={"webhookUrl": efi_webhook_url()},
+        extra_headers={"x-skip-mtls-checking": "true"},
+    )
+    return response.status_code in (200, 201)
+
+
+def iniciar_registro_webhook_efi():
+    def worker():
+        time.sleep(3)
+        for tentativa in range(1, 4):
+            try:
+                registrar_webhook_efi()
+                logger.info("[EFI_WEBHOOK] configurado=True")
+                return
+            except Exception as exc:
+                logger.warning(
+                    "[EFI_WEBHOOK] tentativa=%s/3 erro=%s",
+                    tentativa,
+                    sanitizar_erro_log(exc),
+                )
+                if tentativa < 3:
+                    time.sleep(tentativa * 2)
+
+    Thread(target=worker, daemon=True, name="efi-webhook-registration").start()
+
+
+def _valor_centavos_para_api(valor_centavos):
+    try:
+        cents = int(valor_centavos)
+    except Exception as exc:
+        raise EfiApiError("Valor do plano inválido.") from exc
+    return f"{Decimal(cents) / Decimal(100):.2f}"
+
+
+def criar_pedido_efi(user_id, plano_key, plano, atribuicao_pix=None):
+    if not efi_is_configured():
+        raise EfiApiError("Pagamento automático ainda não está configurado.")
+
+    order_nsu = gerar_order_nsu(user_id)
+    txid = f"VID{secrets.token_hex(14)}"
+    valor_centavos = int(plano["preco_centavos"])
+    payload = {
+        "calendario": {"expiracao": EFI_PIX_EXPIRATION_SECONDS},
+        "valor": {"original": _valor_centavos_para_api(valor_centavos)},
+        "chave": EFI_PIX_KEY,
+        "solicitacaoPagador": "VIP Baixar Videos HD - 30 dias",
+        "infoAdicionais": [
+            {"nome": "Plano", "valor": str(plano.get("nome") or "VIP")[:50]},
+            {"nome": "Pedido", "valor": order_nsu[:50]},
+        ],
+    }
+
+    response = efi_api_request("PUT", f"/v2/cob/{txid}", json_body=payload)
+    data = response.json()
+    loc = data.get("loc") or {}
+    location_id = loc.get("id")
+    if location_id is None:
+        raise EfiApiError(
+            "A Efí criou a cobrança, mas não retornou o location do QR Code."
+        )
+
+    qr_response = efi_api_request("GET", f"/v2/loc/{location_id}/qrcode")
+    qr_data = qr_response.json()
+    pix_copy = str(
+        qr_data.get("qrcode") or data.get("pixCopiaECola") or ""
+    ).strip()
+    if not pix_copy:
+        raise EfiApiError(
+            "A Efí criou a cobrança, mas não retornou o Pix Copia e Cola."
+        )
+
+    agora = agora_tz()
+    pedido = {
+        "order_nsu": order_nsu,
+        "provider": "efi",
+        "user_id": str(user_id),
+        "plano_key": str(plano_key),
+        "plano_nome": plano.get("nome") or "VIP",
+        "valor_centavos": valor_centavos,
+        "txid": txid,
+        "status": "awaiting_pix",
+        "created_at": agora,
+        "expires_at": agora + timedelta(seconds=EFI_PIX_EXPIRATION_SECONDS),
+        "payment_verification_status": "efi_awaiting_payment",
+        "pix_copy": pix_copy,
+        "location_id": location_id,
+        "visual_url": str(qr_data.get("linkVisualizacao") or "").strip(),
+        "vip_aplicado_ao_pedido": False,
+    }
+    if atribuicao_pix:
+        pedido["atribuicao_ads"] = atribuicao_pix
+    pedidos_col.insert_one(pedido)
+    return pedido
+
+
+def obter_cobranca_efi(txid):
+    response = efi_api_request(
+        "GET", f"/v2/cob/{quote(str(txid or ''), safe='')}"
+    )
+    return response.json()
+
+
+def valor_pago_efi_centavos(cobranca):
+    if str((cobranca or {}).get("status") or "").upper() != "CONCLUIDA":
+        return None, None
+    pix_items = (cobranca or {}).get("pix") or []
+    if not pix_items:
+        return None, None
+    total = Decimal("0.00")
+    primeiro = None
+    for item in pix_items:
+        try:
+            total += Decimal(str(item.get("valor") or "0"))
+            if primeiro is None:
+                primeiro = item
+        except (InvalidOperation, ValueError):
+            continue
+    cents = int(total.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP) * 100)
+    return cents, primeiro
+
+
+def gerar_qr_pix_buffer(pix_copy):
+    image = qrcode.make(str(pix_copy or ""))
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
+    buffer.seek(0)
+    buffer.name = "pix_vip.png"
+    return buffer
+
+
+def enviar_instrucoes_pix_efi(chat_id, pedido, plano):
+    pix_copy = str(pedido.get("pix_copy") or "").strip()
+    if not pix_copy:
+        return False
+
+    valor = int(pedido.get("valor_centavos") or plano.get("preco_centavos") or 0) / 100
+    valor_formatado = f"{valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    qr = gerar_qr_pix_buffer(pix_copy)
+    try:
+        bot.send_photo(
+            chat_id,
+            qr,
+            caption=(
+                f"💎 {plano.get('nome') or 'VIP'} — {plano.get('dias') or 30} dias\n"
+                f"💰 R$ {valor_formatado}\n\n"
+                "Escaneie o QR Code pelo aplicativo do seu banco."
+            ),
+        )
+    except Exception as exc:
+        logger.warning("[EFI_QR_ENVIO] erro=%s", sanitizar_erro_log(exc))
+        return False
+
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        types.InlineKeyboardButton(
+            "✅ Já paguei",
+            callback_data=f"efi_check_{pedido['order_nsu']}",
+        )
+    )
+    texto = (
+        "📋 <b>PIX COPIA E COLA</b>\n\n"
+        f"<code>{html.escape(pix_copy)}</code>\n\n"
+        "Após o pagamento, o VIP será liberado automaticamente."
+    )
+    return bool(
+        safe_send_message(
+            chat_id,
+            texto,
+            parse_mode="HTML",
+            reply_markup=markup,
+        )
+    )
+
+
+def _registrar_funil_pago_efi(pedido):
+    atribuicao = pedido.get("atribuicao_ads")
+    if not isinstance(atribuicao, dict):
+        return
+    try:
+        registrar_evento_funil_ads(
+            pedido.get("user_id"),
+            "paid",
+            atribuicao=atribuicao,
+        )
+    except Exception as exc:
+        logger.warning(
+            "[FUNIL_ADS_PAGO_EFI_ERRO] pedido_ref=%s erro=%s",
+            referencia_pedido_log(pedido.get("order_nsu")),
+            sanitizar_erro_log(exc),
+        )
+
+
+def confirmar_pedido_efi_pago(pedido, cobranca=None):
+    if not pedido or pedido.get("provider") != "efi":
+        return {"pago": False, "finalizado_agora": False, "motivo": "pedido_invalido"}
+
+    order_nsu = str(pedido.get("order_nsu") or "").strip()
+    txid = str(pedido.get("txid") or "").strip()
+    if not order_nsu or not txid:
+        return {"pago": False, "finalizado_agora": False, "motivo": "dados_incompletos"}
+
+    if cobranca is None:
+        cobranca = obter_cobranca_efi(txid)
+    if str((cobranca or {}).get("txid") or "") != txid:
+        return {"pago": False, "finalizado_agora": False, "motivo": "txid_divergente"}
+
+    valor_pago, pix_pago = valor_pago_efi_centavos(cobranca)
+    if pix_pago is None:
+        pedidos_col.update_one(
+            {"order_nsu": order_nsu, "provider": "efi", "status": "awaiting_pix"},
+            {"$set": {
+                "efi_status": str((cobranca or {}).get("status") or "ATIVA").upper(),
+                "last_payment_check_at": agora_tz(),
+            }},
+        )
+        return {"pago": False, "finalizado_agora": False, "motivo": "nao_concluida"}
+
+    if valor_pago != int(pedido.get("valor_centavos") or 0):
+        logger.warning(
+            "[EFI_VALOR_DIVERGENTE] pedido_ref=%s esperado=%s recebido=%s",
+            referencia_pedido_log(order_nsu),
+            int(pedido.get("valor_centavos") or 0),
+            valor_pago,
+        )
+        return {"pago": False, "finalizado_agora": False, "motivo": "valor_divergente"}
+
+    lock_pedido = obter_lock_distribuido_local(order_nsu, PAYMENT_ORDER_LOCKS)
+    with lock_pedido:
+        atual = pedidos_col.find_one({"order_nsu": order_nsu}) or pedido
+        if atual.get("status") == "paid" and atual.get("vip_aplicado_ao_pedido"):
+            sync = garantir_vip_de_pedido_pago(atual, origem="efi_ja_pago")
+            return {
+                "pago": True,
+                "finalizado_agora": False,
+                "vip_ate": sync.get("vip_ate") or atual.get("vip_liberado_ate"),
+                "motivo": "ja_pago",
+            }
+
+        if atual.get("status") not in ("awaiting_pix", "processing_efi"):
+            return {
+                "pago": False,
+                "finalizado_agora": False,
+                "motivo": f"status_{atual.get('status')}",
+            }
+
+        if atual.get("status") == "awaiting_pix":
+            claimed = pedidos_col.update_one(
+                {"order_nsu": order_nsu, "provider": "efi", "status": "awaiting_pix"},
+                {"$set": {
+                    "status": "processing_efi",
+                    "efi_payment_processing_at": agora_tz(),
+                    "payment_verification_status": "efi_confirmed_processing",
+                }},
+            )
+            if not claimed.modified_count:
+                atual = pedidos_col.find_one({"order_nsu": order_nsu}) or {}
+                if atual.get("status") == "paid" and atual.get("vip_aplicado_ao_pedido"):
+                    sync = garantir_vip_de_pedido_pago(atual, origem="efi_concorrente")
+                    return {
+                        "pago": True,
+                        "finalizado_agora": False,
+                        "vip_ate": sync.get("vip_ate") or atual.get("vip_liberado_ate"),
+                        "motivo": "ja_pago",
+                    }
+                if atual.get("status") != "processing_efi":
+                    return {"pago": False, "finalizado_agora": False, "motivo": "estado_mudou"}
+
+        plano = PLANOS.get(atual.get("plano_key")) or {}
+        if not plano:
+            pedidos_col.update_one(
+                {"order_nsu": order_nsu, "status": "processing_efi"},
+                {"$set": {"status": "payment_error", "payment_error": "plano_invalido"}},
+            )
+            return {"pago": False, "finalizado_agora": False, "motivo": "plano_invalido"}
+
+        vip_ate, vip_aplicado = liberar_vip_por_plano(
+            atual["user_id"], plano, order_nsu=order_nsu
+        )
+        agora = agora_tz()
+        horario_pagamento = str(pix_pago.get("horario") or "").strip()
+        e2e_id = str(pix_pago.get("endToEndId") or "").strip()
+
+        resultado = pedidos_col.update_one(
+            {"order_nsu": order_nsu, "provider": "efi", "status": "processing_efi"},
+            {"$set": {
+                "status": "paid",
+                "paid_at": horario_pagamento or agora,
+                "paid_amount": valor_pago,
+                "capture_method": "pix_efi",
+                "payment_verification_status": "efi_verified",
+                "efi_status": "CONCLUIDA",
+                "efi_e2e_id": e2e_id,
+                "efi_verified_at": agora,
+                "vip_liberado_ate": vip_ate,
+                "vip_aplicado_nesta_chamada": bool(vip_aplicado),
+                "vip_aplicado_ao_pedido": True,
+            }, "$unset": {"expires_at": "", "payment_error": ""}},
+        )
+
+        if not resultado.modified_count:
+            atual = pedidos_col.find_one({"order_nsu": order_nsu}) or {}
+            if atual.get("status") != "paid":
+                raise RuntimeError("EFI_FINALIZACAO_PEDIDO_FALHOU")
+            vip_ate = atual.get("vip_liberado_ate") or vip_ate
+            return {"pago": True, "finalizado_agora": False, "vip_ate": vip_ate, "motivo": "ja_pago"}
+
+        pedido_final = pedidos_col.find_one({"order_nsu": order_nsu}) or atual
+        garantir_vip_de_pedido_pago(pedido_final, origem="efi_pagamento")
+        _registrar_funil_pago_efi(pedido_final)
+        return {
+            "pago": True,
+            "finalizado_agora": True,
+            "vip_ate": vip_ate,
+            "motivo": "confirmado",
+        }
+
+
+def validar_requisicao_webhook_efi(full_path):
+    try:
+        query = dict(parse_qsl(urlparse(full_path).query, keep_blank_values=True))
+        recebido = str(query.get("hmac") or "")
+        esperado = efi_webhook_hash()
+        return bool(recebido) and hmac.compare_digest(recebido, esperado)
+    except Exception:
+        return False
+
+
+def processar_webhook_efi(raw_body, full_path):
+    if not validar_requisicao_webhook_efi(full_path):
+        return 401, {"ok": False, "error": "webhook inválido"}
+    if not raw_body:
+        return 200, {"ok": True}
+    try:
+        data = json.loads(raw_body.decode("utf-8"))
+    except Exception:
+        return 400, {"ok": False, "error": "json inválido"}
+
+    for evento in data.get("pix") or []:
+        txid = str((evento or {}).get("txid") or "").strip()
+        if not txid:
+            continue
+        pedido = pedidos_col.find_one({"provider": "efi", "txid": txid})
+        if not pedido:
+            continue
+        try:
+            cobranca = obter_cobranca_efi(txid)
+            resultado = confirmar_pedido_efi_pago(pedido, cobranca=cobranca)
+            if resultado.get("finalizado_agora"):
+                plano = PLANOS.get(pedido.get("plano_key")) or {}
+                notificar_pagamento_confirmado(
+                    pedido.get("user_id"),
+                    plano.get("nome") or pedido.get("plano_nome") or "VIP",
+                    resultado.get("vip_ate"),
+                )
+        except Exception as exc:
+            logger.warning(
+                "[EFI_WEBHOOK_PROCESSAR] txid_ref=%s erro=%s",
+                hashlib.sha256(txid.encode("utf-8")).hexdigest()[:10],
+                sanitizar_erro_log(exc),
+            )
+            return 500, {"ok": False, "error": "verificação temporariamente indisponível"}
+    return 200, {"ok": True}
+
+
+def recuperar_pagamentos_efi_interrompidos():
+    try:
+        limite = agora_tz() - timedelta(days=2)
+        pedidos = list(
+            pedidos_col.find(
+                {
+                    "provider": "efi",
+                    "status": {"$in": ["awaiting_pix", "processing_efi"]},
+                    "created_at": {"$gte": limite},
+                }
+            ).sort("created_at", -1).limit(100)
+        )
+    except Exception as exc:
+        logger.warning("[EFI_RECUPERACAO_LISTAR] erro=%s", sanitizar_erro_log(exc))
+        return 0, 1
+
+    recuperados = 0
+    falhas = 0
+    for pedido in pedidos:
+        try:
+            resultado = confirmar_pedido_efi_pago(pedido)
+            if resultado.get("finalizado_agora"):
+                recuperados += 1
+                plano = PLANOS.get(pedido.get("plano_key")) or {}
+                notificar_pagamento_confirmado(
+                    pedido.get("user_id"),
+                    plano.get("nome") or pedido.get("plano_nome") or "VIP",
+                    resultado.get("vip_ate"),
+                )
+        except Exception as exc:
+            falhas += 1
+            logger.warning(
+                "[EFI_RECUPERACAO] pedido_ref=%s erro=%s",
+                referencia_pedido_log(pedido.get("order_nsu")),
+                sanitizar_erro_log(exc),
+            )
+    if recuperados or falhas:
+        logger.info("[EFI_RECUPERACAO] recuperados=%s falhas=%s", recuperados, falhas)
+    return recuperados, falhas
+
+
 def gerar_order_nsu(user_id):
     # O argumento é mantido para compatibilidade com as chamadas atuais, mas
     # novos códigos não carregam mais o ID do Telegram.
@@ -7526,7 +8127,7 @@ def mostrar_planos_chat(chat_id, user_id):
         "✅ Prioridade no processamento\n"
         "✅ TikTok, Pinterest, Shopee Video, Mercado Livre Clips e RedNote\n"
         "✅ Pagamento exclusivamente via Pix\n"
-        "✅ Liberação após conferência do pagamento\n\n"
+        "✅ Liberação automática após o pagamento\n\n"
         f"Sua ID: `{user_id}`"
     )
 
@@ -8120,6 +8721,16 @@ def montar_relatorio_diagnostico():
         registrar_falha_componente("MongoDB", e)
         linhas.append("❌ MongoDB: falha de conexão")
         problemas.append(f"MongoDB: {sanitizar_erro_log(e, limite=180)}")
+
+    try:
+        token_efi = efi_get_access_token()
+        if token_efi:
+            linhas.append("✅ Efí Pix: autenticação OK")
+        else:
+            raise RuntimeError("token_vazio")
+    except Exception as e:
+        linhas.append("❌ Efí Pix: falha de autenticação")
+        problemas.append(f"Efí Pix: {sanitizar_erro_log(e, limite=180)}")
 
     ffmpeg_ok = bool(shutil.which("ffmpeg"))
     ffprobe_ok = bool(shutil.which("ffprobe"))
@@ -9862,7 +10473,7 @@ def buscar_pedido_pix_ativo(user_id):
         {
             "user_id": str(user_id),
             "status": {
-                "$in": ["awaiting_pix", "receipt_submitted", "approving"]
+                "$in": ["awaiting_pix", "receipt_submitted", "approving", "processing_efi"]
             },
         },
         sort=[("created_at", -1)],
@@ -10218,7 +10829,7 @@ def reabrir_comprovante_pix(call):
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("pay_"))
-def iniciar_pagamento_pix_manual(call):
+def iniciar_pagamento_pix_automatico(call):
     try:
         if not is_chat_privado(call.message):
             orientar_uso_no_privado(call.message)
@@ -10226,7 +10837,6 @@ def iniciar_pagamento_pix_manual(call):
 
         valor = call.data.split("_", 1)[1]
         plano = obter_plano_por_callback(valor)
-
         if not plano:
             safe_send_message(call.message.chat.id, "❌ Plano inválido.")
             return
@@ -10237,88 +10847,139 @@ def iniciar_pagamento_pix_manual(call):
                 call.from_user.id,
                 "pix_started",
             )
-        except Exception as e:
+        except Exception as exc:
             logger.warning(
-                "[FUNIL_ADS_PIX_ERRO] "
-                f"user_ref={referencia_usuario_log(call.from_user.id)} "
-                f"erro={sanitizar_erro_log(e)}"
+                "[FUNIL_ADS_PIX_ERRO] user_ref=%s erro=%s",
+                referencia_usuario_log(call.from_user.id),
+                sanitizar_erro_log(exc),
             )
 
         pedido_ativo = buscar_pedido_pix_ativo(call.from_user.id)
-        if pedido_ativo and pedido_ativo.get("status") in (
-            "receipt_submitted",
-            "approving",
-        ):
-            safe_send_message(
-                call.message.chat.id,
-                "🧾 Seu comprovante já foi recebido e está aguardando conferência. "
-                "Você será avisado aqui.",
-            )
-            return
+        if pedido_ativo and pedido_ativo.get("provider") == "efi":
+            if pedido_ativo.get("status") == "processing_efi":
+                try:
+                    resultado = confirmar_pedido_efi_pago(pedido_ativo)
+                    if resultado.get("pago"):
+                        safe_send_message(
+                            call.message.chat.id,
+                            "✅ Pagamento já confirmado e VIP liberado. 💎",
+                        )
+                        return
+                except Exception:
+                    pass
 
-        if pedido_ativo and pedido_pix_expirado(pedido_ativo):
-            pedidos_col.update_one(
-                {"order_nsu": pedido_ativo["order_nsu"], "status": "awaiting_pix"},
-                {"$set": {"status": "expired", "expired_at": agora_tz()}},
-            )
-            pedido_ativo = None
-
-        if pedido_ativo and pedido_ativo.get("plano_key") == valor:
-            if atribuicao_pix:
+            if pedido_pix_expirado(pedido_ativo):
                 pedidos_col.update_one(
-                    {"order_nsu": pedido_ativo["order_nsu"]},
-                    {"$set": {"atribuicao_ads": atribuicao_pix}},
+                    {"order_nsu": pedido_ativo["order_nsu"], "status": "awaiting_pix"},
+                    {"$set": {"status": "expired", "expired_at": agora_tz()}},
                 )
-            if not enviar_instrucoes_pix(call.message.chat.id, pedido_ativo, plano):
-                raise RuntimeError("falha ao reenviar instruções Pix")
-            return
+                pedido_ativo = None
+            elif pedido_ativo.get("plano_key") == valor:
+                if atribuicao_pix:
+                    pedidos_col.update_one(
+                        {"order_nsu": pedido_ativo["order_nsu"]},
+                        {"$set": {"atribuicao_ads": atribuicao_pix}},
+                    )
+                if not enviar_instrucoes_pix_efi(
+                    call.message.chat.id, pedido_ativo, plano
+                ):
+                    raise RuntimeError("falha ao reenviar Pix Efí")
+                return
 
         if pedido_ativo:
-            markup = types.InlineKeyboardMarkup()
-            markup.add(types.InlineKeyboardButton(
-                "Cancelar pedido anterior",
-                callback_data=f"pix_cancel_{pedido_ativo['order_nsu']}",
-            ))
-            safe_send_message(
-                call.message.chat.id,
-                "⚠️ Você já possui um pedido Pix em aberto. Cancele o pedido "
-                "anterior antes de escolher outro plano.",
-                reply_markup=markup,
-            )
-            return
+            # Compatibilidade com um pedido manual antigo ainda em aberto.
+            if pedido_pix_expirado(pedido_ativo) and pedido_ativo.get("status") == "awaiting_pix":
+                pedidos_col.update_one(
+                    {"order_nsu": pedido_ativo["order_nsu"], "status": "awaiting_pix"},
+                    {"$set": {"status": "expired", "expired_at": agora_tz()}},
+                )
+            else:
+                safe_send_message(
+                    call.message.chat.id,
+                    "⚠️ Você já possui um pedido Pix anterior em aberto. "
+                    "Conclua ou aguarde a expiração desse pedido antes de gerar outro.",
+                )
+                return
 
-        agora = agora_tz()
-        order_nsu = gerar_order_nsu(call.from_user.id)
-        pedido = {
-            "order_nsu": order_nsu,
-            "user_id": str(call.from_user.id),
-            "plano_key": valor,
-            "plano_nome": plano["nome"],
-            "valor_centavos": int(plano["preco_centavos"]),
-            "status": "awaiting_pix",
-            "created_at": agora,
-            "expires_at": agora + timedelta(hours=PIX_ORDER_EXPIRATION_HOURS),
-            "payment_verification_status": "awaiting_manual_receipt",
-        }
-        if atribuicao_pix:
-            pedido["atribuicao_ads"] = atribuicao_pix
-        pedidos_col.insert_one(pedido)
-        if not enviar_instrucoes_pix(call.message.chat.id, pedido, plano):
+        pedido = criar_pedido_efi(
+            call.from_user.id,
+            valor,
+            plano,
+            atribuicao_pix=atribuicao_pix,
+        )
+        if not enviar_instrucoes_pix_efi(call.message.chat.id, pedido, plano):
             pedidos_col.update_one(
-                {"order_nsu": order_nsu, "status": "awaiting_pix"},
+                {"order_nsu": pedido["order_nsu"], "status": "awaiting_pix"},
                 {"$set": {"status": "delivery_failed", "delivery_failed_at": agora_tz()}},
             )
-            raise RuntimeError("falha ao entregar instruções Pix")
+            raise RuntimeError("falha ao entregar Pix Efí")
 
-    except Exception as e:
-        logger.error(f"[PIX_MANUAL_INICIO] erro={sanitizar_erro_log(e)}")
+    except EfiApiError as exc:
+        logger.error("[EFI_PIX_INICIO] erro=%s", sanitizar_erro_log(exc))
         safe_send_message(
             call.message.chat.id,
-            "❌ Não consegui iniciar seu pagamento Pix agora.\n"
-            "Tente novamente em instantes ou fale com o suporte."
+            "❌ Não consegui gerar o Pix agora. Tente novamente em instantes.",
+        )
+    except Exception as exc:
+        logger.error("[EFI_PIX_INICIO] erro=%s", sanitizar_erro_log(exc))
+        safe_send_message(
+            call.message.chat.id,
+            "❌ Não consegui iniciar seu pagamento Pix agora. "
+            "Tente novamente em instantes ou fale com o suporte.",
         )
     finally:
         safe_answer_callback(call.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("efi_check_"))
+def verificar_pagamento_efi_usuario(call):
+    try:
+        if not is_chat_privado(call.message):
+            orientar_uso_no_privado(call.message)
+            return
+        order_nsu = call.data[len("efi_check_"):].strip()
+        pedido = pedidos_col.find_one(
+            {"order_nsu": order_nsu, "provider": "efi", "user_id": str(call.from_user.id)}
+        )
+        if not pedido:
+            safe_answer_callback(call.id, text="Cobrança não encontrada.", show_alert=True)
+            return
+        if pedido.get("status") == "paid" and pedido.get("vip_aplicado_ao_pedido"):
+            safe_answer_callback(
+                call.id,
+                text="Pagamento já confirmado e VIP liberado. 💎",
+                show_alert=True,
+            )
+            return
+
+        resultado = confirmar_pedido_efi_pago(pedido)
+        if not resultado.get("pago"):
+            safe_answer_callback(
+                call.id,
+                text="Ainda não localizei o pagamento. Aguarde alguns segundos e tente novamente.",
+                show_alert=True,
+            )
+            return
+
+        plano = PLANOS.get(pedido.get("plano_key")) or {}
+        if resultado.get("finalizado_agora"):
+            notificar_pagamento_confirmado(
+                pedido.get("user_id"),
+                plano.get("nome") or pedido.get("plano_nome") or "VIP",
+                resultado.get("vip_ate"),
+            )
+        safe_answer_callback(
+            call.id,
+            text="Pagamento confirmado e VIP liberado. 💎",
+            show_alert=True,
+        )
+    except Exception as exc:
+        logger.error("[EFI_CHECK_USUARIO] erro=%s", sanitizar_erro_log(exc))
+        safe_answer_callback(
+            call.id,
+            text="Não consegui consultar o pagamento agora.",
+            show_alert=True,
+        )
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("pix_cancel_"))
@@ -13809,6 +14470,31 @@ class HealthRequestHandler(BaseHTTPRequestHandler):
 
         return self._enviar_resposta(404, b"NOT FOUND")
 
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        caminho = parsed.path
+
+        if caminho == "/efi/webhook":
+            try:
+                tamanho = int(self.headers.get("Content-Length") or 0)
+            except Exception:
+                tamanho = 0
+            if tamanho < 0 or tamanho > 200_000:
+                return self._enviar_resposta(
+                    413,
+                    json.dumps({"ok": False, "error": "payload muito grande"}),
+                    "application/json; charset=utf-8",
+                )
+            raw_body = self.rfile.read(tamanho) if tamanho else b""
+            status, payload = processar_webhook_efi(raw_body, self.path)
+            return self._enviar_resposta(
+                status,
+                json.dumps(payload, ensure_ascii=False),
+                "application/json; charset=utf-8",
+            )
+
+        return self._enviar_resposta(404, b"NOT FOUND")
+
     def log_message(self, _format, *_args):
         return
 
@@ -13947,7 +14633,7 @@ if __name__ == "__main__":
             "para concluir os vídeos ativos.",
             parse_mode="HTML",
         )
-    logger.info("[PAGAMENTO_CONFIG] modo=manual_pix configurado=True")
+    logger.info(f"[PAGAMENTO_CONFIG] modo=efi_pix_automatico configurado={efi_is_configured()}")
     if INSTAGRAM_DOWNLOADS_ENABLED:
         logger.info(
             "[INSTAGRAM_AUDIO_CONFIG] ativo=True validacao=True "
@@ -13987,6 +14673,7 @@ if __name__ == "__main__":
     inicializar_protecao_continuidade_vip(notificar_admin=True)
     configurar_menu_comandos()
     recuperar_aprovacoes_pix_interrompidas()
+    recuperar_pagamentos_efi_interrompidos()
     sincronizar_vips_pagos_ativos(notificar_admin=True)
     bot.set_update_listener(registrar_atividade_bot)
     registrar_sinais_desligamento()
@@ -14020,6 +14707,7 @@ if __name__ == "__main__":
         target=servir_healthcheck,
         daemon=True
     ).start()
+    iniciar_registro_webhook_efi()
 
     while not SHUTDOWN_EVENT.is_set():
         if TELEGRAM_FATAL_EVENT.is_set():
