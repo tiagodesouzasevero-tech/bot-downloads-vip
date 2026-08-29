@@ -8112,6 +8112,34 @@ def configurar_menu_comandos():
 
 
 def mostrar_planos_chat(chat_id, user_id):
+    # Impede que um usuário com VIP ativo gere uma nova cobrança por engano.
+    # Esta checagem fica também no callback de pagamento para proteger botões
+    # antigos que possam continuar visíveis no histórico do Telegram.
+    try:
+        usuario = obter_usuario(user_id)
+    except Exception as e:
+        logger.error(
+            "[PLANOS_USUARIO_ERRO] "
+            f"user_ref={referencia_usuario_log(user_id)} "
+            f"erro={sanitizar_erro_log(e)}"
+        )
+        safe_send_message(
+            chat_id,
+            "⏳ Não consegui consultar seu plano agora. Tente novamente em instantes.",
+        )
+        return False
+
+    if is_vip_user(usuario):
+        validade = formatar_validade_vip(usuario.get("vip_ate"))
+        safe_send_message(
+            chat_id,
+            "💎 *Você já possui acesso VIP ativo.*\n\n"
+            f"Válido até: *{validade}*\n"
+            "Não é necessário realizar um novo pagamento agora.",
+            parse_mode="Markdown",
+        )
+        return False
+
     markup = types.InlineKeyboardMarkup(row_width=1)
     markup.add(
         types.InlineKeyboardButton(
@@ -10833,6 +10861,32 @@ def iniciar_pagamento_pix_automatico(call):
     try:
         if not is_chat_privado(call.message):
             orientar_uso_no_privado(call.message)
+            return
+
+        # Segunda barreira: mesmo que o usuário toque em um botão de pagamento
+        # antigo salvo no histórico, não geramos cobrança se o VIP já estiver ativo.
+        try:
+            usuario = obter_usuario(call.from_user.id)
+        except Exception as e:
+            logger.error(
+                "[EFI_PIX_USUARIO_ERRO] "
+                f"user_ref={referencia_usuario_log(call.from_user.id)} "
+                f"erro={sanitizar_erro_log(e)}"
+            )
+            safe_answer_callback(
+                call.id,
+                text="Não consegui consultar seu plano agora. Tente novamente.",
+                show_alert=True,
+            )
+            return
+
+        if is_vip_user(usuario):
+            validade = formatar_validade_vip(usuario.get("vip_ate"))
+            safe_answer_callback(
+                call.id,
+                text=f"Você já possui VIP ativo até {validade}. 💎",
+                show_alert=True,
+            )
             return
 
         valor = call.data.split("_", 1)[1]
