@@ -6367,8 +6367,9 @@ def calcular_nova_data_vip(user, dias):
     except Exception:
         pass
 
-    # Em um plano novo ou vencido, hoje já conta como o primeiro dia.
-    nova_data = hoje + timedelta(days=dias - 1)
+    # Em um plano novo ou vencido, entrega os dias completos contratados.
+    # Ex.: compra em 29/08 por 30 dias -> validade em 28/09.
+    nova_data = hoje + timedelta(days=dias)
     return nova_data.strftime("%Y-%m-%d")
 
 
@@ -14608,7 +14609,7 @@ if __name__ == "__main__":
         "[READY_CONFIG] endpoint=/ready liveness_separado=True "
         "checks=polling,download_worker,watchdog,maintenance,mongodb"
     )
-    logger.info("[VIP_PLAN_CONFIG] novos=mensal anual=historico_nao_vendavel")
+    logger.info("[VIP_PLAN_CONFIG] novos=mensal anual=historico_nao_vendavel validade_dias_completos=True")
     logger.info("[QUEUE_PRIORITY_CONFIG] admin=-1 vip=0 gratis=1 worker_compartilhado=True")
     logger.info("[ML_CLIPS_CONFIG] enabled=True login=False cookies=False token=False source=public_mobile_html_hls dns_guard=host_allowlist")
     logger.info(f"[YT_DLP] versao={YT_DLP_VERSION}")
