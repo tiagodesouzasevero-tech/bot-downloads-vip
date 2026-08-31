@@ -3198,6 +3198,7 @@ def tentar_entrega_cache_url_rapida(
     plataformas,
     vip_status,
     reserva_download=None,
+    user=None,
 ):
     """Entrega cache por URL antes da fila pesada, quando disponível.
 
@@ -3265,6 +3266,7 @@ def tentar_entrega_cache_url_rapida(
         tipo_entrega="cache_url",
         admin_status=message.from_user.id == ADMIN_ID,
         user_id=message.from_user.id,
+        user=user,
     )
     if reserva_download:
         confirmar_download_gratis(
@@ -5769,6 +5771,7 @@ def registrar_download_diario(
     bytes_upload=0,
     admin_status=False,
     user_id=None,
+    user=None,
 ):
     """Registra o download e sua forma de entrega na mesma escrita diária."""
     try:
@@ -5835,7 +5838,21 @@ def registrar_download_diario(
     # Isso permite validar o percurso completo sem alterar os totais diários.
     if user_id is not None:
         try:
-            registrar_evento_funil_ads(user_id, "download")
+            if isinstance(user, dict):
+                atribuicao_carregada = _normalizar_atribuicao_ads_ativa(
+                    user_id,
+                    user.get("ultima_atribuicao_ads"),
+                )
+                if atribuicao_carregada:
+                    registrar_evento_funil_ads(
+                        user_id,
+                        "download",
+                        atribuicao=atribuicao_carregada,
+                    )
+            else:
+                # Fallback para fluxos antigos/recuperados que não carregaram o
+                # documento do usuário junto com o trabalho.
+                registrar_evento_funil_ads(user_id, "download")
         except Exception as e:
             logger.warning(
                 "[FUNIL_ADS_DOWNLOAD_ERRO] "
@@ -7265,12 +7282,9 @@ def _id_evento_funil_ads(user_id, campanha, anuncio):
     return referencia_privada_log("adsfunil", material, tamanho=40)
 
 
-def _atribuir_funil_ads_ativo_ao_usuario(user_id):
-    usuario = usuarios_col.find_one(
-        {"_id": str(user_id)},
-        {"ultima_atribuicao_ads": 1},
-    ) or {}
-    atribuicao = usuario.get("ultima_atribuicao_ads") or {}
+def _normalizar_atribuicao_ads_ativa(user_id, atribuicao):
+    """Valida uma atribuição já carregada usando a mesma janela do funil."""
+    atribuicao = atribuicao if isinstance(atribuicao, dict) else {}
     campanha = _normalizar_codigo_tracking(atribuicao.get("campanha"), 24)
     anuncio = _normalizar_codigo_tracking(atribuicao.get("anuncio"), 32)
     toque_em = _normalizar_datetime_utc_naive(atribuicao.get("toque_em"))
@@ -7290,6 +7304,17 @@ def _atribuir_funil_ads_ativo_ao_usuario(user_id):
         "evento_id": _id_evento_funil_ads(user_id, campanha, anuncio),
         "toque_em": toque_em,
     }
+
+
+def _atribuir_funil_ads_ativo_ao_usuario(user_id):
+    usuario = usuarios_col.find_one(
+        {"_id": str(user_id)},
+        {"ultima_atribuicao_ads": 1},
+    ) or {}
+    return _normalizar_atribuicao_ads_ativa(
+        user_id,
+        usuario.get("ultima_atribuicao_ads"),
+    )
 
 
 def registrar_evento_funil_ads(
@@ -11072,10 +11097,16 @@ def iniciar_pagamento_pix_automatico(call):
 
         atribuicao_pix = None
         try:
-            atribuicao_pix = registrar_evento_funil_ads(
+            atribuicao_carregada = _normalizar_atribuicao_ads_ativa(
                 call.from_user.id,
-                "pix_started",
+                usuario.get("ultima_atribuicao_ads"),
             )
+            if atribuicao_carregada:
+                atribuicao_pix = registrar_evento_funil_ads(
+                    call.from_user.id,
+                    "pix_started",
+                    atribuicao=atribuicao_carregada,
+                )
         except Exception as exc:
             logger.warning(
                 "[FUNIL_ADS_PIX_ERRO] user_ref=%s erro=%s",
@@ -12205,6 +12236,7 @@ def processar_download_mercado_livre_clips(
     status_msg,
     vip_status,
     reserva_download=None,
+    user=None,
 ):
     """Pipeline público de Mercado Livre Clips sem login/cookies/token."""
     prefix = os.path.join(DOWNLOAD_DIR, f"mlclips_{uuid.uuid4().hex}")
@@ -12229,6 +12261,7 @@ def processar_download_mercado_livre_clips(
                 tipo_entrega="cache_url",
                 admin_status=message.from_user.id == ADMIN_ID,
                 user_id=message.from_user.id,
+                user=user,
             )
             if reserva_download:
                 confirmar_download_gratis(
@@ -12290,6 +12323,7 @@ def processar_download_mercado_livre_clips(
                 tipo_entrega="cache_midia",
                 admin_status=message.from_user.id == ADMIN_ID,
                 user_id=message.from_user.id,
+                user=user,
             )
             if reserva_download:
                 confirmar_download_gratis(
@@ -12370,6 +12404,7 @@ def processar_download_mercado_livre_clips(
             bytes_upload=bytes_upload,
             admin_status=message.from_user.id == ADMIN_ID,
             user_id=message.from_user.id,
+            user=user,
         )
         if reserva_download:
             confirmar_download_gratis(
@@ -12635,7 +12670,14 @@ def baixar_url_original_shopee(url_midia, destino, referer):
             resposta.close()
 
 
-def processar_download_shopee(message, url, status_msg, vip_status, reserva_download=None):
+def processar_download_shopee(
+    message,
+    url,
+    status_msg,
+    vip_status,
+    reserva_download=None,
+    user=None,
+):
     """Pipeline Shopee Video: original oficial, áudio obrigatório e cache Telegram."""
     prefix = os.path.join(DOWNLOAD_DIR, f"shopee_{uuid.uuid4().hex}")
     plataforma = "Shopee Video"
@@ -12658,6 +12700,7 @@ def processar_download_shopee(message, url, status_msg, vip_status, reserva_down
                 tipo_entrega="cache_url",
                 admin_status=message.from_user.id == ADMIN_ID,
                 user_id=message.from_user.id,
+                user=user,
             )
             if reserva_download:
                 confirmar_download_gratis(
@@ -12721,6 +12764,7 @@ def processar_download_shopee(message, url, status_msg, vip_status, reserva_down
                 tipo_entrega="cache_midia",
                 admin_status=message.from_user.id == ADMIN_ID,
                 user_id=message.from_user.id,
+                user=user,
             )
             if reserva_download:
                 confirmar_download_gratis(
@@ -12827,6 +12871,7 @@ def processar_download_shopee(message, url, status_msg, vip_status, reserva_down
             bytes_upload=bytes_upload,
             admin_status=message.from_user.id == ADMIN_ID,
             user_id=message.from_user.id,
+            user=user,
         )
         if reserva_download:
             confirmar_download_gratis(
@@ -13025,6 +13070,7 @@ def _processar_download(message, url, status_msg, reserva_download=None, user=No
                 status_msg,
                 vip_status,
                 reserva_download=reserva_download,
+                user=user,
             )
             return
 
@@ -13035,6 +13081,7 @@ def _processar_download(message, url, status_msg, reserva_download=None, user=No
                 status_msg,
                 vip_status,
                 reserva_download=reserva_download,
+                user=user,
             )
             return
 
@@ -13068,6 +13115,7 @@ def _processar_download(message, url, status_msg, reserva_download=None, user=No
                     tipo_entrega="cache_url",
                     admin_status=message.from_user.id == ADMIN_ID,
                     user_id=message.from_user.id,
+                    user=user,
                 )
                 if reserva_download:
                     confirmar_download_gratis(
@@ -13129,6 +13177,7 @@ def _processar_download(message, url, status_msg, reserva_download=None, user=No
                         tipo_entrega="cache_midia",
                         admin_status=message.from_user.id == ADMIN_ID,
                         user_id=message.from_user.id,
+                        user=user,
                     )
                     if reserva_download:
                         confirmar_download_gratis(
@@ -13218,6 +13267,7 @@ def _processar_download(message, url, status_msg, reserva_download=None, user=No
                     bytes_upload=bytes_upload,
                     admin_status=message.from_user.id == ADMIN_ID,
                     user_id=message.from_user.id,
+                    user=user,
                 )
                 if reserva_download:
                     confirmar_download_gratis(
@@ -13288,6 +13338,7 @@ def _processar_download(message, url, status_msg, reserva_download=None, user=No
                 tipo_entrega="cache_url",
                 admin_status=message.from_user.id == ADMIN_ID,
                 user_id=message.from_user.id,
+                user=user,
             )
             if reserva_download:
                 confirmar_download_gratis(
@@ -13387,6 +13438,7 @@ def _processar_download(message, url, status_msg, reserva_download=None, user=No
                 tipo_entrega="cache_midia",
                 admin_status=message.from_user.id == ADMIN_ID,
                 user_id=message.from_user.id,
+                user=user,
             )
             if reserva_download:
                 confirmar_download_gratis(
@@ -13654,6 +13706,7 @@ def _processar_download(message, url, status_msg, reserva_download=None, user=No
             bytes_upload=bytes_upload,
             admin_status=message.from_user.id == ADMIN_ID,
             user_id=message.from_user.id,
+            user=user,
         )
         if reserva_download:
             confirmar_download_gratis(
@@ -14375,6 +14428,7 @@ def handle_download(message):
             plataformas,
             vip_status,
             reserva_download=reserva_download,
+            user=user,
         )
     except CacheTelegramTemporariamenteIndisponivel as e:
         with DOWNLOAD_PENDING_LOCK:
