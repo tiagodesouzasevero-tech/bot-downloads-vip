@@ -1409,7 +1409,7 @@ def obter_info_midia(arquivo_entrada):
     }
 
 
-def validar_arquivo_midia(arquivo, limite_bytes, fase="arquivo", exigir_duracao=True):
+def validar_arquivo_midia(arquivo, limite_bytes, fase="arquivo", exigir_duracao=True, info=None):
     """Impede mídia sem duração, longa demais ou grande demais."""
     if not arquivo or not os.path.isfile(arquivo):
         raise FalhaComponenteDownload(
@@ -1430,7 +1430,7 @@ def validar_arquivo_midia(arquivo, limite_bytes, fase="arquivo", exigir_duracao=
             f"tamanho={tamanho} limite_mb={limite_mb:.0f}"
         )
 
-    info = obter_info_midia(arquivo)
+    info = info or obter_info_midia(arquivo)
     if not info:
         raise FalhaComponenteDownload(
             "Processamento",
@@ -1616,14 +1616,14 @@ def converter_para_h264_compativel(arquivo_entrada, info=None):
     return arquivo_saida
 
 
-def converter_para_720x1280_30fps(arquivo_entrada):
+def converter_para_720x1280_30fps(arquivo_entrada, info=None):
     """
     Garante saída final em no máximo 720x1280, 30fps, H.264/AAC.
     Mantém a proporção original sem adicionar bordas e nunca amplia vídeos
     que já tenham resolução menor que o limite.
     """
     atualizar_heartbeat_worker("convertendo_video")
-    info = obter_info_midia(arquivo_entrada) or {}
+    info = info or obter_info_midia(arquivo_entrada) or {}
     base, _ = os.path.splitext(arquivo_entrada)
     arquivo_saida = f"{base}_720x1280_30fps.mp4"
 
@@ -1682,9 +1682,9 @@ def converter_para_720x1280_30fps(arquivo_entrada):
     return arquivo_saida
 
 
-def preparar_arquivo_para_envio(arquivo_entrada, plataforma=None):
+def preparar_arquivo_para_envio(arquivo_entrada, plataforma=None, info=None):
     atualizar_heartbeat_worker("preparando_envio")
-    info = obter_info_midia(arquivo_entrada)
+    info = info or obter_info_midia(arquivo_entrada)
     permitir_hevc = permitir_hevc_por_plataforma(plataforma)
 
     if arquivo_ja_otimizado_para_envio(arquivo_entrada, info, permitir_hevc=permitir_hevc):
@@ -1725,7 +1725,7 @@ def preparar_arquivo_para_envio(arquivo_entrada, plataforma=None):
         f"arquivo_ref={referencia_arquivo_log(arquivo_entrada)} "
         f"info={info} permitir_hevc={permitir_hevc}"
     )
-    return converter_para_720x1280_30fps(arquivo_entrada)
+    return converter_para_720x1280_30fps(arquivo_entrada, info=info)
 
 
 def safe_send_message(chat_id, texto, **kwargs):
@@ -12299,17 +12299,22 @@ def processar_download_mercado_livre_clips(
                 "[ML_CLIPS_COMPACTACAO] necessaria=True "
                 f"limite_mb={MAX_OUTPUT_FILE_MB}"
             )
-            arquivo_envio = converter_para_720x1280_30fps(arquivo_baixado)
+            arquivo_envio = converter_para_720x1280_30fps(
+                arquivo_baixado,
+                info=info_baixada,
+            )
         else:
             arquivo_envio = preparar_arquivo_para_envio(
                 arquivo_baixado,
                 plataforma=plataforma,
+                info=info_baixada,
             )
 
         info_envio = validar_arquivo_midia(
             arquivo_envio,
             MAX_OUTPUT_FILE_BYTES,
             fase="ml_clips_envio",
+            info=info_baixada if arquivo_envio == arquivo_baixado else None,
         )
         if not arquivo_possui_audio(info_envio):
             raise RuntimeError("ML_CLIPS_AUDIO_AUSENTE_APOS_PROCESSAMENTO")
@@ -12738,16 +12743,21 @@ def processar_download_shopee(message, url, status_msg, vip_status, reserva_down
                 "[SHOPEE_COMPACTACAO] necessaria=True "
                 f"limite_mb={MAX_OUTPUT_FILE_MB}"
             )
-            arquivo_envio = converter_para_720x1280_30fps(arquivo_baixado)
+            arquivo_envio = converter_para_720x1280_30fps(
+                arquivo_baixado,
+                info=info_baixada,
+            )
         else:
             arquivo_envio = preparar_arquivo_para_envio(
                 arquivo_baixado,
                 plataforma=plataforma,
+                info=info_baixada,
             )
         info_envio = validar_arquivo_midia(
             arquivo_envio,
             MAX_OUTPUT_FILE_BYTES,
             fase="shopee_envio",
+            info=info_baixada if arquivo_envio == arquivo_baixado else None,
         )
         if not arquivo_possui_audio(info_envio):
             raise RuntimeError("SHOPEE_AUDIO_AUSENTE_APOS_PROCESSAMENTO")
@@ -13107,7 +13117,7 @@ def _processar_download(message, url, status_msg, reserva_download=None):
                 except Exception as e:
                     raise FalhaComponenteDownload(plataforma, e) from e
                 registrar_sucesso_plataforma(plataforma)
-                validar_arquivo_midia(
+                info_baixada = validar_arquivo_midia(
                     arquivo_final,
                     MAX_SOURCE_FILE_BYTES,
                     fase="download_pinterest",
@@ -13115,11 +13125,13 @@ def _processar_download(message, url, status_msg, reserva_download=None):
                 arquivo_envio = preparar_arquivo_para_envio(
                     arquivo_final,
                     plataforma=plataforma,
+                    info=info_baixada,
                 )
                 validar_arquivo_midia(
                     arquivo_envio,
                     MAX_OUTPUT_FILE_BYTES,
                     fase="envio_pinterest",
+                    info=info_baixada if arquivo_envio == arquivo_final else None,
                 )
                 registrar_sucesso_componente("Processamento")
 
@@ -13518,24 +13530,27 @@ def _processar_download(message, url, status_msg, reserva_download=None):
                 "Arquivo final não encontrado após o download",
             )
 
-        validar_arquivo_midia(
+        info_baixada = validar_arquivo_midia(
             arquivo_final,
             MAX_SOURCE_FILE_BYTES,
             fase="download",
         )
-        arquivo_envio = preparar_arquivo_para_envio(arquivo_final, plataforma=plataforma)
-        validar_arquivo_midia(
+        arquivo_envio = preparar_arquivo_para_envio(
+            arquivo_final,
+            plataforma=plataforma,
+            info=info_baixada,
+        )
+        info_envio = validar_arquivo_midia(
             arquivo_envio,
             MAX_OUTPUT_FILE_BYTES,
             fase="envio",
+            info=info_baixada if arquivo_envio == arquivo_final else None,
         )
 
         instagram_sem_audio = False
         if is_instagram:
             try:
-                instagram_sem_audio = not arquivo_possui_audio(
-                    obter_info_midia(arquivo_envio)
-                )
+                instagram_sem_audio = not arquivo_possui_audio(info_envio)
             except Exception as e:
                 logger.warning(
                     "[INSTAGRAM_AUDIO_CHECK] "
