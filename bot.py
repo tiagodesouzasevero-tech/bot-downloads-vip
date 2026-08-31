@@ -158,6 +158,7 @@ VIP_CONTINUIDADE_HEARTBEAT_SECONDS = get_env_int(
 )
 
 FREE_DAILY_LIMIT = 3
+VIP_RENEWAL_WINDOW_DAYS = 7
 MAX_DURATION_SECONDS = 90
 MAX_URL_LENGTH = get_env_int("MAX_URL_LENGTH", 2048, 256, 8192)
 MAX_SOURCE_FILE_MB = get_env_int("MAX_SOURCE_FILE_MB", 100, 10, 500)
@@ -7428,6 +7429,35 @@ def is_vip_user(user):
         return False
 
 
+def dias_restantes_vip(user):
+    """Retorna os dias restantes de um VIP com validade por data."""
+    vip_ate = (user or {}).get("vip_ate")
+    if not vip_ate or vip_ate == "Vitalício":
+        return None
+
+    try:
+        validade = datetime.strptime(vip_ate, "%Y-%m-%d").date()
+        return (validade - agora_tz().date()).days
+    except Exception as e:
+        logger.warning(
+            "[VIP_DIAS_RESTANTES] validade_invalida=True "
+            f"erro={sanitizar_erro_log(e)}"
+        )
+        return None
+
+
+def vip_pode_renovar(user):
+    """Permite renovação apenas nos últimos dias de um VIP não vitalício."""
+    if not is_vip_user(user):
+        return False
+
+    dias_restantes = dias_restantes_vip(user)
+    return bool(
+        dias_restantes is not None
+        and 0 <= dias_restantes <= VIP_RENEWAL_WINDOW_DAYS
+    )
+
+
 # =========================================
 # CONTINUIDADE VIP ENTRE BOTS
 # =========================================
@@ -8113,9 +8143,9 @@ def configurar_menu_comandos():
 
 
 def mostrar_planos_chat(chat_id, user_id):
-    # Impede que um usuário com VIP ativo gere uma nova cobrança por engano.
-    # Esta checagem fica também no callback de pagamento para proteger botões
-    # antigos que possam continuar visíveis no histórico do Telegram.
+    # Impede cobrança antecipada por engano, mas libera a renovação durante
+    # os últimos dias do plano. A mesma regra existe no callback de pagamento
+    # para proteger botões antigos que continuam visíveis no histórico.
     try:
         usuario = obter_usuario(user_id)
     except Exception as e:
@@ -8130,13 +8160,17 @@ def mostrar_planos_chat(chat_id, user_id):
         )
         return False
 
-    if is_vip_user(usuario):
+    vip_ativo = is_vip_user(usuario)
+    renovacao_permitida = vip_ativo and vip_pode_renovar(usuario)
+
+    if vip_ativo and not renovacao_permitida:
         validade = formatar_validade_vip(usuario.get("vip_ate"))
         safe_send_message(
             chat_id,
             "💎 *Você já possui acesso VIP ativo.*\n\n"
             f"Válido até: *{validade}*\n"
-            "Não é necessário realizar um novo pagamento agora.",
+            f"A renovação ficará disponível nos últimos "
+            f"{VIP_RENEWAL_WINDOW_DAYS} dias do seu plano.",
             parse_mode="Markdown",
         )
         return False
@@ -8144,21 +8178,36 @@ def mostrar_planos_chat(chat_id, user_id):
     markup = types.InlineKeyboardMarkup(row_width=1)
     markup.add(
         types.InlineKeyboardButton(
-            "💠 VIP Mensal - R$ 10,00 via Pix",
+            (
+                "💠 Renovar VIP Mensal - R$ 10,00"
+                if renovacao_permitida
+                else "💠 VIP Mensal - R$ 10,00 via Pix"
+            ),
             callback_data="pay_10.00",
         )
     )
 
-    texto = (
-        "🚀 *LIBERAR ACESSO VIP*\n\n"
-        "VIP Mensal por *R$ 10,00* com 30 dias de acesso.\n\n"
-        "✅ Sem limite diário\n"
-        "✅ Prioridade no processamento\n"
-        "✅ TikTok, Pinterest, Shopee Video, Mercado Livre Clips e RedNote\n"
-        "✅ Pagamento exclusivamente via Pix\n"
-        "✅ Liberação automática após o pagamento\n\n"
-        f"Sua ID: `{user_id}`"
-    )
+    if renovacao_permitida:
+        validade = formatar_validade_vip(usuario.get("vip_ate"))
+        texto = (
+            "💎 *RENOVAR ACESSO VIP*\n\n"
+            f"Seu VIP atual é válido até *{validade}*.\n"
+            "Após a confirmação do Pix, os novos 30 dias serão somados "
+            "à sua validade atual. Você não perde os dias restantes.\n\n"
+            "💠 Renovação mensal: *R$ 10,00*\n"
+            "✅ Liberação automática após o pagamento"
+        )
+    else:
+        texto = (
+            "🚀 *LIBERAR ACESSO VIP*\n\n"
+            "VIP Mensal por *R$ 10,00* com 30 dias de acesso.\n\n"
+            "✅ Sem limite diário\n"
+            "✅ Prioridade no processamento\n"
+            "✅ TikTok, Pinterest, Shopee Video, Mercado Livre Clips e RedNote\n"
+            "✅ Pagamento exclusivamente via Pix\n"
+            "✅ Liberação automática após o pagamento\n\n"
+            f"Sua ID: `{user_id}`"
+        )
 
     safe_send_message(chat_id, texto, parse_mode="Markdown", reply_markup=markup)
 
@@ -10864,8 +10913,9 @@ def iniciar_pagamento_pix_automatico(call):
             orientar_uso_no_privado(call.message)
             return
 
-        # Segunda barreira: mesmo que o usuário toque em um botão de pagamento
-        # antigo salvo no histórico, não geramos cobrança se o VIP já estiver ativo.
+        # Segunda barreira: botões antigos não geram cobrança antecipada. Nos
+        # últimos dias do plano, a renovação é liberada e acumula a nova compra
+        # sobre a validade atual.
         try:
             usuario = obter_usuario(call.from_user.id)
         except Exception as e:
@@ -10881,14 +10931,26 @@ def iniciar_pagamento_pix_automatico(call):
             )
             return
 
-        if is_vip_user(usuario):
+        vip_ativo = is_vip_user(usuario)
+        renovacao_permitida = vip_ativo and vip_pode_renovar(usuario)
+        if vip_ativo and not renovacao_permitida:
             validade = formatar_validade_vip(usuario.get("vip_ate"))
             safe_answer_callback(
                 call.id,
-                text=f"Você já possui VIP ativo até {validade}. 💎",
+                text=(
+                    f"Seu VIP está ativo até {validade}. A renovação abre nos "
+                    f"últimos {VIP_RENEWAL_WINDOW_DAYS} dias. 💎"
+                ),
                 show_alert=True,
             )
             return
+
+        if renovacao_permitida:
+            logger.info(
+                "[VIP_RENOVACAO_INICIADA] "
+                f"user_ref={referencia_usuario_log(call.from_user.id)} "
+                f"dias_restantes={dias_restantes_vip(usuario)}"
+            )
 
         valor = call.data.split("_", 1)[1]
         plano = obter_plano_por_callback(valor)
