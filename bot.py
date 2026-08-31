@@ -3169,6 +3169,56 @@ def enviar_midia_cacheada(chat_id, cache_key, entrada_cache):
     return None
 
 
+def tentar_entrega_cache_url_rapida(
+    message,
+    url,
+    plataformas,
+    vip_status,
+    reserva_download=None,
+):
+    """Entrega um cache por URL antes da fila pesada, quando disponível.
+
+    A tentativa respeita os mesmos contadores/limites já autorizados pelo
+    handler. Em cache miss (ou file_id inválido), devolve False e o fluxo
+    normal segue para a fila de download.
+    """
+    plataforma = nome_plataforma(*plataformas)
+    cache_key, _url_normalizada = montar_chave_cache_url(plataforma, url)
+    entrada_cache = obter_entrada_cache(cache_key)
+    if not entrada_cache:
+        return False
+
+    tipo_cache = enviar_midia_cacheada(
+        message.chat.id,
+        cache_key,
+        entrada_cache,
+    )
+    if not tipo_cache:
+        return False
+
+    registrar_download_diario(
+        vip_status,
+        tipo_entrega="cache_url",
+        admin_status=message.from_user.id == ADMIN_ID,
+        user_id=message.from_user.id,
+    )
+    if reserva_download:
+        confirmar_download_gratis(
+            reserva_download,
+            message.from_user.id,
+            message.chat.id,
+            message.from_user.id,
+        )
+
+    logger.info(
+        "[FAST_CACHE_HIT] "
+        f"user_ref={referencia_usuario_log(message.from_user.id)} "
+        f"plataforma={plataforma} key={cache_key[:12]} "
+        "fila_bypass=True"
+    )
+    return True
+
+
 def detectar_plataforma(url):
     return detectar_plataforma_url(url)
 
@@ -14237,6 +14287,45 @@ def handle_download(message):
         )
         remover_trabalho_fila_persistente(user_id)
         safe_reply_to(message, mensagem_limite_global)
+        return
+
+    # FAST CACHE: antes de ocupar o único worker pesado, tenta entregar pelo
+    # file_id já salvo no Telegram. Cache miss continua exatamente no fluxo
+    # anterior da fila; cache hit evita download, FFmpeg e novo upload.
+    try:
+        entregue_cache = tentar_entrega_cache_url_rapida(
+            message,
+            url,
+            plataformas,
+            vip_status,
+            reserva_download=reserva_download,
+        )
+    except CacheTelegramTemporariamenteIndisponivel as e:
+        with DOWNLOAD_PENDING_LOCK:
+            DOWNLOAD_PENDING_USERS.discard(user_id)
+        remover_trabalho_fila_persistente(user_id)
+        devolver_reserva_download_gratis(
+            reserva_download,
+            user_id,
+            motivo="fast_cache_telegram_temporario",
+        )
+        logger.warning(
+            "[FAST_CACHE_TEMPORARIO] "
+            f"user_ref={referencia_usuario_log(message.from_user.id)} "
+            f"erro={sanitizar_erro_log(e)}"
+        )
+        safe_reply_to(
+            message,
+            "⏳ O Telegram está temporariamente indisponível. Aguarde alguns "
+            "instantes e envie o link novamente. Esta tentativa não consumiu "
+            "seu limite diário.",
+        )
+        return
+
+    if entregue_cache:
+        with DOWNLOAD_PENDING_LOCK:
+            DOWNLOAD_PENDING_USERS.discard(user_id)
+        remover_trabalho_fila_persistente(user_id)
         return
 
     is_admin_download = int(message.from_user.id) == ADMIN_ID
