@@ -12868,20 +12868,24 @@ def formatos_por_plataforma(
     return formatos_capados_gerais()
 
 
-def _processar_download(message, url, status_msg, reserva_download=None):
+def _processar_download(message, url, status_msg, reserva_download=None, user=None):
     atualizar_heartbeat_worker("preparando")
     prefix = None
     plataforma = nome_plataforma(*detectar_plataforma(url))
 
     try:
-        try:
-            user = obter_usuario(message.from_user.id)
-        except Exception as e:
-            raise FalhaComponenteDownload(
-                "MongoDB",
-                e,
-                ja_registrada=True,
-            ) from e
+        # O handler já acabou de carregar o usuário antes de enfileirar.
+        # Reaproveite esse documento para evitar uma segunda leitura no MongoDB.
+        # O fallback preserva compatibilidade com trabalhos criados por outros fluxos.
+        if user is None:
+            try:
+                user = obter_usuario(message.from_user.id)
+            except Exception as e:
+                raise FalhaComponenteDownload(
+                    "MongoDB",
+                    e,
+                    ja_registrada=True,
+                ) from e
         vip_status = is_vip_user(user)
 
         if status_msg:
@@ -14096,6 +14100,7 @@ def loop_fila_downloads():
                     trabalho["url"],
                     trabalho.get("status_msg"),
                     reserva_download,
+                    trabalho.get("user"),
                 )
             except Exception as e:
                 logger.error(
@@ -14427,6 +14432,9 @@ def handle_download(message):
                             "status_msg": status_msg,
                             "persistent_recorded": registro_persistido,
                             "download_reservation": reserva_download,
+                            # Documento já carregado pelo handler; evita nova consulta
+                            # ao MongoDB quando o worker iniciar este download.
+                            "user": user,
                         },
                     )
                 )
