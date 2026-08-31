@@ -3080,9 +3080,15 @@ def _enviar_file_id_telegram(chat_id, telegram_file_id, telegram_media_type):
     )
 
 
-def enviar_midia_cacheada(chat_id, cache_key, entrada_cache):
+def enviar_midia_cacheada(
+    chat_id,
+    cache_key,
+    entrada_cache,
+    atualizar_heartbeat=True,
+):
     """Retorna o tipo usado, None se inválido, ou interrompe em falha temporária."""
-    atualizar_heartbeat_worker("enviando_cache")
+    if atualizar_heartbeat:
+        atualizar_heartbeat_worker("enviando_cache")
     telegram_file_id = entrada_cache.get("telegram_file_id")
     tipo_armazenado = entrada_cache.get("telegram_media_type")
     tipos_tentativa = (
@@ -3176,14 +3182,53 @@ def tentar_entrega_cache_url_rapida(
     vip_status,
     reserva_download=None,
 ):
-    """Entrega um cache por URL antes da fila pesada, quando disponível.
+    """Entrega cache por URL antes da fila pesada, quando disponível.
 
-    A tentativa respeita os mesmos contadores/limites já autorizados pelo
-    handler. Em cache miss (ou file_id inválido), devolve False e o fluxo
-    normal segue para a fila de download.
+    A URL é resolvida/normalizada com as mesmas regras do worker para que
+    links curtos compartilhados (ex.: TikTok) encontrem a chave gravada no
+    primeiro download. Falha ao preparar a URL vira cache miss e o fluxo
+    normal continua, sem impedir o download.
     """
+    try:
+        url_cache = resolver_url_compartilhada(url)
+        plataformas_resolvidas = detectar_plataforma(url_cache)
+        if any(plataformas_resolvidas):
+            plataformas = plataformas_resolvidas
+
+        (
+            is_pinterest,
+            _is_tiktok,
+            is_instagram,
+            _is_rednote,
+            is_facebook_reel,
+            _is_shopee,
+            is_mercado_livre_clips,
+        ) = plataformas
+
+        if is_instagram:
+            url_cache = normalizar_url_instagram(url_cache)
+        elif is_facebook_reel:
+            url_cache = normalizar_url_facebook_reel(url_cache)
+        elif is_mercado_livre_clips:
+            url_cache = normalizar_url_mercado_livre_clips(url_cache)
+
+        # O pipeline do Pinterest usa a URL final da mídia/post para formar
+        # a chave por URL; repete somente essa etapa leve antes da fila.
+        if is_pinterest:
+            url_cache = resolver_link_pinterest(url_cache)
+            plataformas_resolvidas = detectar_plataforma(url_cache)
+            if any(plataformas_resolvidas):
+                plataformas = plataformas_resolvidas
+    except Exception as e:
+        logger.info(
+            "[FAST_CACHE_PREP_MISS] "
+            f"user_ref={referencia_usuario_log(message.from_user.id)} "
+            f"erro={sanitizar_erro_log(e)}"
+        )
+        return False
+
     plataforma = nome_plataforma(*plataformas)
-    cache_key, _url_normalizada = montar_chave_cache_url(plataforma, url)
+    cache_key, _url_normalizada = montar_chave_cache_url(plataforma, url_cache)
     entrada_cache = obter_entrada_cache(cache_key)
     if not entrada_cache:
         return False
@@ -3192,6 +3237,7 @@ def tentar_entrega_cache_url_rapida(
         message.chat.id,
         cache_key,
         entrada_cache,
+        atualizar_heartbeat=False,
     )
     if not tipo_cache:
         return False
@@ -14146,29 +14192,16 @@ def handle_download(message):
         return
 
     user_id = str(message.from_user.id)
-    with DOWNLOAD_PENDING_LOCK:
-        if user_id in DOWNLOAD_PENDING_USERS:
-            safe_reply_to(
-                message,
-                "⏳ Seu vídeo anterior ainda está na fila. Aguarde a conclusão antes "
-                "de enviar outro link.",
-            )
-            return
-        if DOWNLOAD_QUEUE.full():
-            safe_reply_to(
-                message,
-                "⏳ A fila está cheia neste momento. Aguarde um pouco e tente novamente.",
-            )
-            return
 
     autorizado, mensagem_limite = autorizar_tentativa_download(message.from_user.id)
     if not autorizado:
         safe_reply_to(message, mensagem_limite)
         return
 
+    # Reserva somente o usuário, não a fila. Assim um cache hit continua
+    # disponível mesmo quando o worker pesado está com a fila cheia.
     recusado_desligamento = False
     duplicado = False
-    fila_ficou_cheia = False
     with DOWNLOAD_QUEUE_STATE_LOCK:
         if SHUTDOWN_EVENT.is_set():
             recusado_desligamento = True
@@ -14176,8 +14209,6 @@ def handle_download(message):
             with DOWNLOAD_PENDING_LOCK:
                 if user_id in DOWNLOAD_PENDING_USERS:
                     duplicado = True
-                elif DOWNLOAD_QUEUE.full():
-                    fila_ficou_cheia = True
                 else:
                     DOWNLOAD_PENDING_USERS.add(user_id)
 
@@ -14195,32 +14226,6 @@ def handle_download(message):
             "antes de enviar outro link.",
         )
         return
-    if fila_ficou_cheia:
-        safe_reply_to(
-            message,
-            "⏳ A fila está cheia neste momento. Aguarde um pouco e tente novamente.",
-        )
-        return
-
-    registro_persistido, erro_registro = registrar_trabalho_fila_persistente(
-        user_id
-    )
-    if not registro_persistido:
-        with DOWNLOAD_PENDING_LOCK:
-            DOWNLOAD_PENDING_USERS.discard(user_id)
-        if erro_registro == "em_andamento":
-            safe_reply_to(
-                message,
-                "⏳ Seu vídeo anterior ainda está na fila ou em processamento. "
-                "Aguarde a conclusão antes de enviar outro link.",
-            )
-        else:
-            safe_reply_to(
-                message,
-                "⏳ O banco de dados está temporariamente indisponível. "
-                "Aguarde alguns instantes e tente novamente.",
-            )
-        return
 
     reserva_download = None
     if not vip_status:
@@ -14228,8 +14233,6 @@ def handle_download(message):
         if not reserva_download:
             with DOWNLOAD_PENDING_LOCK:
                 DOWNLOAD_PENDING_USERS.discard(user_id)
-            if erro_reserva == "limite":
-                remover_trabalho_fila_persistente(user_id)
 
             if erro_reserva == "limite":
                 safe_reply_to(
@@ -14270,7 +14273,6 @@ def handle_download(message):
             user_id,
             motivo="limite_usuario",
         )
-        remover_trabalho_fila_persistente(user_id)
         safe_reply_to(message, mensagem_limite_usuario)
         return
 
@@ -14285,13 +14287,11 @@ def handle_download(message):
             user_id,
             motivo="limite_global",
         )
-        remover_trabalho_fila_persistente(user_id)
         safe_reply_to(message, mensagem_limite_global)
         return
 
-    # FAST CACHE: antes de ocupar o único worker pesado, tenta entregar pelo
-    # file_id já salvo no Telegram. Cache miss continua exatamente no fluxo
-    # anterior da fila; cache hit evita download, FFmpeg e novo upload.
+    # FAST CACHE acontece antes de consultar lotação da fila e antes de criar
+    # o registro persistente de trabalho. Cache hit não ocupa o worker pesado.
     try:
         entregue_cache = tentar_entrega_cache_url_rapida(
             message,
@@ -14303,7 +14303,6 @@ def handle_download(message):
     except CacheTelegramTemporariamenteIndisponivel as e:
         with DOWNLOAD_PENDING_LOCK:
             DOWNLOAD_PENDING_USERS.discard(user_id)
-        remover_trabalho_fila_persistente(user_id)
         devolver_reserva_download_gratis(
             reserva_download,
             user_id,
@@ -14325,7 +14324,63 @@ def handle_download(message):
     if entregue_cache:
         with DOWNLOAD_PENDING_LOCK:
             DOWNLOAD_PENDING_USERS.discard(user_id)
-        remover_trabalho_fila_persistente(user_id)
+        return
+
+    # Só cache miss precisa de capacidade na fila pesada.
+    recusado_desligamento = False
+    fila_ficou_cheia = False
+    with DOWNLOAD_QUEUE_STATE_LOCK:
+        if SHUTDOWN_EVENT.is_set():
+            recusado_desligamento = True
+        elif DOWNLOAD_QUEUE.full():
+            fila_ficou_cheia = True
+
+    if recusado_desligamento or fila_ficou_cheia:
+        with DOWNLOAD_PENDING_LOCK:
+            DOWNLOAD_PENDING_USERS.discard(user_id)
+        devolver_reserva_download_gratis(
+            reserva_download,
+            user_id,
+            motivo="fila_nao_aceita",
+        )
+
+        if recusado_desligamento:
+            safe_reply_to(
+                message,
+                "🔄 O bot está concluindo uma atualização. Aguarde alguns "
+                "instantes e envie o link novamente.",
+            )
+        else:
+            safe_reply_to(
+                message,
+                "⏳ A fila está cheia neste momento. Aguarde um pouco e tente novamente.",
+            )
+        return
+
+    # Persistência de recuperação só é necessária quando realmente haverá fila.
+    registro_persistido, erro_registro = registrar_trabalho_fila_persistente(
+        user_id
+    )
+    if not registro_persistido:
+        with DOWNLOAD_PENDING_LOCK:
+            DOWNLOAD_PENDING_USERS.discard(user_id)
+        devolver_reserva_download_gratis(
+            reserva_download,
+            user_id,
+            motivo="fila_persistente_nao_criada",
+        )
+        if erro_registro == "em_andamento":
+            safe_reply_to(
+                message,
+                "⏳ Seu vídeo anterior ainda está na fila ou em processamento. "
+                "Aguarde a conclusão antes de enviar outro link.",
+            )
+        else:
+            safe_reply_to(
+                message,
+                "⏳ O banco de dados está temporariamente indisponível. "
+                "Aguarde alguns instantes e tente novamente.",
+            )
         return
 
     is_admin_download = int(message.from_user.id) == ADMIN_ID
@@ -14372,8 +14427,7 @@ def handle_download(message):
     if recusado_desligamento or fila_ficou_cheia:
         with DOWNLOAD_PENDING_LOCK:
             DOWNLOAD_PENDING_USERS.discard(user_id)
-        if registro_persistido:
-            remover_trabalho_fila_persistente(user_id)
+        remover_trabalho_fila_persistente(user_id)
         devolver_reserva_download_gratis(
             reserva_download,
             user_id,
