@@ -582,7 +582,7 @@ except Exception as e:
         f"{erro_inicio[:500]}"
     )
 
-bot = telebot.TeleBot(TOKEN_TELEGRAM, threaded=False)
+bot = telebot.TeleBot(TOKEN_TELEGRAM, threaded=True, num_threads=4)
 
 DEFAULT_HEADERS = {
     "User-Agent": "Mozilla/5.0",
