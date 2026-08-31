@@ -14268,23 +14268,9 @@ def handle_download(message):
         )
         return
 
-    try:
-        user = obter_usuario(message.from_user.id)
-    except Exception as e:
-        logger.error(
-            "[DOWNLOAD_USUARIO_ERRO] "
-            f"user_ref={referencia_usuario_log(message.from_user.id)} "
-            f"erro={sanitizar_erro_log(e)}"
-        )
-        safe_reply_to(
-            message,
-            "⏳ O sistema de cadastro está temporariamente indisponível. "
-            "Aguarde alguns instantes e envie o link novamente.",
-        )
-        return
-
-    vip_status = is_vip_user(user)
-
+    # Validações baratas acontecem antes de consultar o MongoDB. Assim links
+    # inválidos, plataformas não suportadas e cooldowns locais não geram uma
+    # leitura desnecessária no banco.
     url = extrair_primeira_url(message.text)
     if not url or not validar_url_http_publica(url, resolver_dns=False):
         safe_reply_to(message, "❌ Não encontrei um link válido na sua mensagem.")
@@ -14326,6 +14312,23 @@ def handle_download(message):
     if not autorizado:
         safe_reply_to(message, mensagem_limite)
         return
+
+    try:
+        user = obter_usuario(message.from_user.id)
+    except Exception as e:
+        logger.error(
+            "[DOWNLOAD_USUARIO_ERRO] "
+            f"user_ref={referencia_usuario_log(message.from_user.id)} "
+            f"erro={sanitizar_erro_log(e)}"
+        )
+        safe_reply_to(
+            message,
+            "⏳ O sistema de cadastro está temporariamente indisponível. "
+            "Aguarde alguns instantes e envie o link novamente.",
+        )
+        return
+
+    vip_status = is_vip_user(user)
 
     # Reserva somente o usuário, não a fila. Assim um cache hit continua
     # disponível mesmo quando o worker pesado está com a fila cheia.
