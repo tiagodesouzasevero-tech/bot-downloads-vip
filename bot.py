@@ -2648,12 +2648,20 @@ def classificar_erro_envio_arquivo(erro):
     return "inconclusivo"
 
 
-def _enviar_video_local_telegram(chat_id, arquivo):
+def montar_legenda_download(reserva_download=None):
+    """Legenda compacta; usuários grátis veem o uso diário no próprio arquivo."""
+    if reserva_download:
+        novo_count = int(reserva_download.get("count") or 0)
+        return f"✅ Download concluído • Uso hoje: {novo_count}/{FREE_DAILY_LIMIT}"
+    return None
+
+
+def _enviar_video_local_telegram(chat_id, arquivo, legenda=None):
     with open(arquivo, "rb") as f:
         return bot.send_video(
             chat_id,
             f,
-            caption="👉 Download concluído! Aqui está seu vídeo 👊",
+            caption=legenda or "👉 Download concluído! Aqui está seu vídeo 👊",
         )
 
 
@@ -2670,12 +2678,13 @@ def obter_tamanho_arquivo_para_metrica(arquivo):
         return 0
 
 
-def enviar_arquivo_com_fallback(chat_id, arquivo):
+def enviar_arquivo_com_fallback(chat_id, arquivo, reserva_download=None):
     atualizar_heartbeat_worker("enviando_telegram")
+    legenda = montar_legenda_download(reserva_download)
     erro_video = None
     classificacao_video = None
     try:
-        mensagem = _enviar_video_local_telegram(chat_id, arquivo)
+        mensagem = _enviar_video_local_telegram(chat_id, arquivo, legenda)
         telegram_file_id, telegram_media_type = extrair_dados_midia_telegram(mensagem)
         registrar_sucesso_componente("Telegram")
         return (
@@ -2709,7 +2718,7 @@ def enviar_arquivo_com_fallback(chat_id, arquivo):
         time.sleep(espera)
         atualizar_heartbeat_worker("reenviando_telegram")
         try:
-            mensagem = _enviar_video_local_telegram(chat_id, arquivo)
+            mensagem = _enviar_video_local_telegram(chat_id, arquivo, legenda)
             telegram_file_id, telegram_media_type = extrair_dados_midia_telegram(
                 mensagem
             )
@@ -2765,7 +2774,7 @@ def enviar_arquivo_com_fallback(chat_id, arquivo):
             )
             arquivo_fallback = candidato_fallback
 
-            mensagem = _enviar_video_local_telegram(chat_id, arquivo_fallback)
+            mensagem = _enviar_video_local_telegram(chat_id, arquivo_fallback, legenda)
 
             logger.info(
                 "[SEND_VIDEO] Fallback H.264 enviado com sucesso | "
@@ -2803,7 +2812,7 @@ def enviar_arquivo_com_fallback(chat_id, arquivo):
             mensagem = bot.send_document(
                 chat_id,
                 f,
-                caption="👉 Download concluído! Aqui está seu arquivo 👊",
+                caption=legenda or "👉 Download concluído! Aqui está seu arquivo 👊",
             )
         telegram_file_id, telegram_media_type = extrair_dados_midia_telegram(mensagem)
         registrar_sucesso_componente("Telegram")
@@ -3066,17 +3075,22 @@ def classificar_erro_envio_cache(erro):
     return "inconclusivo"
 
 
-def _enviar_file_id_telegram(chat_id, telegram_file_id, telegram_media_type):
+def _enviar_file_id_telegram(
+    chat_id,
+    telegram_file_id,
+    telegram_media_type,
+    legenda=None,
+):
     if telegram_media_type == "document":
         return bot.send_document(
             chat_id,
             telegram_file_id,
-            caption="👉 Download concluído! Aqui está seu arquivo 👊",
+            caption=legenda or "👉 Download concluído! Aqui está seu arquivo 👊",
         )
     return bot.send_video(
         chat_id,
         telegram_file_id,
-        caption="👉 Download concluído! Aqui está seu vídeo 👊",
+        caption=legenda or "👉 Download concluído! Aqui está seu vídeo 👊",
     )
 
 
@@ -3085,10 +3099,12 @@ def enviar_midia_cacheada(
     cache_key,
     entrada_cache,
     atualizar_heartbeat=True,
+    reserva_download=None,
 ):
     """Retorna o tipo usado, None se inválido, ou interrompe em falha temporária."""
     if atualizar_heartbeat:
         atualizar_heartbeat_worker("enviando_cache")
+    legenda = montar_legenda_download(reserva_download)
     telegram_file_id = entrada_cache.get("telegram_file_id")
     tipo_armazenado = entrada_cache.get("telegram_media_type")
     tipos_tentativa = (
@@ -3105,6 +3121,7 @@ def enviar_midia_cacheada(
                     chat_id,
                     telegram_file_id,
                     telegram_media_type,
+                    legenda=legenda,
                 )
                 logger.info(
                     f"[CACHE_MIDIA_HIT] key={cache_key[:12]} "
@@ -3238,6 +3255,7 @@ def tentar_entrega_cache_url_rapida(
         cache_key,
         entrada_cache,
         atualizar_heartbeat=False,
+        reserva_download=reserva_download,
     )
     if not tipo_cache:
         return False
@@ -5562,7 +5580,6 @@ def confirmar_download_gratis(
 
     reserva["finalized"] = True
     novo_count = int(reserva.get("count") or 0)
-    safe_send_message(chat_id, f"📊 Uso diário: {novo_count}/{FREE_DAILY_LIMIT}")
 
     if novo_count >= FREE_DAILY_LIMIT:
         safe_send_message(
@@ -12198,7 +12215,12 @@ def processar_download_mercado_livre_clips(
         url_cache_key, url_normalizada = montar_chave_cache_url(plataforma, url)
         entrada_cache_url = obter_entrada_cache(url_cache_key)
         tipo_cache_url = (
-            enviar_midia_cacheada(message.chat.id, url_cache_key, entrada_cache_url)
+            enviar_midia_cacheada(
+                message.chat.id,
+                url_cache_key,
+                entrada_cache_url,
+                reserva_download=reserva_download,
+            )
             if entrada_cache_url
             else None
         )
@@ -12245,7 +12267,12 @@ def processar_download_mercado_livre_clips(
         )
         entrada_cache = obter_entrada_cache(cache_key)
         tipo_cache = (
-            enviar_midia_cacheada(message.chat.id, cache_key, entrada_cache)
+            enviar_midia_cacheada(
+                message.chat.id,
+                cache_key,
+                entrada_cache,
+                reserva_download=reserva_download,
+            )
             if entrada_cache
             else None
         )
@@ -12320,7 +12347,11 @@ def processar_download_mercado_livre_clips(
             raise RuntimeError("ML_CLIPS_AUDIO_AUSENTE_APOS_PROCESSAMENTO")
 
         enviado, telegram_file_id, telegram_media_type, bytes_upload = (
-            enviar_arquivo_com_fallback(message.chat.id, arquivo_envio)
+            enviar_arquivo_com_fallback(
+                message.chat.id,
+                arquivo_envio,
+                reserva_download=reserva_download,
+            )
         )
         if not enviado:
             raise RuntimeError("ML_CLIPS_FALHA_ENVIO_TELEGRAM")
@@ -12613,7 +12644,12 @@ def processar_download_shopee(message, url, status_msg, vip_status, reserva_down
         url_cache_key, url_normalizada = montar_chave_cache_url(plataforma, url)
         entrada_cache_url = obter_entrada_cache(url_cache_key)
         tipo_cache_url = (
-            enviar_midia_cacheada(message.chat.id, url_cache_key, entrada_cache_url)
+            enviar_midia_cacheada(
+                message.chat.id,
+                url_cache_key,
+                entrada_cache_url,
+                reserva_download=reserva_download,
+            )
             if entrada_cache_url
             else None
         )
@@ -12662,7 +12698,12 @@ def processar_download_shopee(message, url, status_msg, vip_status, reserva_down
         )
         entrada_cache = obter_entrada_cache(cache_key)
         tipo_cache = (
-            enviar_midia_cacheada(message.chat.id, cache_key, entrada_cache)
+            enviar_midia_cacheada(
+                message.chat.id,
+                cache_key,
+                entrada_cache,
+                reserva_download=reserva_download,
+            )
             if entrada_cache
             else None
         )
@@ -12763,7 +12804,11 @@ def processar_download_shopee(message, url, status_msg, vip_status, reserva_down
             raise RuntimeError("SHOPEE_AUDIO_AUSENTE_APOS_PROCESSAMENTO")
 
         enviado, telegram_file_id, telegram_media_type, bytes_upload = (
-            enviar_arquivo_com_fallback(message.chat.id, arquivo_envio)
+            enviar_arquivo_com_fallback(
+                message.chat.id,
+                arquivo_envio,
+                reserva_download=reserva_download,
+            )
         )
         if not enviado:
             raise RuntimeError("SHOPEE_FALHA_ENVIO_TELEGRAM")
@@ -13013,6 +13058,7 @@ def _processar_download(message, url, status_msg, reserva_download=None, user=No
                     message.chat.id,
                     url_cache_key,
                     entrada_cache_url,
+                    reserva_download=reserva_download,
                 )
                 if entrada_cache_url
                 else None
@@ -13064,6 +13110,7 @@ def _processar_download(message, url, status_msg, reserva_download=None, user=No
                         message.chat.id,
                         cache_key,
                         entrada_cache,
+                        reserva_download=reserva_download,
                     )
                     if entrada_cache
                     else None
@@ -13144,7 +13191,11 @@ def _processar_download(message, url, status_msg, reserva_download=None, user=No
                     telegram_file_id,
                     telegram_media_type,
                     bytes_upload,
-                ) = enviar_arquivo_com_fallback(message.chat.id, arquivo_envio)
+                ) = enviar_arquivo_com_fallback(
+                    message.chat.id,
+                    arquivo_envio,
+                    reserva_download=reserva_download,
+                )
                 if not enviado:
                     raise Exception("Falha ao enviar arquivo ao Telegram")
 
@@ -13227,6 +13278,7 @@ def _processar_download(message, url, status_msg, reserva_download=None, user=No
                 message.chat.id,
                 url_cache_key,
                 entrada_cache_url,
+                reserva_download=reserva_download,
             )
             if entrada_cache_url
             else None
@@ -13316,6 +13368,7 @@ def _processar_download(message, url, status_msg, reserva_download=None, user=No
                 message.chat.id,
                 cache_key,
                 entrada_cache,
+                reserva_download=reserva_download,
             )
             if entrada_cache
             else None
@@ -13569,7 +13622,11 @@ def _processar_download(message, url, status_msg, reserva_download=None, user=No
             telegram_file_id,
             telegram_media_type,
             bytes_upload,
-        ) = enviar_arquivo_com_fallback(message.chat.id, arquivo_envio)
+        ) = enviar_arquivo_com_fallback(
+            message.chat.id,
+            arquivo_envio,
+            reserva_download=reserva_download,
+        )
         if not enviado:
             raise Exception("Falha ao enviar arquivo ao Telegram")
 
