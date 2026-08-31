@@ -6176,20 +6176,6 @@ def enviar_instrucoes_pix_efi(chat_id, pedido, plano):
 
     valor = int(pedido.get("valor_centavos") or plano.get("preco_centavos") or 0) / 100
     valor_formatado = f"{valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-    qr = gerar_qr_pix_buffer(pix_copy)
-    try:
-        bot.send_photo(
-            chat_id,
-            qr,
-            caption=(
-                f"💎 {plano.get('nome') or 'VIP'} — {plano.get('dias') or 30} dias\n"
-                f"💰 R$ {valor_formatado}\n\n"
-                "Escaneie o QR Code pelo aplicativo do seu banco."
-            ),
-        )
-    except Exception as exc:
-        logger.warning("[EFI_QR_ENVIO] erro=%s", sanitizar_erro_log(exc))
-        return False
 
     markup = types.InlineKeyboardMarkup(row_width=1)
     markup.add(
@@ -6198,19 +6184,32 @@ def enviar_instrucoes_pix_efi(chat_id, pedido, plano):
             callback_data=f"efi_check_{pedido['order_nsu']}",
         )
     )
-    texto = (
-        "📋 <b>PIX COPIA E COLA</b>\n\n"
+
+    nome_plano = html.escape(str(plano.get("nome") or "VIP"))
+    dias_plano = int(plano.get("dias") or 30)
+    caption = (
+        f"💎 <b>{nome_plano} — {dias_plano} dias</b>\n"
+        f"💰 <b>R$ {valor_formatado}</b>\n\n"
+        "📋 <b>PIX COPIA E COLA</b>\n"
         f"<code>{html.escape(pix_copy)}</code>\n\n"
+        "Escaneie o QR Code ou copie o código acima.\n"
         "Após o pagamento, o VIP será liberado automaticamente."
     )
-    return bool(
-        safe_send_message(
-            chat_id,
-            texto,
-            parse_mode="HTML",
-            reply_markup=markup,
+
+    qr = gerar_qr_pix_buffer(pix_copy)
+    try:
+        return bool(
+            bot.send_photo(
+                chat_id,
+                qr,
+                caption=caption,
+                parse_mode="HTML",
+                reply_markup=markup,
+            )
         )
-    )
+    except Exception as exc:
+        logger.warning("[EFI_QR_ENVIO] erro=%s", sanitizar_erro_log(exc))
+        return False
 
 
 def _registrar_funil_pago_efi(pedido):
