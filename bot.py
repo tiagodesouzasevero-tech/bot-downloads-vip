@@ -14435,29 +14435,21 @@ def _processar_download(message, url, status_msg, reserva_download=None, user=No
                                     "INSTAGRAM_AUDIO_AUSENTE_NO_ARQUIVO "
                                     f"metadata={audio_instagram_esperado}"
                                 )
-                                # Os IDs diretos/HTTP são justamente os formatos
-                                # que o yt-dlp marca como codec desconhecido. Testa
-                                # todos eles antes de aceitar o fallback mudo.
-                                if fmt in formatos_progressivos_ig:
-                                    logger.warning(
-                                        "[INSTAGRAM_PROGRESSIVO_SEM_AUDIO] "
-                                        f"formato={fmt} tentando_proximo=True"
-                                    )
-                                    cleanup_prefix(prefix)
-                                    continue
-                                if audio_instagram_esperado is True:
-                                    logger.warning(
-                                        "[INSTAGRAM_AUDIO_RETRY] "
-                                        f"audio_esperado={audio_instagram_esperado} "
-                                        f"formato={fmt} "
-                                        f"arquivo_ref={referencia_arquivo_log(arquivo_baixado)}"
-                                    )
-                                    cleanup_prefix(prefix)
-                                    continue
+                                # Áudio passa a ser requisito obrigatório para
+                                # Instagram. Mesmo quando os metadados públicos
+                                # não conseguem confirmar a faixa de áudio, um
+                                # arquivo realmente mudo nunca é aceito como
+                                # sucesso enquanto existirem outros seletores.
                                 logger.warning(
-                                    "[INSTAGRAM_FALLBACK_SEM_AUDIO] "
-                                    f"formato={fmt} metadata={audio_instagram_esperado}"
+                                    "[INSTAGRAM_AUDIO_RETRY] "
+                                    f"audio_esperado={audio_instagram_esperado} "
+                                    f"formato={fmt} "
+                                    f"progressivo={fmt in formatos_progressivos_ig} "
+                                    "tentando_proximo=True "
+                                    f"arquivo_ref={referencia_arquivo_log(arquivo_baixado)}"
                                 )
+                                cleanup_prefix(prefix)
+                                continue
                         if is_facebook_reel:
                             info_arquivo_baixado = obter_info_midia(arquivo_baixado)
                             if not arquivo_possui_audio(info_arquivo_baixado):
@@ -14531,6 +14523,20 @@ def _processar_download(message, url, status_msg, reserva_download=None, user=No
                     f"arquivo_ref={referencia_arquivo_log(arquivo_envio)} "
                     f"erro={sanitizar_erro_log(e)}"
                 )
+                raise FalhaComponenteDownload(
+                    plataforma,
+                    "INSTAGRAM_AUDIO_VALIDACAO_FALHOU",
+                ) from e
+            if instagram_sem_audio:
+                logger.warning(
+                    "[INSTAGRAM_AUDIO_REJEITADO_FINAL] "
+                    f"arquivo_ref={referencia_arquivo_log(arquivo_envio)} "
+                    "envio_bloqueado=True"
+                )
+                raise FalhaComponenteDownload(
+                    plataforma,
+                    "INSTAGRAM_AUDIO_AUSENTE_NO_ARQUIVO",
+                )
 
         registrar_sucesso_componente("Processamento")
 
@@ -14547,25 +14553,18 @@ def _processar_download(message, url, status_msg, reserva_download=None, user=No
         if not enviado:
             raise Exception("Falha ao enviar arquivo ao Telegram")
 
-        # Nunca guarda no cache um Reel do Instagram que chegou sem áudio.
-        # Além de evitar repetir um arquivo defeituoso, isso permite que uma
-        # tentativa futura use novamente as rotas web/iOS do extrator.
-        if is_instagram and instagram_sem_audio:
-            logger.warning(
-                "[INSTAGRAM_CACHE_IGNORADO_SEM_AUDIO] "
-                f"url_ref={referencia_url_log(url)}"
-            )
-        else:
-            salvar_file_id_cache(
-                cache_key,
-                cache_source_id,
-                plataforma,
-                telegram_file_id,
-                telegram_media_type,
-                url_cache_key=url_cache_key,
-                url_normalizada=url_normalizada,
-                media_size_bytes=bytes_upload,
-            )
+        # O guard final acima impede que um Reel sem áudio chegue a esta
+        # etapa; portanto todo Instagram salvo no cache já foi validado.
+        salvar_file_id_cache(
+            cache_key,
+            cache_source_id,
+            plataforma,
+            telegram_file_id,
+            telegram_media_type,
+            url_cache_key=url_cache_key,
+            url_normalizada=url_normalizada,
+            media_size_bytes=bytes_upload,
+        )
 
         registrar_download_diario(
             vip_status,
@@ -14583,16 +14582,6 @@ def _processar_download(message, url, status_msg, reserva_download=None, user=No
                 message.from_user.id,
             )
 
-        if is_instagram and instagram_sem_audio:
-            logger.warning(
-                "[INSTAGRAM_SEM_AUDIO_ENTREGUE] "
-                f"user_ref={referencia_usuario_log(message.from_user.id)} "
-                f"url_ref={referencia_url_log(url)}"
-            )
-            safe_send_message(
-                message.chat.id,
-                "🔇 Não foi possível incluir o áudio nesta versão.",
-            )
 
         if status_msg:
             safe_delete_message(message.chat.id, status_msg.message_id)
