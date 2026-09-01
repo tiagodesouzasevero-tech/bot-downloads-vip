@@ -10549,6 +10549,126 @@ def verificar_backup_admin(message):
     )
 
 
+@bot.message_handler(commands=["limparcache"])
+def cmd_limparcache(message):
+    if not exigir_admin_privado(message):
+        return
+
+    texto = str(getattr(message, "text", "") or "")
+    partes = texto.split(maxsplit=1)
+    if len(partes) < 2 or not partes[1].strip():
+        safe_reply_to(
+            message,
+            "Uso: /limparcache <link do vídeo>",
+        )
+        return
+
+    url_original = partes[1].strip()
+    if not validar_url_http_publica(url_original, resolver_dns=False):
+        safe_reply_to(message, "❌ Link inválido.")
+        return
+
+    plataformas = detectar_plataforma(url_original)
+    if not any(plataformas):
+        safe_reply_to(message, "❌ Plataforma não reconhecida.")
+        return
+
+    try:
+        url_cache = resolver_url_compartilhada(url_original)
+        plataformas_resolvidas = detectar_plataforma(url_cache)
+        if any(plataformas_resolvidas):
+            plataformas = plataformas_resolvidas
+
+        (
+            is_pinterest,
+            _is_tiktok,
+            is_instagram,
+            _is_rednote,
+            is_facebook_reel,
+            _is_shopee,
+            is_mercado_livre_clips,
+        ) = plataformas
+
+        if is_instagram:
+            url_cache = normalizar_url_instagram(url_cache)
+        elif is_facebook_reel:
+            url_cache = normalizar_url_facebook_reel(url_cache)
+        elif is_mercado_livre_clips:
+            url_cache = normalizar_url_mercado_livre_clips(url_cache)
+
+        if is_pinterest:
+            url_cache = resolver_link_pinterest(url_cache)
+            plataformas_resolvidas = detectar_plataforma(url_cache)
+            if any(plataformas_resolvidas):
+                plataformas = plataformas_resolvidas
+
+        plataforma = nome_plataforma(*plataformas)
+        if plataforma == "Desconhecida":
+            safe_reply_to(message, "❌ Não consegui identificar a plataforma.")
+            return
+
+        url_cache_key, _url_normalizada = montar_chave_cache_url(
+            plataforma,
+            url_cache,
+        )
+
+        entrada_url = midia_cache_col.find_one(
+            {"_id": url_cache_key},
+            {"source_hash": 1, "cache_kind": 1, "plataforma": 1},
+        )
+
+        if not entrada_url:
+            registrar_sucesso_componente("MongoDB")
+            safe_reply_to(
+                message,
+                "ℹ️ Não encontrei cache salvo para esse link.",
+            )
+            return
+
+        source_hash = str(entrada_url.get("source_hash") or "").strip()
+        if source_hash:
+            resultado = midia_cache_col.delete_many(
+                {
+                    "source_hash": source_hash,
+                    "plataforma": plataforma,
+                }
+            )
+        else:
+            resultado = midia_cache_col.delete_one({"_id": url_cache_key})
+
+        registrar_sucesso_componente("MongoDB")
+        removidos = int(getattr(resultado, "deleted_count", 0) or 0)
+
+        logger.info(
+            "[CACHE_ADMIN_LIMPEZA] "
+            f"admin_ref={referencia_usuario_log(message.from_user.id)} "
+            f"plataforma={plataforma} removidos={removidos} "
+            f"url_ref={referencia_privada_log('url', url_cache, tamanho=16)}"
+        )
+
+        if removidos:
+            safe_reply_to(
+                message,
+                f"✅ Cache removido com sucesso. Entradas apagadas: {removidos}.",
+            )
+        else:
+            safe_reply_to(
+                message,
+                "ℹ️ Nenhuma entrada de cache precisou ser removida.",
+            )
+    except Exception as e:
+        logger.warning(
+            "[CACHE_ADMIN_LIMPEZA_ERRO] "
+            f"admin_ref={referencia_usuario_log(message.from_user.id)} "
+            f"erro={sanitizar_erro_log(e)}"
+        )
+        registrar_falha_componente("MongoDB", e)
+        safe_reply_to(
+            message,
+            "❌ Não consegui limpar o cache desse vídeo agora.",
+        )
+
+
 @bot.message_handler(commands=["painel"])
 @bot.message_handler(func=lambda m: m.text == "⚙️ Painel Admin")
 def painel_admin(message):
