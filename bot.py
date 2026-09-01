@@ -196,18 +196,45 @@ SMART_COMPRESSION_BITRATE_KBPS = get_env_int(
     "SMART_COMPRESSION_BITRATE_KBPS", 2500, 1200, 10000
 )
 SMART_COMPRESSION_CRF = get_env_int(
-    "SMART_COMPRESSION_CRF", 27, 18, 35
+    "SMART_COMPRESSION_CRF", 28, 18, 35
 )
 SMART_COMPRESSION_MAX_FPS = get_env_int(
-    "SMART_COMPRESSION_MAX_FPS", 25, 20, 30
+    "SMART_COMPRESSION_MAX_FPS", 30, 20, 30
 )
 SMART_COMPRESSION_PRESET = (
-    os.environ.get("SMART_COMPRESSION_PRESET", "fast").strip().lower() or "fast"
+    os.environ.get("SMART_COMPRESSION_PRESET", "veryfast").strip().lower()
+    or "veryfast"
 )
 if SMART_COMPRESSION_PRESET not in {
     "ultrafast", "superfast", "veryfast", "faster", "fast", "medium"
 }:
-    SMART_COMPRESSION_PRESET = "fast"
+    SMART_COMPRESSION_PRESET = "veryfast"
+
+SHOPEE_SMART_COMPRESSION_CRF = get_env_int(
+    "SHOPEE_SMART_COMPRESSION_CRF", 28, 18, 35
+)
+SHOPEE_SMART_COMPRESSION_MAX_FPS = get_env_int(
+    "SHOPEE_SMART_COMPRESSION_MAX_FPS", 25, 20, 30
+)
+SHOPEE_SMART_COMPRESSION_PRESET = (
+    os.environ.get("SHOPEE_SMART_COMPRESSION_PRESET", "fast").strip().lower()
+    or "fast"
+)
+if SHOPEE_SMART_COMPRESSION_PRESET not in {
+    "ultrafast", "superfast", "veryfast", "faster", "fast", "medium"
+}:
+    SHOPEE_SMART_COMPRESSION_PRESET = "fast"
+
+SHOPEE_SMART_AUDIO_BITRATE = (
+    os.environ.get("SHOPEE_SMART_AUDIO_BITRATE", "48k").strip() or "48k"
+)
+SHOPEE_SMART_UNSHARP_FILTER = (
+    os.environ.get(
+        "SHOPEE_SMART_UNSHARP_FILTER",
+        "unsharp=5:5:0.25:5:5:0.0",
+    ).strip()
+    or "unsharp=5:5:0.25:5:5:0.0"
+)
 SMART_COMPRESSION_MIN_SIZE_MB = get_env_int(
     "SMART_COMPRESSION_MIN_SIZE_MB", 4, 1, 50
 )
@@ -1649,12 +1676,17 @@ def deve_compactar_midia_inteligente(arquivo_entrada, info=None):
     return bitrate_kbps > SMART_COMPRESSION_BITRATE_KBPS, bitrate_kbps
 
 
-def montar_vf_compressao_inteligente(info=None):
-    """Mantém resolução até 720x1280 e limita somente FPS acima do alvo."""
+def montar_vf_compressao_inteligente(
+    info=None,
+    max_fps=None,
+    adicionar_nitidez=False,
+):
+    """Mantém até 720x1280 e aplica apenas filtros necessários ao perfil."""
     info = info or {}
     width = info.get("width") or 0
     height = info.get("height") or 0
     fps = info.get("fps") or 0
+    max_fps = int(max_fps or SMART_COMPRESSION_MAX_FPS)
 
     filtros = []
     if width > 720 or height > 1280:
@@ -1662,25 +1694,50 @@ def montar_vf_compressao_inteligente(info=None):
             "scale=720:1280:force_original_aspect_ratio=decrease:"
             "force_divisible_by=2"
         )
-    if fps > SMART_COMPRESSION_MAX_FPS + 0.5:
-        filtros.append(f"fps={SMART_COMPRESSION_MAX_FPS}")
+    if fps > max_fps + 0.5:
+        filtros.append(f"fps={max_fps}")
+
+    # Nitidez deliberadamente leve e exclusiva da Shopee.
+    # Evita halos/agressividade e tenta compensar a fonte mais "macia".
+    if adicionar_nitidez:
+        filtros.append(SHOPEE_SMART_UNSHARP_FILTER)
 
     return ",".join(filtros) if filtros else None
 
 
-def converter_compressao_inteligente(arquivo_entrada, info=None):
+def converter_compressao_inteligente(
+    arquivo_entrada,
+    info=None,
+    plataforma=None,
+):
     """
-    Perfil econômico com foco em qualidade perceptível:
-    H.264 CRF 27, preset fast, áudio 64k e no máximo 25 fps.
-    É usado somente quando a regra de compressão inteligente já decidiu
-    que o arquivo original está pesado demais.
+    Compressão inteligente com dois perfis:
+    - Shopee pesada: 25 fps, preset fast, áudio 48k e nitidez leve.
+    - Demais plataformas: perfil conservador, até 30 fps, veryfast, sem nitidez.
     """
     atualizar_heartbeat_worker("compactando_inteligente")
     info = info or obter_info_midia(arquivo_entrada) or {}
+
+    plataforma_normalizada = str(plataforma or "").strip().lower()
+    is_shopee = plataforma_normalizada in ("shopee", "shopee video")
+
+    if is_shopee:
+        crf = SHOPEE_SMART_COMPRESSION_CRF
+        max_fps = SHOPEE_SMART_COMPRESSION_MAX_FPS
+        preset = SHOPEE_SMART_COMPRESSION_PRESET
+        audio_bitrate = SHOPEE_SMART_AUDIO_BITRATE
+        adicionar_nitidez = True
+        perfil_nome = "shopee_nitidez_v1"
+    else:
+        crf = SMART_COMPRESSION_CRF
+        max_fps = SMART_COMPRESSION_MAX_FPS
+        preset = SMART_COMPRESSION_PRESET
+        audio_bitrate = AUDIO_BITRATE
+        adicionar_nitidez = False
+        perfil_nome = "geral_conservador_v1"
+
     base, _ = os.path.splitext(arquivo_entrada)
-    arquivo_saida = (
-        f"{base}_smart_720x1280_{SMART_COMPRESSION_MAX_FPS}fps.mp4"
-    )
+    arquivo_saida = f"{base}_smart_{max_fps}fps.mp4"
 
     cmd = [
         "ffmpeg",
@@ -1689,21 +1746,32 @@ def converter_compressao_inteligente(arquivo_entrada, info=None):
         "-i", arquivo_entrada,
     ]
 
-    vf = montar_vf_compressao_inteligente(info)
+    vf = montar_vf_compressao_inteligente(
+        info,
+        max_fps=max_fps,
+        adicionar_nitidez=adicionar_nitidez,
+    )
     if vf:
         cmd += ["-vf", vf]
 
     cmd += [
         "-c:v", "libx264",
-        "-preset", SMART_COMPRESSION_PRESET,
-        "-crf", str(SMART_COMPRESSION_CRF),
+        "-preset", preset,
+        "-crf", str(crf),
         "-threads", str(FFMPEG_THREADS),
         "-pix_fmt", "yuv420p",
         "-c:a", "aac",
-        "-b:a", AUDIO_BITRATE,
+        "-b:a", audio_bitrate,
         "-movflags", "+faststart",
         arquivo_saida,
     ]
+
+    logger.info(
+        "[MIDIA_PERFIL_COMPRESSAO] "
+        f"plataforma={plataforma} perfil={perfil_nome} "
+        f"crf={crf} preset={preset} fps_max={max_fps} "
+        f"audio={audio_bitrate} nitidez={adicionar_nitidez}"
+    )
 
     try:
         resultado = executar_ffmpeg_medido(
@@ -1718,10 +1786,11 @@ def converter_compressao_inteligente(arquivo_entrada, info=None):
         ) from e
 
     if resultado.returncode != 0:
+        detalhe = sanitizar_erro_log(resultado.stderr or "")
         raise FalhaComponenteDownload(
             "Processamento",
             f"FFMPEG_COMPRESSAO_INTELIGENTE_FALHOU "
-            f"codigo={resultado.returncode}",
+            f"codigo={resultado.returncode} erro={detalhe}",
         )
 
     if not os.path.exists(arquivo_saida):
@@ -1752,15 +1821,13 @@ def compactar_midia_inteligente(arquivo_entrada, info=None, plataforma=None):
         f"duracao={float(info.get('duration') or 0):.2f} "
         f"bitrate_kbps={bitrate_kbps:.0f} "
         f"limite_kbps={SMART_COMPRESSION_BITRATE_KBPS} "
-        f"crf={SMART_COMPRESSION_CRF} "
-        f"preset={SMART_COMPRESSION_PRESET} "
-        f"fps_max={SMART_COMPRESSION_MAX_FPS} "
-        f"audio={AUDIO_BITRATE}"
+        f"perfil_plataforma=True"
     )
 
     arquivo_compactado = converter_compressao_inteligente(
         arquivo_entrada,
         info=info,
+        plataforma=plataforma,
     )
 
     try:
