@@ -21,7 +21,7 @@ from collections import defaultdict, deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from http.cookies import SimpleCookie
 from queue import Empty, Full, PriorityQueue
-from threading import Event, Lock, Thread, enumerate as enumerate_threads
+from threading import Event, Lock, Thread, local, enumerate as enumerate_threads
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from io import BytesIO
@@ -1493,6 +1493,117 @@ def permitir_hevc_por_plataforma(plataforma=None):
     return plataforma in ("tiktok", "rednote")
 
 
+# Telemetria econômica acumulada apenas em memória durante cada download.
+DOWNLOAD_TELEMETRY_LOCAL = local()
+
+PLATAFORMA_METRICA_CHAVES = {
+    "tiktok": "tiktok",
+    "pinterest": "pinterest",
+    "shopee video": "shopee",
+    "mercado livre clips": "mercado_livre",
+    "rednote": "rednote",
+    "instagram": "instagram",
+    "facebook reels": "facebook",
+}
+
+
+def chave_metrica_plataforma(plataforma):
+    return PLATAFORMA_METRICA_CHAVES.get(
+        str(plataforma or "").strip().lower(),
+        "outras",
+    )
+
+
+def iniciar_telemetria_download(plataforma=None):
+    dados = {
+        "plataforma": plataforma,
+        "cache_bytes_estimados": 0,
+        "ffmpeg_execucoes": 0,
+        "ffmpeg_tempo_ms": 0,
+        "compressao_tentativas": 0,
+        "compressao_aplicadas": 0,
+        "compressao_descartadas": 0,
+        "compressao_bytes_entrada": 0,
+        "compressao_bytes_saida": 0,
+        "compressao_bytes_economizados": 0,
+    }
+    DOWNLOAD_TELEMETRY_LOCAL.dados = dados
+    return dados
+
+
+def obter_telemetria_download():
+    dados = getattr(DOWNLOAD_TELEMETRY_LOCAL, "dados", None)
+    return dados if isinstance(dados, dict) else None
+
+
+def atualizar_plataforma_telemetria(plataforma):
+    dados = obter_telemetria_download()
+    if dados is not None:
+        dados["plataforma"] = plataforma
+
+
+def registrar_cache_hit_telemetria(media_size_bytes):
+    dados = obter_telemetria_download()
+    if dados is None:
+        return
+    try:
+        media_size_bytes = max(0, int(media_size_bytes or 0))
+    except (TypeError, ValueError):
+        media_size_bytes = 0
+    dados["cache_bytes_estimados"] = media_size_bytes
+
+
+def registrar_tempo_ffmpeg(segundos):
+    dados = obter_telemetria_download()
+    if dados is None:
+        return
+    try:
+        tempo_ms = max(0, int(round(float(segundos) * 1000)))
+    except (TypeError, ValueError):
+        tempo_ms = 0
+    dados["ffmpeg_execucoes"] = int(dados.get("ffmpeg_execucoes") or 0) + 1
+    dados["ffmpeg_tempo_ms"] = int(dados.get("ffmpeg_tempo_ms") or 0) + tempo_ms
+
+
+def registrar_resultado_compressao(tamanho_original, tamanho_saida, aplicada):
+    dados = obter_telemetria_download()
+    if dados is None:
+        return
+    try:
+        tamanho_original = max(0, int(tamanho_original or 0))
+        tamanho_saida = max(0, int(tamanho_saida or 0))
+    except (TypeError, ValueError):
+        return
+    dados["compressao_tentativas"] = int(dados.get("compressao_tentativas") or 0) + 1
+    dados["compressao_bytes_entrada"] = int(dados.get("compressao_bytes_entrada") or 0) + tamanho_original
+    dados["compressao_bytes_saida"] = int(dados.get("compressao_bytes_saida") or 0) + tamanho_saida
+    if aplicada:
+        dados["compressao_aplicadas"] = int(dados.get("compressao_aplicadas") or 0) + 1
+        dados["compressao_bytes_economizados"] = int(dados.get("compressao_bytes_economizados") or 0) + max(0, tamanho_original - tamanho_saida)
+    else:
+        dados["compressao_descartadas"] = int(dados.get("compressao_descartadas") or 0) + 1
+
+
+def limpar_telemetria_download():
+    if hasattr(DOWNLOAD_TELEMETRY_LOCAL, "dados"):
+        del DOWNLOAD_TELEMETRY_LOCAL.dados
+
+
+def executar_ffmpeg_medido(cmd, timeout):
+    """Mede FFmpeg em memória; nenhuma escrita extra é feita aqui."""
+    inicio = time.monotonic()
+    try:
+        return subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout,
+        )
+    finally:
+        registrar_tempo_ffmpeg(time.monotonic() - inicio)
+
+
 def deve_compactar_midia_inteligente(arquivo_entrada, info=None):
     """Compacta só H.264 pesado; arquivos leves e HEVC eficiente ficam intactos."""
     info = info or {}
@@ -1559,6 +1670,11 @@ def compactar_midia_inteligente(arquivo_entrada, info=None, plataforma=None):
     # Se a redução for pequena, preserva o original para evitar perda de
     # qualidade sem benefício real. O FFmpeg só é usado em arquivos pesados.
     if tamanho_compactado >= tamanho_original * 0.85:
+        registrar_resultado_compressao(
+            tamanho_original,
+            tamanho_compactado,
+            aplicada=False,
+        )
         logger.info(
             "[MIDIA_COMPACTACAO_INTELIGENTE] "
             f"plataforma={plataforma} mantido_original=True "
@@ -1571,6 +1687,11 @@ def compactar_midia_inteligente(arquivo_entrada, info=None, plataforma=None):
             pass
         return arquivo_entrada
 
+    registrar_resultado_compressao(
+        tamanho_original,
+        tamanho_compactado,
+        aplicada=True,
+    )
     logger.info(
         "[MIDIA_COMPACTACAO_INTELIGENTE] "
         f"plataforma={plataforma} concluida=True "
@@ -1598,12 +1719,9 @@ def remuxar_para_mp4_faststart(arquivo_entrada):
 
     try:
         atualizar_heartbeat_worker("remux_ffmpeg")
-        resultado = subprocess.run(
+        resultado = executar_ffmpeg_medido(
             cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=FFMPEG_TIMEOUT_SECONDS,
+            FFMPEG_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired as e:
         raise FalhaComponenteDownload(
@@ -1688,12 +1806,9 @@ def converter_para_h264_compativel(arquivo_entrada, info=None):
 
     try:
         atualizar_heartbeat_worker("convertendo_h264")
-        resultado = subprocess.run(
+        resultado = executar_ffmpeg_medido(
             cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=FFMPEG_TIMEOUT_SECONDS,
+            FFMPEG_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired as e:
         raise FalhaComponenteDownload(
@@ -1754,12 +1869,9 @@ def converter_para_720x1280_30fps(arquivo_entrada, info=None):
 
     try:
         atualizar_heartbeat_worker("convertendo_video")
-        resultado = subprocess.run(
+        resultado = executar_ffmpeg_medido(
             cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=FFMPEG_TIMEOUT_SECONDS,
+            FFMPEG_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired as e:
         raise FalhaComponenteDownload(
@@ -3036,9 +3148,14 @@ def obter_entrada_cache(cache_key):
         if telegram_media_type not in ("video", "document"):
             telegram_media_type = None
         registrar_sucesso_componente("MongoDB")
+        try:
+            media_size_bytes = max(0, int(doc.get("media_size_bytes") or 0))
+        except (TypeError, ValueError):
+            media_size_bytes = 0
         return {
             "telegram_file_id": telegram_file_id,
             "telegram_media_type": telegram_media_type,
+            "media_size_bytes": media_size_bytes,
         }
     except Exception as e:
         logger.warning(
@@ -3057,6 +3174,7 @@ def salvar_file_id_cache(
     telegram_media_type,
     url_cache_key=None,
     url_normalizada=None,
+    media_size_bytes=0,
 ):
     if not telegram_file_id:
         return
@@ -3068,6 +3186,10 @@ def salvar_file_id_cache(
         return
     try:
         agora = datetime.now(timezone.utc).replace(tzinfo=None)
+        try:
+            media_size_bytes = max(0, int(media_size_bytes or 0))
+        except (TypeError, ValueError):
+            media_size_bytes = 0
         documentos = [
             (cache_key, "source", source_id),
         ]
@@ -3094,6 +3216,7 @@ def salvar_file_id_cache(
                             "plataforma": plataforma,
                             "telegram_file_id": telegram_file_id,
                             "telegram_media_type": telegram_media_type,
+                            "media_size_bytes": media_size_bytes,
                             "media_profile": MEDIA_PROFILE_VERSION,
                             "updated_at": agora,
                             "expires_at": agora + timedelta(days=MEDIA_CACHE_DAYS),
@@ -3269,6 +3392,9 @@ def enviar_midia_cacheada(
                         )
                         registrar_falha_componente("MongoDB", e)
                 registrar_sucesso_componente("Telegram")
+                registrar_cache_hit_telemetria(
+                    entrada_cache.get("media_size_bytes", 0)
+                )
                 return telegram_media_type
             except Exception as e:
                 classificacao = classificar_erro_envio_cache(e)
@@ -3385,6 +3511,8 @@ def tentar_entrega_cache_url_rapida(
         admin_status=message.from_user.id == ADMIN_ID,
         user_id=message.from_user.id,
         user=user,
+        plataforma=plataforma,
+        bytes_cache_estimados=entrada_cache.get("media_size_bytes", 0),
     )
     if reserva_download:
         confirmar_download_gratis(
@@ -5869,6 +5997,18 @@ def inicializar_metricas_diarias():
                     "downloads_cache_midia": 0,
                     "downloads_upload": 0,
                     "bytes_upload_telegram": 0,
+                    "bytes_upload_usuarios": 0,
+                    "bytes_upload_admin": 0,
+                    "bytes_cache_economizados_estimados": 0,
+                    "cache_hits_tamanho_conhecido": 0,
+                    "ffmpeg_execucoes": 0,
+                    "ffmpeg_tempo_ms": 0,
+                    "compressao_tentativas": 0,
+                    "compressao_aplicadas": 0,
+                    "compressao_descartadas": 0,
+                    "compressao_bytes_entrada": 0,
+                    "compressao_bytes_saida": 0,
+                    "compressao_bytes_economizados": 0,
                     "created_at": agora,
                     "updated_at": agora,
                 }
@@ -5890,8 +6030,10 @@ def registrar_download_diario(
     admin_status=False,
     user_id=None,
     user=None,
+    plataforma=None,
+    bytes_cache_estimados=0,
 ):
-    """Registra o download e sua forma de entrega na mesma escrita diária."""
+    """Registra entrega e custo na mesma escrita diária já existente."""
     try:
         hoje = hoje_str()
         agora = agora_tz()
@@ -5910,32 +6052,69 @@ def registrar_download_diario(
             )
             tipo_entrega = "upload"
             campo_entrega = campos_entrega[tipo_entrega]
-
         try:
             bytes_upload = max(0, int(bytes_upload or 0))
         except (TypeError, ValueError):
             bytes_upload = 0
-
-        incrementos = {campo_entrega: 1}
+        try:
+            bytes_cache_estimados = max(0, int(bytes_cache_estimados or 0))
+        except (TypeError, ValueError):
+            bytes_cache_estimados = 0
+        telemetria = obter_telemetria_download() or {}
+        if not plataforma:
+            plataforma = telemetria.get("plataforma") or "Desconhecida"
+        if not bytes_cache_estimados:
+            try:
+                bytes_cache_estimados = max(0, int(telemetria.get("cache_bytes_estimados") or 0))
+            except (TypeError, ValueError):
+                bytes_cache_estimados = 0
+        plataforma_chave = chave_metrica_plataforma(plataforma)
+        prefixo = f"plataformas.{plataforma_chave}"
+        incrementos = {campo_entrega: 1, f"{prefixo}.downloads": 1}
         if admin_status:
             incrementos["downloads_admin_teste"] = 1
+            incrementos[f"{prefixo}.downloads_admin"] = 1
         else:
             incrementos["downloads_total"] = 1
             incrementos[campo_tipo] = 1
+            incrementos[f"{prefixo}.downloads_usuarios"] = 1
         if tipo_entrega == "upload":
             incrementos["bytes_upload_telegram"] = bytes_upload
-
+            incrementos[f"{prefixo}.uploads"] = 1
+            incrementos[f"{prefixo}.bytes_upload"] = bytes_upload
+            if admin_status:
+                incrementos["bytes_upload_admin"] = bytes_upload
+            else:
+                incrementos["bytes_upload_usuarios"] = bytes_upload
+        else:
+            incrementos[f"{prefixo}.cache_hits"] = 1
+            if bytes_cache_estimados > 0:
+                incrementos["bytes_cache_economizados_estimados"] = bytes_cache_estimados
+                incrementos["cache_hits_tamanho_conhecido"] = 1
+                incrementos[f"{prefixo}.bytes_cache_economizados_estimados"] = bytes_cache_estimados
+        for campo in (
+            "ffmpeg_execucoes", "ffmpeg_tempo_ms",
+            "compressao_tentativas", "compressao_aplicadas",
+            "compressao_descartadas", "compressao_bytes_entrada",
+            "compressao_bytes_saida", "compressao_bytes_economizados",
+        ):
+            try:
+                valor = max(0, int(telemetria.get(campo) or 0))
+            except (TypeError, ValueError):
+                valor = 0
+            if valor:
+                incrementos[campo] = valor
+                incrementos[f"{prefixo}.{campo}"] = valor
         metricas_col.update_one(
             {"_id": hoje},
             {
                 "$inc": incrementos,
                 "$set": {
                     "updated_at": agora,
+                    "telemetria_custos_versao": 1,
                 },
-                "$setOnInsert": {
-                    "data": hoje,
-                    "created_at": agora,
-                },
+                "$min": {"telemetria_custos_desde": agora},
+                "$setOnInsert": {"data": hoje, "created_at": agora},
             },
             upsert=True,
         )
@@ -5943,9 +6122,8 @@ def registrar_download_diario(
     except Exception as e:
         logger.error(
             f"[METRICAS_DOWNLOAD] vip={vip_status} admin={admin_status} "
-            f"tipo={tipo_entrega} "
-            f"bytes_upload={bytes_upload} "
-            f"erro={sanitizar_erro_log(e)}"
+            f"tipo={tipo_entrega} plataforma={plataforma} "
+            f"bytes_upload={bytes_upload} erro={sanitizar_erro_log(e)}"
         )
         registrar_falha_componente("MongoDB", e)
 
@@ -10742,6 +10920,25 @@ def painel_admin(message):
         bytes_upload_hoje = int(
             metricas_hoje.get("bytes_upload_telegram", 0) or 0
         )
+        bytes_upload_usuarios_hoje = int(metricas_hoje.get("bytes_upload_usuarios", 0) or 0)
+        bytes_upload_admin_hoje = int(metricas_hoje.get("bytes_upload_admin", 0) or 0)
+        bytes_cache_economizados_hoje = int(metricas_hoje.get("bytes_cache_economizados_estimados", 0) or 0)
+        cache_hits_tamanho_conhecido = int(metricas_hoje.get("cache_hits_tamanho_conhecido", 0) or 0)
+        ffmpeg_execucoes_hoje = int(metricas_hoje.get("ffmpeg_execucoes", 0) or 0)
+        ffmpeg_tempo_ms_hoje = int(metricas_hoje.get("ffmpeg_tempo_ms", 0) or 0)
+        compressao_aplicadas_hoje = int(metricas_hoje.get("compressao_aplicadas", 0) or 0)
+        compressao_descartadas_hoje = int(metricas_hoje.get("compressao_descartadas", 0) or 0)
+        compressao_entrada_hoje = int(metricas_hoje.get("compressao_bytes_entrada", 0) or 0)
+        compressao_saida_hoje = int(metricas_hoje.get("compressao_bytes_saida", 0) or 0)
+        compressao_economia_hoje = int(metricas_hoje.get("compressao_bytes_economizados", 0) or 0)
+        telemetria_custos_desde = metricas_hoje.get("telemetria_custos_desde")
+        if isinstance(telemetria_custos_desde, datetime):
+            if telemetria_custos_desde.tzinfo is None:
+                telemetria_custos_desde = telemetria_custos_desde.replace(tzinfo=timezone.utc)
+            telemetria_custos_desde = telemetria_custos_desde.astimezone(TZ)
+            texto_telemetria_desde = telemetria_custos_desde.strftime("%H:%M")
+        else:
+            texto_telemetria_desde = "agora"
         cache_total_hoje = cache_url_hoje + cache_midia_hoje
         entregas_medidas_hoje = cache_total_hoje + uploads_hoje
         entregas_operacionais_hoje = (
@@ -10764,6 +10961,32 @@ def painel_admin(message):
         })
         pedidos_pagos = pedidos_col.count_documents({"status": "paid"})
 
+        percentual_compressao = (
+            compressao_economia_hoje * 100 / compressao_entrada_hoje
+            if compressao_entrada_hoje > 0 else 0.0
+        )
+        plataformas_metricas = metricas_hoje.get("plataformas") or {}
+        linhas_plataformas = []
+        for nome_exibicao, chave in (
+            ("Shopee", "shopee"), ("TikTok", "tiktok"),
+            ("Pinterest", "pinterest"), ("Mercado Livre", "mercado_livre"),
+            ("RedNote", "rednote"), ("Instagram", "instagram"),
+            ("Facebook", "facebook"), ("Outras", "outras"),
+        ):
+            dados = plataformas_metricas.get(chave) or {}
+            downloads = int(dados.get("downloads", 0) or 0)
+            if downloads <= 0:
+                continue
+            cache_hits = int(dados.get("cache_hits", 0) or 0)
+            bytes_plataforma = int(dados.get("bytes_upload", 0) or 0)
+            ffmpeg_ms = int(dados.get("ffmpeg_tempo_ms", 0) or 0)
+            linhas_plataformas.append(
+                f"• {nome_exibicao}: `{downloads}` • "
+                f"`{formatar_tamanho_bytes(bytes_plataforma)}` upload • "
+                f"`{cache_hits}` cache • `{ffmpeg_ms / 1000:.1f}s` FFmpeg"
+            )
+        texto_plataformas = "\n".join(linhas_plataformas) if linhas_plataformas else "• Sem entregas detalhadas ainda"
+
         resumo_admin = (
             "⚙️ *Painel Admin*\n\n"
             f"👥 Usuários: `{total_users}`\n"
@@ -10776,8 +10999,19 @@ def painel_admin(message):
             f"   ├ 🔗 Por URL: `{cache_url_hoje}`\n"
             f"   └ 🎞️ Por mídia: `{cache_midia_hoje}`\n"
             f"⬆️ Uploads novos: `{uploads_hoje}`\n"
-            f"🌐 Mídia enviada: `{formatar_tamanho_bytes(bytes_upload_hoje)}`"
-            f"{cobertura_metricas}\n"
+            f"🌐 Mídia enviada: `{formatar_tamanho_bytes(bytes_upload_hoje)}`\n"
+            f"   ├ 👥 Usuários: `{formatar_tamanho_bytes(bytes_upload_usuarios_hoje)}`\n"
+            f"   └ 🧪 Admin: `{formatar_tamanho_bytes(bytes_upload_admin_hoje)}`\n"
+            f"💰 Telemetria detalhada desde: `{texto_telemetria_desde}`\n"
+            f"💾 Cache evitou ~`{formatar_tamanho_bytes(bytes_cache_economizados_hoje)}` (`{cache_hits_tamanho_conhecido}` hits conhecidos)\n"
+            f"🎬 Compressão: `{compressao_aplicadas_hoje}` aplicada(s) / `{compressao_descartadas_hoje}` descartada(s)\n"
+            f"   ├ Entrada: `{formatar_tamanho_bytes(compressao_entrada_hoje)}`\n"
+            f"   ├ Saída gerada: `{formatar_tamanho_bytes(compressao_saida_hoje)}`\n"
+            f"   └ Economia: `{formatar_tamanho_bytes(compressao_economia_hoje)}` (`{percentual_compressao:.1f}%`)\n"
+            f"⚙️ FFmpeg: `{ffmpeg_execucoes_hoje}` execução(ões) • `{ffmpeg_tempo_ms_hoje / 1000:.1f}s`"
+            f"{cobertura_metricas}\n\n"
+            f"📱 *Por plataforma*\n"
+            f"{texto_plataformas}\n\n"
             f"🧾 Comprovantes aguardando análise: `{comprovantes_em_analise}`\n"
             f"✅ Pagamentos aprovados: `{pedidos_pagos}`"
         )
@@ -12482,12 +12716,9 @@ def baixar_hls_mercado_livre_clips(url_hls, destino, referer):
     ]
     atualizar_heartbeat_worker("ml_clips_baixando_hls")
     try:
-        resultado = subprocess.run(
+        resultado = executar_ffmpeg_medido(
             cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=FFMPEG_TIMEOUT_SECONDS,
+            FFMPEG_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired as e:
         raise FalhaComponenteDownload(
@@ -12591,6 +12822,7 @@ def processar_download_mercado_livre_clips(
                 tipo_cache,
                 url_cache_key=url_cache_key,
                 url_normalizada=url_normalizada,
+                media_size_bytes=(entrada_cache or {}).get("media_size_bytes", 0),
             )
             registrar_download_diario(
                 vip_status,
@@ -12671,6 +12903,7 @@ def processar_download_mercado_livre_clips(
             telegram_media_type,
             url_cache_key=url_cache_key,
             url_normalizada=url_normalizada,
+            media_size_bytes=bytes_upload,
         )
         registrar_download_diario(
             vip_status,
@@ -13032,6 +13265,7 @@ def processar_download_shopee(
                 tipo_cache,
                 url_cache_key=url_cache_key,
                 url_normalizada=url_normalizada,
+                media_size_bytes=(entrada_cache or {}).get("media_size_bytes", 0),
             )
             registrar_download_diario(
                 vip_status,
@@ -13138,6 +13372,7 @@ def processar_download_shopee(
             telegram_media_type,
             url_cache_key=url_cache_key,
             url_normalizada=url_normalizada,
+            media_size_bytes=bytes_upload,
         )
         registrar_download_diario(
             vip_status,
@@ -13235,6 +13470,7 @@ def _processar_download(message, url, status_msg, reserva_download=None, user=No
     atualizar_heartbeat_worker("preparando")
     prefix = None
     plataforma = nome_plataforma(*detectar_plataforma(url))
+    iniciar_telemetria_download(plataforma)
 
     try:
         # O handler já acabou de carregar o usuário antes de enfileirar.
@@ -13281,6 +13517,7 @@ def _processar_download(message, url, status_msg, reserva_download=None, user=No
             is_shopee,
             is_mercado_livre_clips,
         )
+        atualizar_plataforma_telemetria(plataforma)
 
         if is_instagram and not INSTAGRAM_DOWNLOADS_ENABLED:
             texto_pausado = (
@@ -13445,6 +13682,7 @@ def _processar_download(message, url, status_msg, reserva_download=None, user=No
                         tipo_cache,
                         url_cache_key=url_cache_key,
                         url_normalizada=url_normalizada,
+                        media_size_bytes=(entrada_cache or {}).get("media_size_bytes", 0),
                     )
                     registrar_download_diario(
                         vip_status,
@@ -13533,6 +13771,7 @@ def _processar_download(message, url, status_msg, reserva_download=None, user=No
                     telegram_media_type,
                     url_cache_key=url_cache_key,
                     url_normalizada=url_normalizada,
+                    media_size_bytes=bytes_upload,
                 )
 
                 registrar_download_diario(
@@ -13706,6 +13945,7 @@ def _processar_download(message, url, status_msg, reserva_download=None, user=No
                 tipo_cache,
                 url_cache_key=url_cache_key,
                 url_normalizada=url_normalizada,
+                media_size_bytes=(entrada_cache or {}).get("media_size_bytes", 0),
             )
             registrar_download_diario(
                 vip_status,
@@ -13972,6 +14212,7 @@ def _processar_download(message, url, status_msg, reserva_download=None, user=No
                 telegram_media_type,
                 url_cache_key=url_cache_key,
                 url_normalizada=url_normalizada,
+                media_size_bytes=bytes_upload,
             )
 
         registrar_download_diario(
@@ -14083,6 +14324,7 @@ def _processar_download(message, url, status_msg, reserva_download=None, user=No
     finally:
         if prefix:
             cleanup_prefix(prefix)
+        limpar_telemetria_download()
 
 
 def registrar_trabalho_fila_persistente(user_id):
