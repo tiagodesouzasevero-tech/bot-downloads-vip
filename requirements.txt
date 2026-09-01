@@ -1,5 +1,5 @@
 pyTelegramBotAPI
-yt-dlp[default,curl-cffi]==2026.7.4
+yt-dlp[default,curl-cffi]==2026.8.19
 pymongo[srv]
 requests
 requests-pkcs12
