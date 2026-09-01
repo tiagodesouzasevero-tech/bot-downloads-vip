@@ -195,6 +195,19 @@ AUDIO_BITRATE = os.environ.get("AUDIO_BITRATE", "64k").strip() or "64k"
 SMART_COMPRESSION_BITRATE_KBPS = get_env_int(
     "SMART_COMPRESSION_BITRATE_KBPS", 2500, 1200, 10000
 )
+SMART_COMPRESSION_CRF = get_env_int(
+    "SMART_COMPRESSION_CRF", 27, 18, 35
+)
+SMART_COMPRESSION_MAX_FPS = get_env_int(
+    "SMART_COMPRESSION_MAX_FPS", 25, 20, 30
+)
+SMART_COMPRESSION_PRESET = (
+    os.environ.get("SMART_COMPRESSION_PRESET", "fast").strip().lower() or "fast"
+)
+if SMART_COMPRESSION_PRESET not in {
+    "ultrafast", "superfast", "veryfast", "faster", "fast", "medium"
+}:
+    SMART_COMPRESSION_PRESET = "fast"
 SMART_COMPRESSION_MIN_SIZE_MB = get_env_int(
     "SMART_COMPRESSION_MIN_SIZE_MB", 4, 1, 50
 )
@@ -1636,6 +1649,90 @@ def deve_compactar_midia_inteligente(arquivo_entrada, info=None):
     return bitrate_kbps > SMART_COMPRESSION_BITRATE_KBPS, bitrate_kbps
 
 
+def montar_vf_compressao_inteligente(info=None):
+    """Mantém resolução até 720x1280 e limita somente FPS acima do alvo."""
+    info = info or {}
+    width = info.get("width") or 0
+    height = info.get("height") or 0
+    fps = info.get("fps") or 0
+
+    filtros = []
+    if width > 720 or height > 1280:
+        filtros.append(
+            "scale=720:1280:force_original_aspect_ratio=decrease:"
+            "force_divisible_by=2"
+        )
+    if fps > SMART_COMPRESSION_MAX_FPS + 0.5:
+        filtros.append(f"fps={SMART_COMPRESSION_MAX_FPS}")
+
+    return ",".join(filtros) if filtros else None
+
+
+def converter_compressao_inteligente(arquivo_entrada, info=None):
+    """
+    Perfil econômico com foco em qualidade perceptível:
+    H.264 CRF 27, preset fast, áudio 64k e no máximo 25 fps.
+    É usado somente quando a regra de compressão inteligente já decidiu
+    que o arquivo original está pesado demais.
+    """
+    atualizar_heartbeat_worker("compactando_inteligente")
+    info = info or obter_info_midia(arquivo_entrada) or {}
+    base, _ = os.path.splitext(arquivo_entrada)
+    arquivo_saida = (
+        f"{base}_smart_720x1280_{SMART_COMPRESSION_MAX_FPS}fps.mp4"
+    )
+
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-v", "error",
+        "-i", arquivo_entrada,
+    ]
+
+    vf = montar_vf_compressao_inteligente(info)
+    if vf:
+        cmd += ["-vf", vf]
+
+    cmd += [
+        "-c:v", "libx264",
+        "-preset", SMART_COMPRESSION_PRESET,
+        "-crf", str(SMART_COMPRESSION_CRF),
+        "-threads", str(FFMPEG_THREADS),
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac",
+        "-b:a", AUDIO_BITRATE,
+        "-movflags", "+faststart",
+        arquivo_saida,
+    ]
+
+    try:
+        resultado = executar_ffmpeg_medido(
+            cmd,
+            FFMPEG_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as e:
+        raise FalhaComponenteDownload(
+            "Processamento",
+            f"FFMPEG_TIMEOUT compressao_inteligente "
+            f"timeout={FFMPEG_TIMEOUT_SECONDS}s",
+        ) from e
+
+    if resultado.returncode != 0:
+        raise FalhaComponenteDownload(
+            "Processamento",
+            f"FFMPEG_COMPRESSAO_INTELIGENTE_FALHOU "
+            f"codigo={resultado.returncode}",
+        )
+
+    if not os.path.exists(arquivo_saida):
+        raise FalhaComponenteDownload(
+            "Processamento",
+            "FFMPEG_COMPRESSAO_INTELIGENTE_NAO_GEROU_SAIDA",
+        )
+
+    return arquivo_saida
+
+
 def compactar_midia_inteligente(arquivo_entrada, info=None, plataforma=None):
     """Reencoda uma vez e usa a saída somente quando a economia é relevante."""
     info = info or obter_info_midia(arquivo_entrada) or {}
@@ -1654,10 +1751,14 @@ def compactar_midia_inteligente(arquivo_entrada, info=None, plataforma=None):
         f"tamanho_mb={tamanho_original / (1024 * 1024):.2f} "
         f"duracao={float(info.get('duration') or 0):.2f} "
         f"bitrate_kbps={bitrate_kbps:.0f} "
-        f"limite_kbps={SMART_COMPRESSION_BITRATE_KBPS}"
+        f"limite_kbps={SMART_COMPRESSION_BITRATE_KBPS} "
+        f"crf={SMART_COMPRESSION_CRF} "
+        f"preset={SMART_COMPRESSION_PRESET} "
+        f"fps_max={SMART_COMPRESSION_MAX_FPS} "
+        f"audio={AUDIO_BITRATE}"
     )
 
-    arquivo_compactado = converter_para_720x1280_30fps(
+    arquivo_compactado = converter_compressao_inteligente(
         arquivo_entrada,
         info=info,
     )
