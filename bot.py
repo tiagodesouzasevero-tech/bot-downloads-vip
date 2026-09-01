@@ -13143,6 +13143,149 @@ def extrair_urls_watermark_shopee(texto):
     return encontrados
 
 
+def _url_shopee_parece_watermark(url):
+    """Reconhece o padrão de arquivo com marca usado pela própria Shopee."""
+    try:
+        nome = os.path.basename(urlparse(str(url or "")).path or "")
+    except Exception:
+        return True
+    return bool(
+        re.fullmatch(
+            r".+?\.\d{10,}\.\d+\.mp4",
+            nome,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def extrair_urls_formatos_shopee(texto):
+    """
+    Extrai MP4s oficiais declarados dentro de video.formats.
+
+    A Shopee costuma ordenar os formatos do vídeo na própria página. Mantemos
+    essa ordem para tentar a melhor fonte primeiro, sem baixar várias versões.
+    """
+    if not texto:
+        return []
+
+    bruto = str(texto)
+    variantes = [bruto]
+
+    decodificado = html.unescape(bruto)
+    try:
+        decodificado = unquote(decodificado)
+    except Exception:
+        pass
+
+    normalizado = decodificado
+    for _ in range(3):
+        anterior = normalizado
+        normalizado = (
+            normalizado.replace("\\u002F", "/")
+            .replace("\\u002f", "/")
+            .replace("\\/", "/")
+            .replace("\\u0026", "&")
+            .replace("\\u003D", "=")
+            .replace("\\u003d", "=")
+        )
+        if normalizado == anterior:
+            break
+
+    for variante in (decodificado, normalizado):
+        if variante not in variantes:
+            variantes.append(variante)
+
+    encontrados = []
+
+    # Padrão observado no estado inline da Shopee:
+    # "video": {"vid":"...","formats":[{"url":"https://...mp4"}, ...]}
+    padrao_video = re.compile(
+        r'["\\\']video["\\\']\s*:\s*\{'
+        r'(?:(?!["\\\']video["\\\']\s*:).){0,12000}?'
+        r'["\\\']formats["\\\']\s*:\s*\[(.*?)\]',
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    padrao_url = re.compile(
+        r'["\\\']url["\\\']\s*:\s*["\\\']([^"\\\']+?\.mp4(?:\?[^"\\\']*)?)',
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    for variante in variantes:
+        for bloco in padrao_video.findall(variante):
+            for match in padrao_url.finditer(bloco):
+                candidato = _normalizar_url_extraida_shopee(match.group(1))
+                if not candidato:
+                    continue
+                if not _host_midia_shopee_permitido(candidato):
+                    continue
+
+                url_lower = candidato.lower()
+                if ".default." in url_lower:
+                    continue
+                if _url_shopee_parece_watermark(candidato):
+                    continue
+
+                if candidato not in encontrados:
+                    encontrados.append(candidato)
+
+    return encontrados
+
+
+def extrair_urls_mp4_oficiais_shopee(texto):
+    """Fallback: encontra MP4s vod/susercontent oficiais no estado da página."""
+    if not texto:
+        return []
+
+    bruto = str(texto)
+    normalizado = html.unescape(bruto)
+    try:
+        normalizado = unquote(normalizado)
+    except Exception:
+        pass
+
+    for _ in range(3):
+        anterior = normalizado
+        normalizado = (
+            normalizado.replace("\\u002F", "/")
+            .replace("\\u002f", "/")
+            .replace("\\/", "/")
+            .replace("\\u0026", "&")
+            .replace("\\u003D", "=")
+            .replace("\\u003d", "=")
+        )
+        if normalizado == anterior:
+            break
+
+    encontrados = []
+    padroes = (
+        r'["\\\']url["\\\']\s*:\s*["\\\'](https?://[^"\\\']+?\.mp4(?:\?[^"\\\']*)?)',
+        r'(https?://[^"\\\'<>\s]+?\.mp4(?:\?[^"\\\'<>\s]*)?)',
+    )
+
+    for padrao in padroes:
+        for match in re.finditer(
+            padrao,
+            normalizado,
+            flags=re.IGNORECASE | re.DOTALL,
+        ):
+            candidato = _normalizar_url_extraida_shopee(match.group(1))
+            if not candidato:
+                continue
+            if not _host_midia_shopee_permitido(candidato):
+                continue
+
+            url_lower = candidato.lower()
+            if ".default." in url_lower:
+                continue
+            if _url_shopee_parece_watermark(candidato):
+                continue
+
+            if candidato not in encontrados:
+                encontrados.append(candidato)
+
+    return encontrados
+
+
 def derivar_url_original_shopee(url_watermark):
     """Remove somente o sufixo de marca d'água do nome oficial do MP4."""
     if not _host_midia_shopee_permitido(url_watermark):
@@ -13171,7 +13314,14 @@ def derivar_url_original_shopee(url_watermark):
 
 
 def obter_originais_shopee(url):
-    """Obtém candidatos originais sem marca apenas da página oficial da Shopee."""
+    """
+    Obtém candidatos oficiais da Shopee priorizando video.formats.
+
+    Ordem:
+    1. URLs MP4 do array video.formats;
+    2. outros MP4s oficiais encontrados no estado da página;
+    3. método legado que deriva o original a partir de watermarkVideoUrl.
+    """
     atualizar_heartbeat_worker("shopee_consultando_pagina")
     resposta, url_final = seguir_redirecionamentos_seguros(
         url,
@@ -13187,33 +13337,66 @@ def obter_originais_shopee(url):
     finally:
         resposta.close()
 
+    formatos = extrair_urls_formatos_shopee(texto)
+    mp4_oficiais = extrair_urls_mp4_oficiais_shopee(texto)
     watermarks = extrair_urls_watermark_shopee(texto)
+
     logger.info(
-        f"[SHOPEE_WATERMARKS] total={len(watermarks)} "
+        "[SHOPEE_FONTES_PAGINA] "
+        f"formats={len(formatos)} "
+        f"mp4_oficiais={len(mp4_oficiais)} "
+        f"watermarks={len(watermarks)} "
         f"url_ref={referencia_url_log(url_final)}"
     )
-    if not watermarks:
-        raise RuntimeError("SHOPEE_WATERMARK_VIDEO_URL_NAO_ENCONTRADA")
 
-    originais = []
-    erros = []
+    candidatos = []
+    origem_por_url = {}
+
+    def adicionar(candidato, origem):
+        if not candidato:
+            return
+        if not _host_midia_shopee_permitido(candidato):
+            return
+        if candidato in candidatos:
+            return
+        candidatos.append(candidato)
+        origem_por_url[candidato] = origem
+
+    # video.formats vem primeiro porque representa a fonte já declarada para
+    # reprodução na página. Não baixamos todas: o pipeline tenta em ordem e
+    # para no primeiro arquivo válido com áudio.
+    for candidato in formatos:
+        adicionar(candidato, "formats")
+
+    for candidato in mp4_oficiais:
+        adicionar(candidato, "mp4_pagina")
+
+    erros_derivacao = []
     for watermark in watermarks:
         try:
             original = derivar_url_original_shopee(watermark)
-            if original not in originais:
-                originais.append(original)
+            adicionar(original, "derivado_watermark")
         except Exception as e:
-            erros.append(str(e))
+            erros_derivacao.append(str(e))
 
-    if not originais:
-        detalhe = erros[-1] if erros else "sem_candidatos"
-        raise RuntimeError(f"SHOPEE_ORIGINAL_NAO_DERIVADO: {detalhe}")
+    if not candidatos:
+        detalhe = (
+            erros_derivacao[-1]
+            if erros_derivacao
+            else "nenhuma_fonte_mp4_oficial_encontrada"
+        )
+        raise RuntimeError(f"SHOPEE_ORIGINAL_NAO_ENCONTRADO: {detalhe}")
 
     logger.info(
-        f"[SHOPEE_ORIGINAIS] total={len(originais)} "
-        "somente_susercontent=True sem_watermark=True"
+        "[SHOPEE_ORIGINAIS] "
+        f"total={len(candidatos)} "
+        f"formats={sum(1 for u in candidatos if origem_por_url.get(u) == 'formats')} "
+        f"pagina={sum(1 for u in candidatos if origem_por_url.get(u) == 'mp4_pagina')} "
+        f"derivados={sum(1 for u in candidatos if origem_por_url.get(u) == 'derivado_watermark')} "
+        "somente_susercontent=True sem_watermark_prioritario=True"
     )
-    return url_final, originais
+
+    return url_final, candidatos
 
 
 def baixar_url_original_shopee(url_midia, destino, referer):
@@ -13398,7 +13581,8 @@ def processar_download_shopee(
             try:
                 logger.info(
                     f"[SHOPEE_DOWNLOAD_TENTATIVA] candidato={indice}/{len(originais)} "
-                    "host_oficial=True sem_watermark=True"
+                    f"arquivo_ref={referencia_privada_log('midia', original, tamanho=12)} "
+                    "host_oficial=True sem_watermark_prioritario=True"
                 )
                 baixar_url_original_shopee(original, destino, pagina_final)
                 info = validar_arquivo_midia(
