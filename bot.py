@@ -190,8 +190,8 @@ WORKER_RESTART_RETRY_SECONDS = get_env_int(
     "WORKER_RESTART_RETRY_SECONDS", 300, 60, 1800
 )
 WORKER_RESTART_EXIT_CODE = 70
-VIDEO_CRF = get_env_int("VIDEO_CRF", 27, 18, 35)
-AUDIO_BITRATE = os.environ.get("AUDIO_BITRATE", "80k").strip() or "80k"
+VIDEO_CRF = get_env_int("VIDEO_CRF", 28, 18, 35)
+AUDIO_BITRATE = os.environ.get("AUDIO_BITRATE", "64k").strip() or "64k"
 SMART_COMPRESSION_BITRATE_KBPS = get_env_int(
     "SMART_COMPRESSION_BITRATE_KBPS", 2500, 1200, 10000
 )
@@ -265,6 +265,11 @@ MONITOR_ALERT_COOLDOWN_SECONDS = get_env_int(
 MONITOR_SUCCESS_LOG_INTERVAL_SECONDS = 900
 MEDIA_PROFILE_VERSION = (
     f"720x1280_30fps_h264_crf{VIDEO_CRF}_audio{AUDIO_BITRATE}_sem_marca_v2"
+)
+# Não mudar esta string ao fazer apenas ajustes finos de bitrate/CRF.
+# Ela preserva as chaves de cache criadas antes da compressão econômica.
+MEDIA_CACHE_COMPAT_PROFILE = (
+    "720x1280_30fps_h264_crf27_audio80k_sem_marca_v2"
 )
 INSTAGRAM_AUDIO_CACHE_VERSION = "instagram_audio_v5_nocookies"
 FACEBOOK_AUDIO_CACHE_VERSION = "facebook_audio_v2"
@@ -2935,7 +2940,9 @@ def enviar_arquivo_com_fallback(chat_id, arquivo, reserva_download=None):
 
 
 def perfil_cache_plataforma(plataforma):
-    perfil = MEDIA_PROFILE_VERSION
+    # A chave do cache representa compatibilidade de entrega, não os detalhes
+    # finos do encoder. Assim ajustes CRF/áudio não invalidam caches existentes.
+    perfil = MEDIA_CACHE_COMPAT_PROFILE
     plataforma_normalizada = str(plataforma or "").strip().lower()
     if plataforma_normalizada == "instagram":
         perfil = f"{perfil}|{INSTAGRAM_AUDIO_CACHE_VERSION}"
