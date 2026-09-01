@@ -49,6 +49,7 @@ except ImportError:
 
 from telebot import types
 from pymongo import MongoClient, ReturnDocument, UpdateOne
+from pymongo.errors import DuplicateKeyError
 from requests.exceptions import RequestException, Timeout
 
 # =========================================
@@ -107,6 +108,13 @@ EFI_CERT_BASE64 = get_env_required("EFI_CERT_BASE64")
 EFI_PIX_KEY = get_env_required("EFI_PIX_KEY")
 EFI_API_URL = "https://pix.api.efipay.com.br"
 EFI_PIX_EXPIRATION_SECONDS = 30 * 60
+EFI_PAYMENT_VERIFIABLE_STATUSES = frozenset(
+    {"awaiting_pix", "processing_efi", "delivery_failed", "expired"}
+)
+PAYMENT_ORDER_RETENTION_DAYS = get_env_int(
+    "PAYMENT_ORDER_RETENTION_DAYS", 90, 60, 365
+)
+PAYMENT_CREATION_LOCK_SECONDS = 5 * 60
 
 # Compatibilidade com pedidos manuais antigos. Novas compras não usam mais
 # estes dados e as variáveis podem ser removidas depois da validação da Efí.
@@ -584,6 +592,7 @@ client = MongoClient(
 db = client[MONGO_DB_NAME]
 usuarios_col = db["usuarios"]
 pedidos_col = db["pedidos"]
+pagamentos_criacao_col = db["pagamentos_criacao"]
 metricas_col = db["metricas_diarias"]
 midia_cache_col = db["midia_cache"]
 auditoria_admin_col = db["auditoria_admin"]
@@ -601,7 +610,29 @@ try:
     pedidos_col.create_index("status")
     pedidos_col.create_index("user_id")
     pedidos_col.create_index([("user_id", 1), ("status", 1), ("created_at", -1)])
-    pedidos_col.create_index("expires_at", expireAfterSeconds=0)
+    pedidos_col.create_index([("provider", 1), ("txid", 1)])
+
+    # ``expires_at`` era, ao mesmo tempo, a validade comercial do Pix e o TTL
+    # físico do MongoDB. Isso podia apagar uma cobrança antes de um webhook
+    # atrasado ou de uma recuperação após indisponibilidade. Remove apenas o
+    # TTL antigo; a validade comercial continua sendo lida por compatibilidade.
+    for nome_indice, info_indice in pedidos_col.index_information().items():
+        chaves = list(info_indice.get("key") or [])
+        if chaves == [("expires_at", 1)] and "expireAfterSeconds" in info_indice:
+            pedidos_col.drop_index(nome_indice)
+            logger.info("[PAGAMENTOS_TTL] indice_antigo_removido=True")
+
+    pedidos_col.create_index("purge_at", expireAfterSeconds=0)
+    pedidos_col.update_many(
+        {"purge_at": {"$exists": False}},
+        {
+            "$set": {
+                "purge_at": datetime.now(TZ)
+                + timedelta(days=PAYMENT_ORDER_RETENTION_DAYS)
+            }
+        },
+    )
+    pagamentos_criacao_col.create_index("expires_at", expireAfterSeconds=0)
     midia_cache_col.create_index("expires_at", expireAfterSeconds=0)
     auditoria_admin_col.create_index("created_at")
     auditoria_admin_col.create_index(
@@ -6554,26 +6585,116 @@ def _valor_centavos_para_api(valor_centavos):
     return f"{Decimal(cents) / Decimal(100):.2f}"
 
 
-def criar_pedido_efi(user_id, plano_key, plano, atribuicao_pix=None):
-    if not efi_is_configured():
-        raise EfiApiError("Pagamento automático ainda não está configurado.")
+def adquirir_bloqueio_criacao_pagamento(user_id):
+    """Reserva atomicamente a criação de Pix para um usuário.
 
-    order_nsu = gerar_order_nsu(user_id)
-    txid = f"VID{secrets.token_hex(14)}"
-    valor_centavos = int(plano["preco_centavos"])
-    payload = {
+    O documento fica no MongoDB para proteger também contra duas instâncias do
+    bot. Se o processo cair, o próprio prazo permite uma nova tentativa sem
+    exigir intervenção manual.
+    """
+    uid = str(user_id)
+    token = secrets.token_hex(16)
+    agora = agora_tz()
+    expira_em = agora + timedelta(seconds=PAYMENT_CREATION_LOCK_SECONDS)
+    try:
+        bloqueio = pagamentos_criacao_col.find_one_and_update(
+            {
+                "_id": uid,
+                "$or": [
+                    {"lock_until": {"$lte": agora}},
+                    {"lock_until": {"$exists": False}},
+                ],
+            },
+            {
+                "$set": {
+                    "token": token,
+                    "lock_until": expira_em,
+                    "expires_at": expira_em,
+                    "updated_at": agora,
+                }
+            },
+            upsert=True,
+            return_document=ReturnDocument.AFTER,
+        )
+    except DuplicateKeyError:
+        return None
+
+    if not bloqueio or not hmac.compare_digest(
+        str(bloqueio.get("token") or ""), token
+    ):
+        return None
+    return token
+
+
+def liberar_bloqueio_criacao_pagamento(user_id, token):
+    if not token:
+        return
+    try:
+        pagamentos_criacao_col.delete_one(
+            {"_id": str(user_id), "token": str(token)}
+        )
+    except Exception as exc:
+        # O lock expira sozinho; uma falha aqui só adia a próxima tentativa.
+        logger.warning(
+            "[EFI_PIX_LOCK_LIBERAR] user_ref=%s erro=%s",
+            referencia_usuario_log(user_id),
+            sanitizar_erro_log(exc),
+        )
+
+
+def _payload_cobranca_efi(pedido, plano):
+    valor_centavos = int(pedido["valor_centavos"])
+    return {
         "calendario": {"expiracao": EFI_PIX_EXPIRATION_SECONDS},
         "valor": {"original": _valor_centavos_para_api(valor_centavos)},
         "chave": EFI_PIX_KEY,
         "solicitacaoPagador": "VIP Baixar Videos HD - 30 dias",
         "infoAdicionais": [
             {"nome": "Plano", "valor": str(plano.get("nome") or "VIP")[:50]},
-            {"nome": "Pedido", "valor": order_nsu[:50]},
+            {"nome": "Pedido", "valor": str(pedido["order_nsu"])[:50]},
         ],
     }
 
-    response = efi_api_request("PUT", f"/v2/cob/{txid}", json_body=payload)
-    data = response.json()
+
+def concluir_criacao_pedido_efi(pedido, plano, consultar_existente=True):
+    """Conclui uma intenção persistida usando sempre o mesmo txid.
+
+    Em uma retomada, primeiro consulta a Efí e só usa PUT quando o txid ainda
+    não existe. Assim, um reinício ou timeout depois da criação remota não gera
+    uma segunda cobrança para o usuário.
+    """
+    if not pedido or pedido.get("provider") != "efi":
+        raise EfiApiError("Pedido Efí inválido.")
+
+    order_nsu = str(pedido.get("order_nsu") or "").strip()
+    txid = str(pedido.get("txid") or "").strip()
+    if not order_nsu or not txid:
+        raise EfiApiError("Pedido Efí sem identificadores.")
+
+    atual = pedidos_col.find_one({"order_nsu": order_nsu}) or pedido
+    if atual.get("status") != "creating_efi":
+        return atual
+
+    if consultar_existente:
+        try:
+            data = obter_cobranca_efi(txid)
+        except EfiApiError as exc:
+            if exc.status_code != 404:
+                raise
+            response = efi_api_request(
+                "PUT",
+                f"/v2/cob/{txid}",
+                json_body=_payload_cobranca_efi(atual, plano),
+            )
+            data = response.json()
+    else:
+        response = efi_api_request(
+            "PUT",
+            f"/v2/cob/{txid}",
+            json_body=_payload_cobranca_efi(atual, plano),
+        )
+        data = response.json()
+
     loc = data.get("loc") or {}
     location_id = loc.get("id")
     if location_id is None:
@@ -6592,6 +6713,46 @@ def criar_pedido_efi(user_id, plano_key, plano, atribuicao_pix=None):
         )
 
     agora = agora_tz()
+    resultado = pedidos_col.update_one(
+        {
+            "order_nsu": order_nsu,
+            "provider": "efi",
+            "status": "creating_efi",
+        },
+        {
+            "$set": {
+                "status": "awaiting_pix",
+                "payment_verification_status": "efi_awaiting_payment",
+                "pix_copy": pix_copy,
+                "location_id": location_id,
+                "visual_url": str(
+                    qr_data.get("linkVisualizacao") or ""
+                ).strip(),
+                "creation_completed_at": agora,
+            },
+            "$unset": {"creation_error": "", "creation_error_at": ""},
+        },
+    )
+    if resultado.modified_count:
+        return pedidos_col.find_one({"order_nsu": order_nsu}) or atual
+
+    atual = pedidos_col.find_one({"order_nsu": order_nsu}) or {}
+    if atual.get("status") in EFI_PAYMENT_VERIFIABLE_STATUSES:
+        return atual
+    raise EfiApiError("O estado da cobrança mudou durante a criação.")
+
+
+def criar_pedido_efi(user_id, plano_key, plano, atribuicao_pix=None):
+    if not efi_is_configured():
+        raise EfiApiError("Pagamento automático ainda não está configurado.")
+
+    order_nsu = gerar_order_nsu(user_id)
+    txid = f"VID{secrets.token_hex(14)}"
+    valor_centavos = int(plano["preco_centavos"])
+    agora = agora_tz()
+    cobranca_expira_em = agora + timedelta(
+        seconds=EFI_PIX_EXPIRATION_SECONDS
+    )
     pedido = {
         "order_nsu": order_nsu,
         "provider": "efi",
@@ -6600,19 +6761,33 @@ def criar_pedido_efi(user_id, plano_key, plano, atribuicao_pix=None):
         "plano_nome": plano.get("nome") or "VIP",
         "valor_centavos": valor_centavos,
         "txid": txid,
-        "status": "awaiting_pix",
+        "status": "creating_efi",
         "created_at": agora,
-        "expires_at": agora + timedelta(seconds=EFI_PIX_EXPIRATION_SECONDS),
-        "payment_verification_status": "efi_awaiting_payment",
-        "pix_copy": pix_copy,
-        "location_id": location_id,
-        "visual_url": str(qr_data.get("linkVisualizacao") or "").strip(),
+        "cobranca_expira_em": cobranca_expira_em,
+        "purge_at": agora + timedelta(days=PAYMENT_ORDER_RETENTION_DAYS),
+        "payment_verification_status": "efi_creating_charge",
         "vip_aplicado_ao_pedido": False,
     }
     if atribuicao_pix:
         pedido["atribuicao_ads"] = atribuicao_pix
     pedidos_col.insert_one(pedido)
-    return pedido
+    try:
+        return concluir_criacao_pedido_efi(
+            pedido,
+            plano,
+            consultar_existente=False,
+        )
+    except Exception as exc:
+        pedidos_col.update_one(
+            {"order_nsu": order_nsu, "status": "creating_efi"},
+            {
+                "$set": {
+                    "creation_error": sanitizar_erro_log(exc)[:300],
+                    "creation_error_at": agora_tz(),
+                }
+            },
+        )
+        raise
 
 
 def obter_cobranca_efi(txid):
@@ -6728,7 +6903,11 @@ def confirmar_pedido_efi_pago(pedido, cobranca=None):
     valor_pago, pix_pago = valor_pago_efi_centavos(cobranca)
     if pix_pago is None:
         pedidos_col.update_one(
-            {"order_nsu": order_nsu, "provider": "efi", "status": "awaiting_pix"},
+            {
+                "order_nsu": order_nsu,
+                "provider": "efi",
+                "status": {"$in": list(EFI_PAYMENT_VERIFIABLE_STATUSES)},
+            },
             {"$set": {
                 "efi_status": str((cobranca or {}).get("status") or "ATIVA").upper(),
                 "last_payment_check_at": agora_tz(),
@@ -6757,16 +6936,20 @@ def confirmar_pedido_efi_pago(pedido, cobranca=None):
                 "motivo": "ja_pago",
             }
 
-        if atual.get("status") not in ("awaiting_pix", "processing_efi"):
+        if atual.get("status") not in EFI_PAYMENT_VERIFIABLE_STATUSES:
             return {
                 "pago": False,
                 "finalizado_agora": False,
                 "motivo": f"status_{atual.get('status')}",
             }
 
-        if atual.get("status") == "awaiting_pix":
+        if atual.get("status") != "processing_efi":
             claimed = pedidos_col.update_one(
-                {"order_nsu": order_nsu, "provider": "efi", "status": "awaiting_pix"},
+                {
+                    "order_nsu": order_nsu,
+                    "provider": "efi",
+                    "status": {"$in": ["awaiting_pix", "delivery_failed", "expired"]},
+                },
                 {"$set": {
                     "status": "processing_efi",
                     "efi_payment_processing_at": agora_tz(),
@@ -6890,7 +7073,11 @@ def recuperar_pagamentos_efi_interrompidos():
             pedidos_col.find(
                 {
                     "provider": "efi",
-                    "status": {"$in": ["awaiting_pix", "processing_efi"]},
+                    "status": {
+                        "$in": list(
+                            EFI_PAYMENT_VERIFIABLE_STATUSES | {"creating_efi"}
+                        )
+                    },
                     "created_at": {"$gte": limite},
                 }
             ).sort("created_at", -1).limit(100)
@@ -6903,6 +7090,50 @@ def recuperar_pagamentos_efi_interrompidos():
     falhas = 0
     for pedido in pedidos:
         try:
+            if pedido.get("status") == "creating_efi":
+                if pedido_pix_expirado(pedido):
+                    pedidos_col.update_one(
+                        {
+                            "order_nsu": pedido.get("order_nsu"),
+                            "status": "creating_efi",
+                        },
+                        {
+                            "$set": {
+                                "status": "expired",
+                                "expired_at": agora_tz(),
+                            }
+                        },
+                    )
+                    continue
+
+                plano_criacao = PLANOS.get(pedido.get("plano_key")) or {}
+                if not plano_criacao:
+                    raise EfiApiError("Plano de cobrança pendente inválido.")
+                pedido = concluir_criacao_pedido_efi(
+                    pedido,
+                    plano_criacao,
+                )
+                entregue = enviar_instrucoes_pix_efi(
+                    int(pedido["user_id"]),
+                    pedido,
+                    plano_criacao,
+                )
+                pedidos_col.update_one(
+                    {"order_nsu": pedido.get("order_nsu")},
+                    {
+                        "$set": {
+                            "delivery_status": (
+                                "delivered" if entregue else "failed"
+                            ),
+                            (
+                                "delivered_at"
+                                if entregue
+                                else "delivery_error_at"
+                            ): agora_tz(),
+                        }
+                    },
+                )
+
             resultado = confirmar_pedido_efi_pago(pedido)
             if resultado.get("finalizado_agora"):
                 recuperados += 1
@@ -11350,7 +11581,9 @@ def normalizar_datetime_tz(valor):
 
 
 def pedido_pix_expirado(pedido):
-    expira_em = normalizar_datetime_tz(pedido.get("expires_at"))
+    expira_em = normalizar_datetime_tz(
+        pedido.get("cobranca_expira_em") or pedido.get("expires_at")
+    )
     if expira_em is None:
         criado_em = normalizar_datetime_tz(pedido.get("created_at"))
         if criado_em is None:
@@ -11364,7 +11597,14 @@ def buscar_pedido_pix_ativo(user_id):
         {
             "user_id": str(user_id),
             "status": {
-                "$in": ["awaiting_pix", "receipt_submitted", "approving", "processing_efi"]
+                "$in": [
+                    "awaiting_pix",
+                    "receipt_submitted",
+                    "approving",
+                    "creating_efi",
+                    "processing_efi",
+                    "delivery_failed",
+                ]
             },
         },
         sort=[("created_at", -1)],
@@ -11721,6 +11961,20 @@ def reabrir_comprovante_pix(call):
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("pay_"))
 def iniciar_pagamento_pix_automatico(call):
+    bloqueio_criacao = None
+    callback_respondido = False
+
+    def responder_callback(text, show_alert=False):
+        nonlocal callback_respondido
+        if callback_respondido:
+            return False
+        callback_respondido = True
+        return safe_answer_callback(
+            call.id,
+            text=text,
+            show_alert=show_alert,
+        )
+
     try:
         if not is_chat_privado(call.message):
             orientar_uso_no_privado(call.message)
@@ -11737,8 +11991,7 @@ def iniciar_pagamento_pix_automatico(call):
                 f"user_ref={referencia_usuario_log(call.from_user.id)} "
                 f"erro={sanitizar_erro_log(e)}"
             )
-            safe_answer_callback(
-                call.id,
+            responder_callback(
                 text="Não consegui consultar seu plano agora. Tente novamente.",
                 show_alert=True,
             )
@@ -11748,8 +12001,7 @@ def iniciar_pagamento_pix_automatico(call):
         renovacao_permitida = vip_ativo and vip_pode_renovar(usuario)
         if vip_ativo and not renovacao_permitida:
             validade = formatar_validade_vip(usuario.get("vip_ate"))
-            safe_answer_callback(
-                call.id,
+            responder_callback(
                 text=(
                     f"Seu VIP está ativo até {validade}. A renovação abre nos "
                     f"últimos {VIP_RENEWAL_WINDOW_DAYS} dias. 💎"
@@ -11769,6 +12021,18 @@ def iniciar_pagamento_pix_automatico(call):
         plano = obter_plano_por_callback(valor)
         if not plano:
             safe_send_message(call.message.chat.id, "❌ Plano inválido.")
+            return
+
+        # Protege o trecho "consultar pedido + criar cobrança" de cliques
+        # simultâneos, inclusive se futuramente houver mais de uma instância.
+        bloqueio_criacao = adquirir_bloqueio_criacao_pagamento(
+            call.from_user.id
+        )
+        if not bloqueio_criacao:
+            responder_callback(
+                text="Seu Pix já está sendo preparado. Aguarde alguns segundos.",
+                show_alert=True,
+            )
             return
 
         atribuicao_pix = None
@@ -11792,6 +12056,18 @@ def iniciar_pagamento_pix_automatico(call):
 
         pedido_ativo = buscar_pedido_pix_ativo(call.from_user.id)
         if pedido_ativo and pedido_ativo.get("provider") == "efi":
+            if (
+                pedido_ativo.get("status") == "creating_efi"
+                and not pedido_pix_expirado(pedido_ativo)
+            ):
+                plano_pendente = PLANOS.get(pedido_ativo.get("plano_key")) or {}
+                if not plano_pendente:
+                    raise EfiApiError("Plano da cobrança pendente é inválido.")
+                pedido_ativo = concluir_criacao_pedido_efi(
+                    pedido_ativo,
+                    plano_pendente,
+                )
+
             if pedido_ativo.get("status") == "processing_efi":
                 try:
                     resultado = confirmar_pedido_efi_pago(pedido_ativo)
@@ -11806,7 +12082,17 @@ def iniciar_pagamento_pix_automatico(call):
 
             if pedido_pix_expirado(pedido_ativo):
                 pedidos_col.update_one(
-                    {"order_nsu": pedido_ativo["order_nsu"], "status": "awaiting_pix"},
+                    {
+                        "order_nsu": pedido_ativo["order_nsu"],
+                        "status": {
+                            "$in": [
+                                "awaiting_pix",
+                                "creating_efi",
+                                "delivery_failed",
+                                "processing_efi",
+                            ]
+                        },
+                    },
                     {"$set": {"status": "expired", "expired_at": agora_tz()}},
                 )
                 pedido_ativo = None
@@ -11820,6 +12106,20 @@ def iniciar_pagamento_pix_automatico(call):
                     call.message.chat.id, pedido_ativo, plano
                 ):
                     raise RuntimeError("falha ao reenviar Pix Efí")
+                pedidos_col.update_one(
+                    {
+                        "order_nsu": pedido_ativo["order_nsu"],
+                        "status": {"$in": ["awaiting_pix", "delivery_failed"]},
+                    },
+                    {
+                        "$set": {
+                            "status": "awaiting_pix",
+                            "delivery_status": "delivered",
+                            "delivered_at": agora_tz(),
+                        },
+                        "$unset": {"delivery_error_at": ""},
+                    },
+                )
                 return
 
         if pedido_ativo:
@@ -11846,9 +12146,24 @@ def iniciar_pagamento_pix_automatico(call):
         if not enviar_instrucoes_pix_efi(call.message.chat.id, pedido, plano):
             pedidos_col.update_one(
                 {"order_nsu": pedido["order_nsu"], "status": "awaiting_pix"},
-                {"$set": {"status": "delivery_failed", "delivery_failed_at": agora_tz()}},
+                {
+                    "$set": {
+                        "delivery_status": "failed",
+                        "delivery_error_at": agora_tz(),
+                    }
+                },
             )
             raise RuntimeError("falha ao entregar Pix Efí")
+        pedidos_col.update_one(
+            {"order_nsu": pedido["order_nsu"], "status": "awaiting_pix"},
+            {
+                "$set": {
+                    "delivery_status": "delivered",
+                    "delivered_at": agora_tz(),
+                },
+                "$unset": {"delivery_error_at": ""},
+            },
+        )
 
     except EfiApiError as exc:
         logger.error("[EFI_PIX_INICIO] erro=%s", sanitizar_erro_log(exc))
@@ -11864,7 +12179,12 @@ def iniciar_pagamento_pix_automatico(call):
             "Tente novamente em instantes ou fale com o suporte.",
         )
     finally:
-        safe_answer_callback(call.id)
+        liberar_bloqueio_criacao_pagamento(
+            call.from_user.id,
+            bloqueio_criacao,
+        )
+        if not callback_respondido:
+            safe_answer_callback(call.id)
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("efi_check_"))
