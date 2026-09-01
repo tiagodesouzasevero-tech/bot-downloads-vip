@@ -10557,10 +10557,7 @@ def cmd_limparcache(message):
     texto = str(getattr(message, "text", "") or "")
     partes = texto.split(maxsplit=1)
     if len(partes) < 2 or not partes[1].strip():
-        safe_reply_to(
-            message,
-            "Uso: /limparcache <link do vídeo>",
-        )
+        safe_reply_to(message, "Uso: /limparcache <link do vídeo>")
         return
 
     url_original = partes[1].strip()
@@ -10585,7 +10582,7 @@ def cmd_limparcache(message):
             is_instagram,
             _is_rednote,
             is_facebook_reel,
-            _is_shopee,
+            is_shopee,
             is_mercado_livre_clips,
         ) = plataformas
 
@@ -10607,34 +10604,72 @@ def cmd_limparcache(message):
             safe_reply_to(message, "❌ Não consegui identificar a plataforma.")
             return
 
+        chaves_candidatas = []
         url_cache_key, _url_normalizada = montar_chave_cache_url(
             plataforma,
             url_cache,
         )
+        chaves_candidatas.append(url_cache_key)
 
-        entrada_url = midia_cache_col.find_one(
+        entrada = midia_cache_col.find_one(
             {"_id": url_cache_key},
             {"source_hash": 1, "cache_kind": 1, "plataforma": 1},
         )
 
-        if not entrada_url:
+        # Alguns caches antigos da Shopee podem ser encontrados apenas pela
+        # chave estável da mídia. Reproduz exatamente a identificação usada
+        # pelo pipeline de download, sem baixar o arquivo de vídeo.
+        if not entrada and is_shopee:
+            pagina_final, originais = obter_originais_shopee(url_cache)
+            original_base = originais[0]
+            media_id_base = os.path.basename(
+                urlparse(original_base).path or ""
+            ).rsplit(".", 1)[0]
+            info_cache = {
+                "id": media_id_base
+                or hashlib.sha256(original_base.encode()).hexdigest()[:24],
+                "display_id": media_id_base,
+                "webpage_url": pagina_final,
+            }
+            cache_key_midia, _cache_source_id = montar_chave_cache_midia(
+                plataforma,
+                info_cache,
+                pagina_final,
+            )
+            chaves_candidatas.append(cache_key_midia)
+            entrada = midia_cache_col.find_one(
+                {"_id": cache_key_midia},
+                {"source_hash": 1, "cache_kind": 1, "plataforma": 1},
+            )
+
+        if not entrada:
             registrar_sucesso_componente("MongoDB")
             safe_reply_to(
                 message,
-                "ℹ️ Não encontrei cache salvo para esse link.",
+                "ℹ️ Não encontrei cache salvo para esse vídeo.",
             )
             return
 
-        source_hash = str(entrada_url.get("source_hash") or "").strip()
+        source_hash = str(entrada.get("source_hash") or "").strip()
+
         if source_hash:
             resultado = midia_cache_col.delete_many(
                 {
-                    "source_hash": source_hash,
-                    "plataforma": plataforma,
+                    "$or": [
+                        {
+                            "source_hash": source_hash,
+                            "plataforma": plataforma,
+                        },
+                        {
+                            "_id": {"$in": list(dict.fromkeys(chaves_candidatas))},
+                        },
+                    ]
                 }
             )
         else:
-            resultado = midia_cache_col.delete_one({"_id": url_cache_key})
+            resultado = midia_cache_col.delete_many(
+                {"_id": {"$in": list(dict.fromkeys(chaves_candidatas))}}
+            )
 
         registrar_sucesso_componente("MongoDB")
         removidos = int(getattr(resultado, "deleted_count", 0) or 0)
@@ -10643,6 +10678,7 @@ def cmd_limparcache(message):
             "[CACHE_ADMIN_LIMPEZA] "
             f"admin_ref={referencia_usuario_log(message.from_user.id)} "
             f"plataforma={plataforma} removidos={removidos} "
+            f"fallback_midia={'sim' if is_shopee else 'na'} "
             f"url_ref={referencia_privada_log('url', url_cache, tamanho=16)}"
         )
 
