@@ -48,7 +48,7 @@ except ImportError:
     TIKTOK_IMPERSONATION_DISPONIVEL = False
 
 from telebot import types
-from pymongo import MongoClient, ReturnDocument
+from pymongo import MongoClient, ReturnDocument, UpdateOne
 from requests.exceptions import RequestException, Timeout
 
 # =========================================
@@ -2964,34 +2964,42 @@ def salvar_file_id_cache(
         if url_cache_key and url_cache_key != cache_key:
             documentos.append((url_cache_key, "url", url_normalizada or source_id))
 
+        source_hash = hashlib.sha256(
+            str(source_id or "").encode("utf-8", errors="ignore")
+        ).hexdigest()
+        operacoes = []
+
         for chave, tipo_cache, identificador in documentos:
             identificador_hash = hashlib.sha256(
                 str(identificador or "").encode("utf-8", errors="ignore")
             ).hexdigest()
-            midia_cache_col.update_one(
-                {"_id": chave},
-                {
-                    "$set": {
-                        "source_hash": hashlib.sha256(
-                            str(source_id or "").encode("utf-8", errors="ignore")
-                        ).hexdigest(),
-                        "cache_kind": tipo_cache,
-                        "cache_identifier_hash": identificador_hash,
-                        "plataforma": plataforma,
-                        "telegram_file_id": telegram_file_id,
-                        "telegram_media_type": telegram_media_type,
-                        "media_profile": MEDIA_PROFILE_VERSION,
-                        "updated_at": agora,
-                        "expires_at": agora + timedelta(days=MEDIA_CACHE_DAYS),
+            operacoes.append(
+                UpdateOne(
+                    {"_id": chave},
+                    {
+                        "$set": {
+                            "source_hash": source_hash,
+                            "cache_kind": tipo_cache,
+                            "cache_identifier_hash": identificador_hash,
+                            "plataforma": plataforma,
+                            "telegram_file_id": telegram_file_id,
+                            "telegram_media_type": telegram_media_type,
+                            "media_profile": MEDIA_PROFILE_VERSION,
+                            "updated_at": agora,
+                            "expires_at": agora + timedelta(days=MEDIA_CACHE_DAYS),
+                        },
+                        "$unset": {
+                            "source_id": "",
+                            "cache_identifier": "",
+                        },
+                        "$setOnInsert": {"created_at": agora},
                     },
-                    "$unset": {
-                        "source_id": "",
-                        "cache_identifier": "",
-                    },
-                    "$setOnInsert": {"created_at": agora},
-                },
-                upsert=True,
+                    upsert=True,
+                )
             )
+
+        if operacoes:
+            midia_cache_col.bulk_write(operacoes, ordered=True)
         registrar_sucesso_componente("MongoDB")
     except Exception as e:
         logger.warning(
