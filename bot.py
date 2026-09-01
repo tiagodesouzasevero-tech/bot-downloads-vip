@@ -13871,11 +13871,7 @@ def _processar_download(message, url, status_msg, reserva_download=None, user=No
         )
         atualizar_plataforma_telemetria(plataforma)
 
-        if (
-            is_instagram
-            and not INSTAGRAM_DOWNLOADS_ENABLED
-            and int(getattr(getattr(message, "from_user", None), "id", 0) or 0) != ADMIN_ID
-        ):
+        if is_instagram and not INSTAGRAM_DOWNLOADS_ENABLED:
             texto_pausado = (
                 "🚧 Instagram está temporariamente indisponível enquanto ajustamos "
                 "a compatibilidade dos downloads com áudio. Por enquanto, envie links "
@@ -13887,11 +13883,7 @@ def _processar_download(message, url, status_msg, reserva_download=None, user=No
                 safe_send_message(message.chat.id, texto_pausado)
             return
 
-        if (
-            is_facebook_reel
-            and not FACEBOOK_REELS_DOWNLOADS_ENABLED
-            and int(getattr(getattr(message, "from_user", None), "id", 0) or 0) != ADMIN_ID
-        ):
+        if is_facebook_reel and not FACEBOOK_REELS_DOWNLOADS_ENABLED:
             texto_pausado = (
                 "🚧 Facebook Reels está temporariamente indisponível enquanto ajustamos "
                 "a compatibilidade dos downloads com áudio. Por enquanto, envie links "
@@ -15145,11 +15137,7 @@ def handle_download(message):
     is_instagram = plataformas[2]
     is_facebook_reel = plataformas[4]
 
-    if (
-        is_instagram
-        and not INSTAGRAM_DOWNLOADS_ENABLED
-        and int(getattr(getattr(message, "from_user", None), "id", 0) or 0) != ADMIN_ID
-    ):
+    if is_instagram and not INSTAGRAM_DOWNLOADS_ENABLED:
         safe_reply_to(
             message,
             "🚧 Instagram está temporariamente indisponível enquanto ajustamos "
@@ -15158,11 +15146,7 @@ def handle_download(message):
         )
         return
 
-    if (
-        is_facebook_reel
-        and not FACEBOOK_REELS_DOWNLOADS_ENABLED
-        and int(getattr(getattr(message, "from_user", None), "id", 0) or 0) != ADMIN_ID
-    ):
+    if is_facebook_reel and not FACEBOOK_REELS_DOWNLOADS_ENABLED:
         safe_reply_to(
             message,
             "🚧 Facebook Reels está temporariamente indisponível enquanto ajustamos "
