@@ -192,6 +192,13 @@ WORKER_RESTART_RETRY_SECONDS = get_env_int(
 WORKER_RESTART_EXIT_CODE = 70
 VIDEO_CRF = get_env_int("VIDEO_CRF", 27, 18, 35)
 AUDIO_BITRATE = os.environ.get("AUDIO_BITRATE", "80k").strip() or "80k"
+SMART_COMPRESSION_BITRATE_KBPS = get_env_int(
+    "SMART_COMPRESSION_BITRATE_KBPS", 2500, 1200, 10000
+)
+SMART_COMPRESSION_MIN_SIZE_MB = get_env_int(
+    "SMART_COMPRESSION_MIN_SIZE_MB", 4, 1, 50
+)
+SMART_COMPRESSION_MIN_SIZE_BYTES = SMART_COMPRESSION_MIN_SIZE_MB * 1024 * 1024
 MEDIA_CACHE_DAYS = get_env_int("MEDIA_CACHE_DAYS", 180, 1, 365)
 DOWNLOAD_COOLDOWN_SECONDS = get_env_int(
     "DOWNLOAD_COOLDOWN_SECONDS", 5, 0, 60
@@ -1481,6 +1488,94 @@ def permitir_hevc_por_plataforma(plataforma=None):
     return plataforma in ("tiktok", "rednote")
 
 
+def deve_compactar_midia_inteligente(arquivo_entrada, info=None):
+    """Compacta só H.264 pesado; arquivos leves e HEVC eficiente ficam intactos."""
+    info = info or {}
+    try:
+        tamanho = int(info.get("size_bytes") or os.path.getsize(arquivo_entrada))
+    except (TypeError, ValueError, OSError):
+        return False, None
+
+    try:
+        duracao = float(info.get("duration") or 0)
+    except (TypeError, ValueError):
+        duracao = 0.0
+
+    vcodec = str(info.get("vcodec") or "").lower()
+    width = int(info.get("width") or 0)
+    height = int(info.get("height") or 0)
+
+    if (
+        tamanho < SMART_COMPRESSION_MIN_SIZE_BYTES
+        or duracao <= 0
+        or vcodec not in ("h264", "avc1")
+        or width <= 0
+        or height <= 0
+        or width > 720
+        or height > 1280
+    ):
+        return False, None
+
+    bitrate_kbps = (tamanho * 8.0) / duracao / 1000.0
+    return bitrate_kbps > SMART_COMPRESSION_BITRATE_KBPS, bitrate_kbps
+
+
+def compactar_midia_inteligente(arquivo_entrada, info=None, plataforma=None):
+    """Reencoda uma vez e usa a saída somente quando a economia é relevante."""
+    info = info or obter_info_midia(arquivo_entrada) or {}
+    deve_compactar, bitrate_kbps = deve_compactar_midia_inteligente(
+        arquivo_entrada,
+        info,
+    )
+    if not deve_compactar:
+        return None
+
+    tamanho_original = int(info.get("size_bytes") or os.path.getsize(arquivo_entrada))
+    logger.info(
+        "[MIDIA_COMPACTACAO_INTELIGENTE] "
+        f"plataforma={plataforma} ativada=True "
+        f"arquivo_ref={referencia_arquivo_log(arquivo_entrada)} "
+        f"tamanho_mb={tamanho_original / (1024 * 1024):.2f} "
+        f"duracao={float(info.get('duration') or 0):.2f} "
+        f"bitrate_kbps={bitrate_kbps:.0f} "
+        f"limite_kbps={SMART_COMPRESSION_BITRATE_KBPS}"
+    )
+
+    arquivo_compactado = converter_para_720x1280_30fps(
+        arquivo_entrada,
+        info=info,
+    )
+
+    try:
+        tamanho_compactado = os.path.getsize(arquivo_compactado)
+    except OSError:
+        return arquivo_compactado
+
+    # Se a redução for pequena, preserva o original para evitar perda de
+    # qualidade sem benefício real. O FFmpeg só é usado em arquivos pesados.
+    if tamanho_compactado >= tamanho_original * 0.85:
+        logger.info(
+            "[MIDIA_COMPACTACAO_INTELIGENTE] "
+            f"plataforma={plataforma} mantido_original=True "
+            f"original_mb={tamanho_original / (1024 * 1024):.2f} "
+            f"compactado_mb={tamanho_compactado / (1024 * 1024):.2f}"
+        )
+        try:
+            os.remove(arquivo_compactado)
+        except OSError:
+            pass
+        return arquivo_entrada
+
+    logger.info(
+        "[MIDIA_COMPACTACAO_INTELIGENTE] "
+        f"plataforma={plataforma} concluida=True "
+        f"original_mb={tamanho_original / (1024 * 1024):.2f} "
+        f"compactado_mb={tamanho_compactado / (1024 * 1024):.2f} "
+        f"reducao_pct={(1 - tamanho_compactado / tamanho_original) * 100:.1f}"
+    )
+    return arquivo_compactado
+
+
 def remuxar_para_mp4_faststart(arquivo_entrada):
     atualizar_heartbeat_worker("remux_ffmpeg")
     base, _ = os.path.splitext(arquivo_entrada)
@@ -1686,6 +1781,14 @@ def preparar_arquivo_para_envio(arquivo_entrada, plataforma=None, info=None):
     atualizar_heartbeat_worker("preparando_envio")
     info = info or obter_info_midia(arquivo_entrada)
     permitir_hevc = permitir_hevc_por_plataforma(plataforma)
+
+    arquivo_compactado = compactar_midia_inteligente(
+        arquivo_entrada,
+        info=info,
+        plataforma=plataforma,
+    )
+    if arquivo_compactado is not None:
+        return arquivo_compactado
 
     if arquivo_ja_otimizado_para_envio(arquivo_entrada, info, permitir_hevc=permitir_hevc):
         logger.info(
