@@ -1,4 +1,4 @@
-# BUILD_FILE: ML_CLIPS_V1_20260817
+# BUILD_FILE: ETAPA3_MIDIA_720P_ADAPTATIVA_20260902
 import os
 import re
 import glob
@@ -12,6 +12,7 @@ import hashlib
 import hmac
 import ipaddress
 import itertools
+import math
 import logging
 import signal
 import socket
@@ -238,13 +239,13 @@ WORKER_RESTART_RETRY_SECONDS = get_env_int(
     "WORKER_RESTART_RETRY_SECONDS", 300, 60, 1800
 )
 WORKER_RESTART_EXIT_CODE = 70
-VIDEO_CRF = get_env_int("VIDEO_CRF", 28, 18, 35)
-AUDIO_BITRATE = os.environ.get("AUDIO_BITRATE", "64k").strip() or "64k"
+VIDEO_CRF = get_env_int("VIDEO_CRF", 27, 18, 35)
+AUDIO_BITRATE = os.environ.get("AUDIO_BITRATE", "80k").strip() or "80k"
 SMART_COMPRESSION_BITRATE_KBPS = get_env_int(
-    "SMART_COMPRESSION_BITRATE_KBPS", 2500, 1200, 10000
+    "SMART_COMPRESSION_BITRATE_KBPS", 3500, 1200, 10000
 )
 SMART_COMPRESSION_CRF = get_env_int(
-    "SMART_COMPRESSION_CRF", 28, 18, 35
+    "SMART_COMPRESSION_CRF", 27, 18, 35
 )
 SMART_COMPRESSION_MAX_FPS = get_env_int(
     "SMART_COMPRESSION_MAX_FPS", 30, 20, 30
@@ -259,7 +260,7 @@ if SMART_COMPRESSION_PRESET not in {
     SMART_COMPRESSION_PRESET = "veryfast"
 
 SHOPEE_SMART_COMPRESSION_CRF = get_env_int(
-    "SHOPEE_SMART_COMPRESSION_CRF", 28, 18, 35
+    "SHOPEE_SMART_COMPRESSION_CRF", 27, 18, 35
 )
 SHOPEE_SMART_COMPRESSION_MAX_FPS = get_env_int(
     "SHOPEE_SMART_COMPRESSION_MAX_FPS", 25, 20, 30
@@ -274,7 +275,7 @@ if SHOPEE_SMART_COMPRESSION_PRESET not in {
     SHOPEE_SMART_COMPRESSION_PRESET = "fast"
 
 SHOPEE_SMART_AUDIO_BITRATE = (
-    os.environ.get("SHOPEE_SMART_AUDIO_BITRATE", "48k").strip() or "48k"
+    os.environ.get("SHOPEE_SMART_AUDIO_BITRATE", "64k").strip() or "64k"
 )
 SHOPEE_SMART_UNSHARP_FILTER = (
     os.environ.get(
@@ -284,9 +285,12 @@ SHOPEE_SMART_UNSHARP_FILTER = (
     or "unsharp=5:5:0.25:5:5:0.0"
 )
 SMART_COMPRESSION_MIN_SIZE_MB = get_env_int(
-    "SMART_COMPRESSION_MIN_SIZE_MB", 4, 1, 50
+    "SMART_COMPRESSION_MIN_SIZE_MB", 15, 1, 50
 )
 SMART_COMPRESSION_MIN_SIZE_BYTES = SMART_COMPRESSION_MIN_SIZE_MB * 1024 * 1024
+SMART_COMPRESSION_MIN_REDUCTION_PERCENT = get_env_int(
+    "SMART_COMPRESSION_MIN_REDUCTION_PERCENT", 25, 10, 60
+)
 MEDIA_CACHE_DAYS = get_env_int("MEDIA_CACHE_DAYS", 180, 1, 365)
 DOWNLOAD_COOLDOWN_SECONDS = get_env_int(
     "DOWNLOAD_COOLDOWN_SECONDS", 5, 0, 60
@@ -352,12 +356,13 @@ MONITOR_ALERT_COOLDOWN_SECONDS = get_env_int(
 )
 MONITOR_SUCCESS_LOG_INTERVAL_SECONDS = 900
 MEDIA_PROFILE_VERSION = (
-    f"720x1280_30fps_h264_crf{VIDEO_CRF}_audio{AUDIO_BITRATE}_sem_marca_v2"
+    f"720p_adaptativo_30fps_h264_crf{VIDEO_CRF}_audio{AUDIO_BITRATE}_sem_marca_v3"
 )
-# Não mudar esta string ao fazer apenas ajustes finos de bitrate/CRF.
-# Ela preserva as chaves de cache criadas antes da compressão econômica.
+# A geometria do perfil mudou: vertical 720x1280 e horizontal 1280x720.
+# O v3 evita reutilizar arquivos horizontais antigos reduzidos para 720x405.
+# Ajustes futuros apenas de CRF/áudio não devem mudar esta string.
 MEDIA_CACHE_COMPAT_PROFILE = (
-    "720x1280_30fps_h264_crf27_audio80k_sem_marca_v2"
+    "720p_adaptativo_30fps_h264_aac_sem_marca_v3"
 )
 INSTAGRAM_AUDIO_CACHE_VERSION = "instagram_audio_v5_nocookies"
 FACEBOOK_AUDIO_CACHE_VERSION = "facebook_audio_v2"
@@ -1460,6 +1465,77 @@ def parse_fps(valor):
         return None
 
 
+def normalizar_rotacao_video(valor):
+    """Normaliza rotações de metadados para 0/90/180/270 graus."""
+    try:
+        graus = float(valor)
+    except (TypeError, ValueError):
+        return 0
+    if not math.isfinite(graus):
+        return 0
+    return int(round(graus / 90.0) * 90) % 360
+
+
+def extrair_rotacao_stream_video(video_stream):
+    video_stream = video_stream or {}
+    candidatos = []
+    # Display Matrix é a representação moderna e deve prevalecer sobre tags
+    # legadas que podem ter ficado desatualizadas após um remux.
+    for side_data in video_stream.get("side_data_list") or []:
+        if isinstance(side_data, dict):
+            candidatos.append(side_data.get("rotation"))
+    tags = video_stream.get("tags") or {}
+    candidatos.append(tags.get("rotate"))
+    for valor in candidatos:
+        if valor not in (None, "", "N/A"):
+            return normalizar_rotacao_video(valor)
+    return 0
+
+
+def dimensoes_exibicao(largura, altura, rotacao=0):
+    try:
+        largura = int(largura or 0)
+        altura = int(altura or 0)
+    except (TypeError, ValueError):
+        return 0, 0
+    if normalizar_rotacao_video(rotacao) in (90, 270):
+        return altura, largura
+    return largura, altura
+
+
+def dimensoes_dentro_limite_720p(largura, altura):
+    """Aceita 720x1280 vertical, 1280x720 horizontal e até 720x720."""
+    try:
+        largura = int(largura or 0)
+        altura = int(altura or 0)
+    except (TypeError, ValueError):
+        return False
+    if largura <= 0 or altura <= 0:
+        return False
+    return min(largura, altura) <= 720 and max(largura, altura) <= 1280
+
+
+def orientacao_por_dimensoes(largura, altura):
+    try:
+        largura = int(largura or 0)
+        altura = int(altura or 0)
+    except (TypeError, ValueError):
+        return "desconhecida"
+    if largura <= 0 or altura <= 0:
+        return "desconhecida"
+    if largura > altura:
+        return "horizontal"
+    if altura > largura:
+        return "vertical"
+    return "quadrada"
+
+
+def limites_720p_por_orientacao(largura, altura):
+    if orientacao_por_dimensoes(largura, altura) == "horizontal":
+        return 1280, 720
+    return 720, 1280
+
+
 def obter_info_midia(arquivo_entrada):
     atualizar_heartbeat_worker("analisando_midia")
 
@@ -1541,9 +1617,25 @@ def obter_info_midia(arquivo_entrada):
     except OSError as e:
         raise FalhaComponenteDownload("Armazenamento", e) from e
 
+    largura_codificada = (video_stream or {}).get("width")
+    altura_codificada = (video_stream or {}).get("height")
+    rotacao = extrair_rotacao_stream_video(video_stream)
+    largura_exibicao, altura_exibicao = dimensoes_exibicao(
+        largura_codificada,
+        altura_codificada,
+        rotacao,
+    )
+
     return {
-        "width": (video_stream or {}).get("width"),
-        "height": (video_stream or {}).get("height"),
+        "width": largura_exibicao,
+        "height": altura_exibicao,
+        "encoded_width": largura_codificada,
+        "encoded_height": altura_codificada,
+        "rotation": rotacao,
+        "orientation": orientacao_por_dimensoes(
+            largura_exibicao,
+            altura_exibicao,
+        ),
         "fps": fps,
         "vcodec": (video_stream or {}).get("codec_name"),
         "acodec": (audio_stream or {}).get("codec_name") if audio_stream else None,
@@ -1612,8 +1704,7 @@ def arquivo_ja_otimizado_para_envio(arquivo_entrada, info=None, permitir_hevc=Tr
 
     return (
         ext == ".mp4"
-        and width <= 720
-        and height <= 1280
+        and dimensoes_dentro_limite_720p(width, height)
         and fps <= 30.5
         and vcodec in codecs_video_aceitos
         and acodec in ("aac", "none")
@@ -1737,7 +1828,7 @@ def executar_ffmpeg_medido(cmd, timeout):
 
 
 def deve_compactar_midia_inteligente(arquivo_entrada, info=None):
-    """Compacta só H.264 pesado; arquivos leves e HEVC eficiente ficam intactos."""
+    """Compacta só H.264 grande e pesado; arquivos pequenos ficam originais."""
     info = info or {}
     try:
         tamanho = int(info.get("size_bytes") or os.path.getsize(arquivo_entrada))
@@ -1754,13 +1845,12 @@ def deve_compactar_midia_inteligente(arquivo_entrada, info=None):
     height = int(info.get("height") or 0)
 
     if (
-        tamanho < SMART_COMPRESSION_MIN_SIZE_BYTES
+        tamanho <= SMART_COMPRESSION_MIN_SIZE_BYTES
         or duracao <= 0
         or vcodec not in ("h264", "avc1")
         or width <= 0
         or height <= 0
-        or width > 720
-        or height > 1280
+        or not dimensoes_dentro_limite_720p(width, height)
     ):
         return False, None
 
@@ -1773,7 +1863,7 @@ def montar_vf_compressao_inteligente(
     max_fps=None,
     adicionar_nitidez=False,
 ):
-    """Mantém até 720x1280 e aplica apenas filtros necessários ao perfil."""
+    """Mantém 720p conforme a orientação e aplica só filtros necessários."""
     info = info or {}
     width = info.get("width") or 0
     height = info.get("height") or 0
@@ -1781,10 +1871,11 @@ def montar_vf_compressao_inteligente(
     max_fps = int(max_fps or SMART_COMPRESSION_MAX_FPS)
 
     filtros = []
-    if width > 720 or height > 1280:
+    if not dimensoes_dentro_limite_720p(width, height):
+        max_width, max_height = limites_720p_por_orientacao(width, height)
         filtros.append(
-            "scale=720:1280:force_original_aspect_ratio=decrease:"
-            "force_divisible_by=2"
+            f"scale={max_width}:{max_height}:"
+            "force_original_aspect_ratio=decrease:force_divisible_by=2"
         )
     if fps > max_fps + 0.5:
         filtros.append(f"fps={max_fps}")
@@ -1854,6 +1945,7 @@ def converter_compressao_inteligente(
         "-pix_fmt", "yuv420p",
         "-c:a", "aac",
         "-b:a", audio_bitrate,
+        "-metadata:s:v:0", "rotate=0",
         "-movflags", "+faststart",
         arquivo_saida,
     ]
@@ -1929,7 +2021,14 @@ def compactar_midia_inteligente(arquivo_entrada, info=None, plataforma=None):
 
     # Se a redução for pequena, preserva o original para evitar perda de
     # qualidade sem benefício real. O FFmpeg só é usado em arquivos pesados.
-    if tamanho_compactado >= tamanho_original * 0.85:
+    reducao_minima = SMART_COMPRESSION_MIN_REDUCTION_PERCENT / 100.0
+    forcar_por_tamanho = tamanho_original > MAX_OUTPUT_FILE_BYTES
+    compactado_cabe_no_limite = tamanho_compactado <= MAX_OUTPUT_FILE_BYTES
+    reducao_relevante = tamanho_compactado <= tamanho_original * (1 - reducao_minima)
+
+    if not reducao_relevante and not (
+        forcar_por_tamanho and compactado_cabe_no_limite
+    ):
         registrar_resultado_compressao(
             tamanho_original,
             tamanho_compactado,
@@ -1939,7 +2038,8 @@ def compactar_midia_inteligente(arquivo_entrada, info=None, plataforma=None):
             "[MIDIA_COMPACTACAO_INTELIGENTE] "
             f"plataforma={plataforma} mantido_original=True "
             f"original_mb={tamanho_original / (1024 * 1024):.2f} "
-            f"compactado_mb={tamanho_compactado / (1024 * 1024):.2f}"
+            f"compactado_mb={tamanho_compactado / (1024 * 1024):.2f} "
+            f"reducao_minima_pct={SMART_COMPRESSION_MIN_REDUCTION_PERCENT}"
         )
         try:
             os.remove(arquivo_compactado)
@@ -2014,6 +2114,7 @@ def arquivo_tem_codec_hevc(arquivo_entrada, info=None):
 
 
 def montar_vf_limite_720x1280_30fps(info=None):
+    """Compatibilidade nominal; aplica 720p de acordo com a orientação real."""
     info = info or {}
     width = info.get("width") or 0
     height = info.get("height") or 0
@@ -2021,8 +2122,12 @@ def montar_vf_limite_720x1280_30fps(info=None):
 
     filtros = []
 
-    if width > 720 or height > 1280:
-        filtros.append("scale=720:1280:force_original_aspect_ratio=decrease:force_divisible_by=2")
+    if not dimensoes_dentro_limite_720p(width, height):
+        max_width, max_height = limites_720p_por_orientacao(width, height)
+        filtros.append(
+            f"scale={max_width}:{max_height}:"
+            "force_original_aspect_ratio=decrease:force_divisible_by=2"
+        )
 
     if fps > 30.5:
         filtros.append("fps=30")
@@ -2060,6 +2165,7 @@ def converter_para_h264_compativel(arquivo_entrada, info=None):
         "-pix_fmt", "yuv420p",
         "-c:a", "aac",
         "-b:a", AUDIO_BITRATE,
+        "-metadata:s:v:0", "rotate=0",
         "-movflags", "+faststart",
         arquivo_saida
     ]
@@ -2093,14 +2199,15 @@ def converter_para_h264_compativel(arquivo_entrada, info=None):
 
 def converter_para_720x1280_30fps(arquivo_entrada, info=None):
     """
-    Garante saída final em no máximo 720x1280, 30fps, H.264/AAC.
+    Garante saída final em 720p adaptativo, 30fps, H.264/AAC.
+    Limites: 720x1280 vertical ou 1280x720 horizontal.
     Mantém a proporção original sem adicionar bordas e nunca amplia vídeos
     que já tenham resolução menor que o limite.
     """
     atualizar_heartbeat_worker("convertendo_video")
     info = info or obter_info_midia(arquivo_entrada) or {}
     base, _ = os.path.splitext(arquivo_entrada)
-    arquivo_saida = f"{base}_720x1280_30fps.mp4"
+    arquivo_saida = f"{base}_720p_30fps.mp4"
 
     cmd = [
         "ffmpeg",
@@ -2109,8 +2216,8 @@ def converter_para_720x1280_30fps(arquivo_entrada, info=None):
         "-i", arquivo_entrada,
     ]
 
-    # Só adiciona escala se o vídeo realmente ultrapassar 720x1280. Se ele
-    # for menor e precisar apenas de ajuste de fps/codec, preserva a resolução.
+    # Só adiciona escala se o vídeo ultrapassar o limite da sua orientação.
+    # Se precisar apenas de ajuste de fps/codec, preserva a resolução.
     vf = montar_vf_limite_720x1280_30fps(info)
     if vf:
         cmd += ["-vf", vf]
@@ -2123,6 +2230,7 @@ def converter_para_720x1280_30fps(arquivo_entrada, info=None):
         "-pix_fmt", "yuv420p",
         "-c:a", "aac",
         "-b:a", AUDIO_BITRATE,
+        "-metadata:s:v:0", "rotate=0",
         "-movflags", "+faststart",
         arquivo_saida
     ]
@@ -2159,6 +2267,30 @@ def preparar_arquivo_para_envio(arquivo_entrada, plataforma=None, info=None):
     info = info or obter_info_midia(arquivo_entrada)
     permitir_hevc = permitir_hevc_por_plataforma(plataforma)
 
+    try:
+        tamanho_entrada = int(
+            info.get("size_bytes") or os.path.getsize(arquivo_entrada)
+        )
+    except (AttributeError, TypeError, ValueError, OSError):
+        tamanho_entrada = 0
+
+    if (
+        tamanho_entrada <= SMART_COMPRESSION_MIN_SIZE_BYTES
+        and arquivo_ja_otimizado_para_envio(
+            arquivo_entrada,
+            info,
+            permitir_hevc=permitir_hevc,
+        )
+    ):
+        logger.info(
+            f"[MIDIA_DECISAO_ECONOMICA] plataforma={plataforma} "
+            "acao=original motivo=arquivo_pequeno_compativel "
+            f"tamanho_mb={tamanho_entrada / (1024 * 1024):.2f} "
+            f"limite_original_mb={SMART_COMPRESSION_MIN_SIZE_MB} "
+            f"orientacao={info.get('orientation')} rotacao={info.get('rotation')}"
+        )
+        return arquivo_entrada
+
     arquivo_compactado = compactar_midia_inteligente(
         arquivo_entrada,
         info=info,
@@ -2172,7 +2304,9 @@ def preparar_arquivo_para_envio(arquivo_entrada, plataforma=None, info=None):
             f"[MIDIA] Enviando original sem reconversão | plataforma={plataforma} "
             f"arquivo_ref={referencia_arquivo_log(arquivo_entrada)} "
             f"width={info.get('width')} height={info.get('height')} fps={info.get('fps')} "
-            f"vcodec={info.get('vcodec')} acodec={info.get('acodec')} permitir_hevc={permitir_hevc}"
+            f"vcodec={info.get('vcodec')} acodec={info.get('acodec')} "
+            f"orientacao={info.get('orientation')} rotacao={info.get('rotation')} "
+            f"permitir_hevc={permitir_hevc}"
         )
         return arquivo_entrada
 
@@ -2185,8 +2319,7 @@ def preparar_arquivo_para_envio(arquivo_entrada, plataforma=None, info=None):
         acodec = (info.get("acodec") or "none").lower()
 
         if (
-            width <= 720
-            and height <= 1280
+            dimensoes_dentro_limite_720p(width, height)
             and fps <= 30.5
             and ext != ".mp4"
             and acodec in ("aac", "none")
@@ -2201,7 +2334,7 @@ def preparar_arquivo_para_envio(arquivo_entrada, plataforma=None, info=None):
             return remuxar_para_mp4_faststart(arquivo_entrada)
 
     logger.info(
-        f"[MIDIA] Convertendo arquivo para padrão 720x1280 30fps | plataforma={plataforma} "
+        f"[MIDIA] Convertendo arquivo para padrão 720p adaptativo 30fps | plataforma={plataforma} "
         f"arquivo_ref={referencia_arquivo_log(arquivo_entrada)} "
         f"info={info} permitir_hevc={permitir_hevc}"
     )
@@ -5211,9 +5344,19 @@ def formatos_progressivos_instagram(info):
         largura = item.get("width")
         altura = item.get("height")
         try:
-            if largura and int(largura) > 720:
-                continue
-            if altura and int(altura) > 1280:
+            largura_exibicao, altura_exibicao = dimensoes_exibicao(
+                largura,
+                altura,
+                item.get("rotation") or (info or {}).get("rotation") or 0,
+            )
+            if (
+                largura_exibicao > 0
+                and altura_exibicao > 0
+                and not dimensoes_dentro_limite_720p(
+                    largura_exibicao,
+                    altura_exibicao,
+                )
+            ):
                 continue
         except (TypeError, ValueError):
             pass
@@ -5729,8 +5872,11 @@ def mapear_erro_download(err_text, plataforma="geral"):
             return "❌ O Pinterest demorou para responder. Tente novamente."
         if "403" in err or "404" in err or "json metadata" in err:
             return "❌ O Pinterest bloqueou esse link no momento. Tente outro pin ou tente novamente depois."
-        if "720x1280" in err or "30fps" in err:
-            return "❌ Não encontrei uma versão do pin compatível com o limite máximo de 720x1280 em até 30 fps."
+        if "720x1280" in err or "720p" in err or "30fps" in err:
+            return (
+                "❌ Não encontrei uma versão do pin compatível com 720p "
+                "(720x1280 vertical ou 1280x720 horizontal) em até 30 fps."
+            )
         return texto_erro
 
     if plataforma == "instagram":
@@ -5850,8 +5996,11 @@ def mapear_erro_download(err_text, plataforma="geral"):
         return "❌ Esse conteúdo é privado ou exige login."
     if "403" in err:
         return "❌ A plataforma bloqueou esse link no momento. Tente novamente mais tarde."
-    if "720x1280" in err or "30fps" in err:
-        return "❌ Não encontrei uma versão compatível com o limite máximo de 720x1280 em até 30 fps."
+    if "720x1280" in err or "720p" in err or "30fps" in err:
+        return (
+            "❌ Não encontrei uma versão compatível com 720p "
+            "(720x1280 vertical ou 1280x720 horizontal) em até 30 fps."
+        )
     return texto_erro
 
 
@@ -8944,7 +9093,7 @@ def resolver_link_pinterest(url):
 def baixar_pinterest_capado(url, prefix, info=None):
     url = resolver_link_pinterest(url)
 
-    formatos = formatos_por_plataforma(is_pinterest=True)
+    formatos = formatos_por_plataforma(is_pinterest=True, info=info)
 
     common_opts = montar_download_opts(prefix, is_pinterest=True)
     ultimo_erro = None
@@ -13557,21 +13706,11 @@ def processar_download_mercado_livre_clips(
             f"acodec={info_baixada.get('acodec')}"
         )
 
-        if os.path.getsize(arquivo_baixado) > MAX_OUTPUT_FILE_BYTES:
-            logger.info(
-                "[ML_CLIPS_COMPACTACAO] necessaria=True "
-                f"limite_mb={MAX_OUTPUT_FILE_MB}"
-            )
-            arquivo_envio = converter_para_720x1280_30fps(
-                arquivo_baixado,
-                info=info_baixada,
-            )
-        else:
-            arquivo_envio = preparar_arquivo_para_envio(
-                arquivo_baixado,
-                plataforma=plataforma,
-                info=info_baixada,
-            )
+        arquivo_envio = preparar_arquivo_para_envio(
+            arquivo_baixado,
+            plataforma=plataforma,
+            info=info_baixada,
+        )
 
         info_envio = validar_arquivo_midia(
             arquivo_envio,
@@ -14211,21 +14350,11 @@ def processar_download_shopee(
             f"acodec={info_baixada.get('acodec')} sem_watermark=True"
         )
 
-        if os.path.getsize(arquivo_baixado) > MAX_OUTPUT_FILE_BYTES:
-            logger.info(
-                "[SHOPEE_COMPACTACAO] necessaria=True "
-                f"limite_mb={MAX_OUTPUT_FILE_MB}"
-            )
-            arquivo_envio = converter_para_720x1280_30fps(
-                arquivo_baixado,
-                info=info_baixada,
-            )
-        else:
-            arquivo_envio = preparar_arquivo_para_envio(
-                arquivo_baixado,
-                plataforma=plataforma,
-                info=info_baixada,
-            )
+        arquivo_envio = preparar_arquivo_para_envio(
+            arquivo_baixado,
+            plataforma=plataforma,
+            info=info_baixada,
+        )
         info_envio = validar_arquivo_midia(
             arquivo_envio,
             MAX_OUTPUT_FILE_BYTES,
@@ -14284,12 +14413,59 @@ def processar_download_shopee(
 # =========================================
 # DOWNLOAD
 # =========================================
-def formatos_capados_gerais():
+def dimensoes_info_yt_dlp(info):
+    """Obtém dimensões de exibição dos metadados já consultados pelo yt-dlp."""
+    if not isinstance(info, dict):
+        return 0, 0
+
+    def dimensoes_item(item):
+        if not isinstance(item, dict):
+            return 0, 0
+        return dimensoes_exibicao(
+            item.get("width"),
+            item.get("height"),
+            item.get("rotation") or info.get("rotation") or 0,
+        )
+
+    largura, altura = dimensoes_item(info)
+    if largura > 0 and altura > 0:
+        return largura, altura
+
+    candidatos = []
+    for chave in ("requested_formats", "formats"):
+        for item in info.get(chave) or []:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("vcodec") or "").lower() == "none":
+                continue
+            item_largura, item_altura = dimensoes_item(item)
+            if item_largura > 0 and item_altura > 0:
+                candidatos.append((item_largura * item_altura, item_largura, item_altura))
+    if not candidatos:
+        return 0, 0
+    _area, largura, altura = max(candidatos)
+    return largura, altura
+
+
+def filtro_dimensoes_yt_dlp(info=None):
+    largura, altura = dimensoes_info_yt_dlp(info)
+    orientacao = orientacao_por_dimensoes(largura, altura)
+    if orientacao == "horizontal":
+        return "[width<=1280][height<=720]"
+    if orientacao in ("vertical", "quadrada"):
+        return "[width<=720][height<=1280]"
+    # Metadados desconhecidos: limita cada eixo a 1280. O ffprobe e o pipeline
+    # final ainda impedem quadrados acima de 720 e qualquer transcode indevido.
+    return "[width<=1280][height<=1280]"
+
+
+def formatos_capados_gerais(info=None):
+    limite = filtro_dimensoes_yt_dlp(info)
     return [
-        "bestvideo[ext=mp4][width<=720][height<=1280][fps<=30]+bestaudio[ext=m4a]/best[ext=mp4][width<=720][height<=1280][fps<=30]",
-        "bestvideo[width<=720][height<=1280][fps<=30]+bestaudio/best[width<=720][height<=1280][fps<=30]",
-        "best[ext=mp4][width<=720][height<=1280]",
-        "best[width<=720][height<=1280]"
+        f"bestvideo[ext=mp4]{limite}[fps<=30]+bestaudio[ext=m4a]/best[ext=mp4]{limite}[fps<=30]",
+        f"bestvideo{limite}[fps<=30]+bestaudio/best{limite}[fps<=30]",
+        f"best[ext=mp4]{limite}",
+        f"best{limite}",
     ]
 
 
@@ -14299,52 +14475,54 @@ def formatos_por_plataforma(
     is_pinterest=False,
     is_rednote=False,
     is_facebook_reel=False,
+    info=None,
 ):
+    limite = filtro_dimensoes_yt_dlp(info)
     if is_instagram:
         # O seletor bv*+ba/b é o padrão moderno recomendado pelo yt-dlp:
         # prefere um vídeo que já possa conter áudio e combina uma faixa de
         # áudio separada quando ela existe. As primeiras opções mantêm o limite
         # do bot; a última é um fallback que o pipeline reduz depois, se preciso.
         return [
-            "bv*[ext=mp4][width<=720][height<=1280][fps<=30]+ba[ext=m4a]/b[ext=mp4][width<=720][height<=1280][fps<=30]",
-            "bv*[width<=720][height<=1280][fps<=30]+ba/b[width<=720][height<=1280][fps<=30]",
+            f"bv*[ext=mp4]{limite}[fps<=30]+ba[ext=m4a]/b[ext=mp4]{limite}[fps<=30]",
+            f"bv*{limite}[fps<=30]+ba/b{limite}[fps<=30]",
             "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]",
             "bv*+ba/b",
         ]
 
     if is_pinterest:
         return [
-            "bestvideo[ext=mp4][width<=720][height<=1280][fps<=30]+bestaudio[ext=m4a]/bestvideo[width<=720][height<=1280][fps<=30]+bestaudio/best[ext=mp4][width<=720][height<=1280][fps<=30]/best[width<=720][height<=1280][fps<=30]",
-            "bestvideo[ext=mp4][width<=720][height<=1280]+bestaudio[ext=m4a]/bestvideo[width<=720][height<=1280]+bestaudio/best[ext=mp4][width<=720][height<=1280]/best[width<=720][height<=1280]",
-            "best[ext=mp4][width<=720][height<=1280][fps<=30]",
-            "best[ext=mp4][width<=720][height<=1280]",
-            "best[width<=720][height<=1280][fps<=30]",
-            "best[width<=720][height<=1280]"
+            f"bestvideo[ext=mp4]{limite}[fps<=30]+bestaudio[ext=m4a]/bestvideo{limite}[fps<=30]+bestaudio/best[ext=mp4]{limite}[fps<=30]/best{limite}[fps<=30]",
+            f"bestvideo[ext=mp4]{limite}+bestaudio[ext=m4a]/bestvideo{limite}+bestaudio/best[ext=mp4]{limite}/best{limite}",
+            f"best[ext=mp4]{limite}[fps<=30]",
+            f"best[ext=mp4]{limite}",
+            f"best{limite}[fps<=30]",
+            f"best{limite}",
         ]
 
     if is_tiktok:
         # A fonte HD sem marca não informa resolução antes do download. Baixa
         # a melhor variante e o pipeline de mídia aplica depois o limite
-        # uniforme de 720x1280 e 30 fps.
-        return ["best[ext=mp4]/best"] + formatos_capados_gerais()
+        # de 720p conforme a orientação e até 30 fps.
+        return ["best[ext=mp4]/best"] + formatos_capados_gerais(info)
 
     if is_rednote:
-        return formatos_capados_gerais() + [
+        return formatos_capados_gerais(info) + [
             "best[ext=mp4]/best"
         ]
 
     if is_facebook_reel:
         return [
-            "best[ext=mp4][vcodec!=none][acodec!=none][width<=720][height<=1280][fps<=30]",
-            "best[ext=mp4][vcodec!=none][acodec!=none][width<=720][height<=1280]",
-            "bestvideo[ext=mp4][width<=720][height<=1280][fps<=30]+bestaudio[ext=m4a]/best[ext=mp4][width<=720][height<=1280][fps<=30]",
-            "bestvideo[width<=720][height<=1280][fps<=30]+bestaudio/best[width<=720][height<=1280][fps<=30]",
+            f"best[ext=mp4][vcodec!=none][acodec!=none]{limite}[fps<=30]",
+            f"best[ext=mp4][vcodec!=none][acodec!=none]{limite}",
+            f"bestvideo[ext=mp4]{limite}[fps<=30]+bestaudio[ext=m4a]/best[ext=mp4]{limite}[fps<=30]",
+            f"bestvideo{limite}[fps<=30]+bestaudio/best{limite}[fps<=30]",
             "best[ext=mp4][vcodec!=none][acodec!=none]",
             "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]",
             "bestvideo+bestaudio/best",
         ]
 
-    return formatos_capados_gerais()
+    return formatos_capados_gerais(info)
 
 
 def _processar_download(message, url, status_msg, reserva_download=None, user=None):
@@ -14860,6 +15038,7 @@ def _processar_download(message, url, status_msg, reserva_download=None, user=No
             is_pinterest=is_pinterest,
             is_rednote=is_rednote,
             is_facebook_reel=is_facebook_reel,
+            info=info,
         )
         formatos = list(dict.fromkeys(formatos))
         baixou = False
@@ -15013,7 +15192,7 @@ def _processar_download(message, url, status_msg, reserva_download=None, user=No
         if not baixou:
             raise FalhaComponenteDownload(
                 plataforma,
-                ultimo_erro or "Falha ao baixar dentro do limite 720x1280 30fps",
+                ultimo_erro or "Falha ao baixar dentro do limite 720p 30fps",
             )
 
         registrar_sucesso_plataforma(plataforma)
@@ -16410,7 +16589,7 @@ def encerrar_healthcheck():
 # MAIN
 # =========================================
 if __name__ == "__main__":
-    logger.info("[BOT_BUILD] bot_downloads_v4_ml_clips_v12_5_landing_auto_redirect")
+    logger.info("[BOT_BUILD] bot_downloads_v4_etapa3_midia_720p_adaptativa")
     logger.info("[VIP_SYNC_CONFIG] startup=True pos_pagamento=True bloqueio_removervip=True comando_syncvip=True")
     logger.info("[VIP_SYNC_FIX] projection_status=True formatacao_newline=True log_motivo=True")
     logger.info("[VIP_SYNC_POLICY] paid_sozinho_nao_reativa=True exige_vip_aplicado_ao_pedido=True respeita_bloqueio_admin=True")
@@ -16453,6 +16632,16 @@ if __name__ == "__main__":
         f"max_duration={MAX_DURATION_SECONDS}s source_max={MAX_SOURCE_FILE_MB}MB "
         f"output_max={MAX_OUTPUT_FILE_MB}MB ffmpeg_timeout={FFMPEG_TIMEOUT_SECONDS}s "
         f"threads={FFMPEG_THREADS}"
+    )
+    logger.info(
+        "[MIDIA_ORIENTACAO_CONFIG] vertical=720x1280 horizontal=1280x720 "
+        "quadrado=720x720 rotacao_metadata=True escala_sem_ampliar=True"
+    )
+    logger.info(
+        f"[MIDIA_ECONOMIA_CONFIG] original_ate_mb={SMART_COMPRESSION_MIN_SIZE_MB} "
+        f"compressao_bitrate_min_kbps={SMART_COMPRESSION_BITRATE_KBPS} "
+        f"reducao_minima_pct={SMART_COMPRESSION_MIN_REDUCTION_PERCENT} "
+        "arquivo_pequeno_compativel=sem_ffmpeg cache_profile=v3"
     )
     logger.info(
         f"[DISK_GUARD_CONFIG] minimo_livre={MIN_DISK_FREE_MB}MB "
