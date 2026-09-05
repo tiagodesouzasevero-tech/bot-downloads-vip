@@ -1,4 +1,4 @@
-# BUILD_FILE: ETAPA3_MIDIA_720P_ADAPTATIVA_20260902
+# BUILD_FILE: ETAPA3_MIDIA_720P_ADAPTATIVA_AUTO_BACKUP_20260904
 import os
 import re
 import glob
@@ -334,6 +334,22 @@ VIP_EXPIRATION_NOTICE_CHECK_SECONDS = get_env_int(
     "VIP_EXPIRATION_NOTICE_CHECK_SECONDS", 3600, 300, 86400
 )
 VIP_EXPIRATION_NOTICE_INITIAL_DELAY_SECONDS = 60
+
+# Backup automático diário. Por padrão fica ativo às 04:00 no fuso operacional
+# (America/Sao_Paulo). As variáveis são opcionais; não é preciso adicionar nada
+# na Railway para usar a configuração recomendada.
+AUTO_BACKUP_ENABLED = str(
+    os.environ.get("AUTO_BACKUP_ENABLED", "true") or "true"
+).strip().lower() not in {"0", "false", "no", "off", "nao", "não"}
+AUTO_BACKUP_HOUR = get_env_int("AUTO_BACKUP_HOUR", 4, 0, 23)
+AUTO_BACKUP_RETRY_MINUTES = get_env_int(
+    "AUTO_BACKUP_RETRY_MINUTES", 60, 15, 360
+)
+AUTO_BACKUP_CLAIM_MINUTES = get_env_int(
+    "AUTO_BACKUP_CLAIM_MINUTES", 20, 5, 120
+)
+AUTO_BACKUP_STATE_DOC_ID = "auto_backup_daily_v1"
+
 PIX_PENDING_PAGE_SIZE = 8
 TIKWM_REQUEST_TIMEOUT_SECONDS = get_env_int(
     "TIKWM_REQUEST_TIMEOUT_SECONDS", 12, 5, 30
@@ -1367,6 +1383,35 @@ def loop_watchdog_worker():
     logger.info("[WORKER_WATCHDOG_LOOP] encerrado durante drenagem")
 
 
+def _agendar_primeira_verificacao_backup_automatico():
+    """Retorna quando o maintenance-loop deve checar o backup pela primeira vez.
+
+    Se o processo inicia depois das 04:00, a checagem acontece quase de imediato.
+    O MongoDB decide se o backup do dia já foi concluído, evitando duplicidade
+    após deploys ou reinícios.
+    """
+    if not AUTO_BACKUP_ENABLED:
+        return None
+
+    agora = agora_tz()
+    alvo_hoje = agora.replace(
+        hour=AUTO_BACKUP_HOUR, minute=0, second=0, microsecond=0
+    )
+    if agora < alvo_hoje:
+        return alvo_hoje
+    return agora + timedelta(seconds=5)
+
+
+def _agendar_proximo_backup_automatico():
+    agora = agora_tz()
+    alvo = agora.replace(
+        hour=AUTO_BACKUP_HOUR, minute=0, second=0, microsecond=0
+    )
+    if alvo <= agora:
+        alvo += timedelta(days=1)
+    return alvo
+
+
 def cleanup_download_dir_periodicamente(interval_minutes=60, max_age_hours=6):
     intervalo_segundos = max(300, int(interval_minutes * 60))
     proxima_limpeza = time.monotonic() + intervalo_segundos
@@ -1375,12 +1420,14 @@ def cleanup_download_dir_periodicamente(interval_minutes=60, max_age_hours=6):
     )
     recuperar_fila_em = time.monotonic() + QUEUE_RECOVERY_DELAY_SECONDS
     recuperacao_fila_executada = False
+    proximo_backup_automatico = _agendar_primeira_verificacao_backup_automatico()
     logger.info(
         f"[MAINTENANCE_LOOP] iniciado cleanup_minutes={interval_minutes} "
         f"max_age_hours={max_age_hours} "
         f"vip_notice_check_seconds={VIP_EXPIRATION_NOTICE_CHECK_SECONDS} "
         f"queue_recovery_delay_seconds={QUEUE_RECOVERY_DELAY_SECONDS} "
         f"queue_recovery_ttl_hours={QUEUE_RECOVERY_TTL_HOURS} "
+        f"auto_backup={AUTO_BACKUP_ENABLED} auto_backup_hour={AUTO_BACKUP_HOUR:02d}:00 "
         "watchdog_separado=True queue_recovery_contains_urls=False"
     )
 
@@ -1417,14 +1464,45 @@ def cleanup_download_dir_periodicamente(interval_minutes=60, max_age_hours=6):
                 agora_monotonic + VIP_EXPIRATION_NOTICE_CHECK_SECONDS
             )
 
+        if (
+            AUTO_BACKUP_ENABLED
+            and proximo_backup_automatico is not None
+            and agora_tz() >= proximo_backup_automatico
+        ):
+            try:
+                resultado_backup = executar_backup_automatico_diario()
+                status_backup = str((resultado_backup or {}).get("status") or "erro")
+                if status_backup in {"sucesso", "ja_concluido"}:
+                    proximo_backup_automatico = _agendar_proximo_backup_automatico()
+                else:
+                    proximo_backup_automatico = agora_tz() + timedelta(
+                        minutes=AUTO_BACKUP_RETRY_MINUTES
+                    )
+            except Exception as e:
+                logger.error(
+                    f"[AUTO_BACKUP_LOOP] erro={sanitizar_erro_log(e)}"
+                )
+                proximo_backup_automatico = agora_tz() + timedelta(
+                    minutes=AUTO_BACKUP_RETRY_MINUTES
+                )
+
         proxima_atividade = min(proxima_limpeza, proximo_aviso_vip)
         if not recuperacao_fila_executada:
             proxima_atividade = min(proxima_atividade, recuperar_fila_em)
+
+        # O agendamento do backup usa datetime de calendário, enquanto as outras
+        # rotinas usam monotonic. Convertê-lo apenas para definir o tempo máximo
+        # de espera evita uma thread adicional e praticamente não altera consumo.
+        espera_backup = None
+        if AUTO_BACKUP_ENABLED and proximo_backup_automatico is not None:
+            espera_backup = max(0.0, (proximo_backup_automatico - agora_tz()).total_seconds())
+
         espera = max(
             0.25,
             min(
                 60,
                 proxima_atividade - time.monotonic(),
+                espera_backup if espera_backup is not None else 60,
             ),
         )
         SHUTDOWN_EVENT.wait(espera)
@@ -9398,13 +9476,16 @@ def consultar_docs_backup(tipo):
     raise ValueError("Tipo de backup inválido")
 
 
-def processar_backup_admin(tipo, origem_chat_id=None):
+def processar_backup_admin(tipo, origem_chat_id=None, automatico=False):
     if not BACKUP_ADMIN_LOCK.acquire(blocking=False):
-        safe_send_message(
-            origem_chat_id or ADMIN_ID,
-            "⚠️ Já existe um backup sendo gerado. Aguarde a conclusão.",
-        )
-        return
+        if automatico:
+            logger.info("[AUTO_BACKUP] adiado=True motivo=backup_em_andamento")
+        else:
+            safe_send_message(
+                origem_chat_id or ADMIN_ID,
+                "⚠️ Já existe um backup sendo gerado. Aguarde a conclusão.",
+            )
+        return {"ok": False, "motivo": "backup_em_andamento"}
 
     caminho_arquivo = None
     try:
@@ -9426,20 +9507,55 @@ def processar_backup_admin(tipo, origem_chat_id=None):
             total = payload["count"]
 
         caminho_arquivo = salvar_backup_json(nome_base, payload)
-        enviar_documento_privado_admin(caminho_arquivo, legenda=f"{legenda} | registros: {total}")
 
-        mensagem_ok = f"✅ {legenda} e enviado no seu privado. Registros: {total}"
-        safe_send_message(ADMIN_ID, mensagem_ok)
+        # O automático só é marcado como concluído depois de reler o arquivo e
+        # passar pela mesma validação estrutural/dry-run usada pelo administrador.
+        if automatico and tipo == "geral":
+            garantir_arquivo_privado(caminho_arquivo)
+            with open(caminho_arquivo, "r", encoding="utf-8") as f:
+                payload_relido = json.load(f)
+            validacao = validar_payload_backup_geral(payload_relido)
+            if not validacao.get("ok"):
+                raise RuntimeError(
+                    "BACKUP_AUTOMATICO_VALIDACAO_FALHOU "
+                    + ",".join((validacao.get("erros") or [])[:5])
+                )
 
-        if origem_chat_id and origem_chat_id != ADMIN_ID:
-            safe_send_message(origem_chat_id, "✅ Backup gerado e enviado no privado do ADM.")
+        if automatico:
+            legenda_envio = (
+                f"🤖 Backup automático diário | registros: {total} | "
+                f"{agora_tz().strftime('%d/%m/%Y %H:%M')}"
+            )
+        else:
+            legenda_envio = f"{legenda} | registros: {total}"
+
+        enviar_documento_privado_admin(caminho_arquivo, legenda=legenda_envio)
+
+        if not automatico:
+            mensagem_ok = f"✅ {legenda} e enviado no seu privado. Registros: {total}"
+            safe_send_message(ADMIN_ID, mensagem_ok)
+
+            if origem_chat_id and origem_chat_id != ADMIN_ID:
+                safe_send_message(
+                    origem_chat_id,
+                    "✅ Backup gerado e enviado no privado do ADM.",
+                )
+
+        return {"ok": True, "total": total}
     except Exception as e:
         logger.error(
-            f"[BACKUP_ADMIN] tipo={tipo} erro={sanitizar_erro_log(e)}"
+            f"[{'AUTO_BACKUP' if automatico else 'BACKUP_ADMIN'}] "
+            f"tipo={tipo} erro={sanitizar_erro_log(e)}"
         )
-        safe_send_message(ADMIN_ID, f"❌ Erro ao gerar backup `{tipo}`.", parse_mode="Markdown")
-        if origem_chat_id and origem_chat_id != ADMIN_ID:
-            safe_send_message(origem_chat_id, "❌ Erro ao gerar backup do ADM.")
+        if not automatico:
+            safe_send_message(
+                ADMIN_ID,
+                f"❌ Erro ao gerar backup `{tipo}`.",
+                parse_mode="Markdown",
+            )
+            if origem_chat_id and origem_chat_id != ADMIN_ID:
+                safe_send_message(origem_chat_id, "❌ Erro ao gerar backup do ADM.")
+        return {"ok": False, "motivo": "erro", "erro": sanitizar_erro_log(e)}
     finally:
         if caminho_arquivo and os.path.exists(caminho_arquivo):
             try:
@@ -9452,6 +9568,210 @@ def processar_backup_admin(tipo, origem_chat_id=None):
                 )
         BACKUP_ADMIN_LOCK.release()
 
+
+def _inicializar_estado_backup_automatico():
+    agora = agora_tz()
+    operacao_continuidade_col.update_one(
+        {"_id": AUTO_BACKUP_STATE_DOC_ID},
+        {
+            "$setOnInsert": {
+                "created_at": agora,
+                "service": SERVICE_NAME,
+                "environment": ENVIRONMENT_NAME,
+                "schedule_hour": AUTO_BACKUP_HOUR,
+            },
+            "$set": {"updated_at": agora},
+        },
+        upsert=True,
+    )
+
+
+def _adquirir_reserva_backup_automatico(data_backup):
+    """Reserva o backup do dia no MongoDB para impedir envios duplicados."""
+    _inicializar_estado_backup_automatico()
+    agora = agora_tz()
+    claim_token = secrets.token_hex(16)
+    claim_until = agora + timedelta(minutes=AUTO_BACKUP_CLAIM_MINUTES)
+
+    estado = operacao_continuidade_col.find_one_and_update(
+        {
+            "_id": AUTO_BACKUP_STATE_DOC_ID,
+            "last_success_date": {"$ne": data_backup},
+            "$and": [
+                {
+                    "$or": [
+                        {"next_retry_at": {"$exists": False}},
+                        {"next_retry_at": None},
+                        {"next_retry_at": {"$lte": agora}},
+                    ]
+                },
+                {
+                    "$or": [
+                        {"claim_until": {"$exists": False}},
+                        {"claim_until": None},
+                        {"claim_until": {"$lte": agora}},
+                    ]
+                },
+            ],
+        },
+        {
+            "$set": {
+                "claim_date": data_backup,
+                "claim_token": claim_token,
+                "claim_until": claim_until,
+                "claim_instance_id": APP_INSTANCE_ID,
+                "last_attempt_at": agora,
+                "updated_at": agora,
+                "schedule_hour": AUTO_BACKUP_HOUR,
+            },
+            "$inc": {"attempts_total": 1},
+        },
+        return_document=ReturnDocument.AFTER,
+    )
+
+    if not estado:
+        atual = operacao_continuidade_col.find_one(
+            {"_id": AUTO_BACKUP_STATE_DOC_ID},
+            {"last_success_date": 1, "claim_until": 1, "next_retry_at": 1},
+        ) or {}
+        if atual.get("last_success_date") == data_backup:
+            return None, "ja_concluido"
+        return None, "ocupado_ou_aguardando_retry"
+
+    if not hmac.compare_digest(str(estado.get("claim_token") or ""), claim_token):
+        return None, "reserva_concorrente"
+    return claim_token, "reservado"
+
+
+def _finalizar_backup_automatico_sucesso(data_backup, claim_token, total):
+    agora = agora_tz()
+    resultado = operacao_continuidade_col.update_one(
+        {
+            "_id": AUTO_BACKUP_STATE_DOC_ID,
+            "claim_date": data_backup,
+            "claim_token": claim_token,
+        },
+        {
+            "$set": {
+                "last_success_date": data_backup,
+                "last_success_at": agora,
+                "last_success_records": int(total or 0),
+                "last_success_instance_id": APP_INSTANCE_ID,
+                "updated_at": agora,
+            },
+            "$unset": {
+                "claim_date": "",
+                "claim_token": "",
+                "claim_until": "",
+                "claim_instance_id": "",
+                "next_retry_at": "",
+                "last_failure_error": "",
+            },
+        },
+    )
+    return bool(getattr(resultado, "modified_count", 0))
+
+
+def _finalizar_backup_automatico_falha(data_backup, claim_token, erro):
+    agora = agora_tz()
+    proxima_tentativa = agora + timedelta(minutes=AUTO_BACKUP_RETRY_MINUTES)
+    operacao_continuidade_col.update_one(
+        {
+            "_id": AUTO_BACKUP_STATE_DOC_ID,
+            "claim_date": data_backup,
+            "claim_token": claim_token,
+        },
+        {
+            "$set": {
+                "last_failure_at": agora,
+                "last_failure_error": sanitizar_erro_log(erro)[:300],
+                "next_retry_at": proxima_tentativa,
+                "updated_at": agora,
+            },
+            "$unset": {
+                "claim_date": "",
+                "claim_token": "",
+                "claim_until": "",
+                "claim_instance_id": "",
+            },
+        },
+    )
+    return proxima_tentativa
+
+
+def executar_backup_automatico_diario():
+    """Gera no máximo um backup geral por dia e envia ao ADM às 04:00."""
+    if not AUTO_BACKUP_ENABLED or SHUTDOWN_EVENT.is_set():
+        return {"status": "desativado"}
+
+    data_backup = hoje_str()
+    try:
+        claim_token, motivo = _adquirir_reserva_backup_automatico(data_backup)
+    except Exception as e:
+        logger.error(
+            f"[AUTO_BACKUP_RESERVA] erro={sanitizar_erro_log(e)}"
+        )
+        return {"status": "erro_reserva"}
+
+    if not claim_token:
+        if motivo == "ja_concluido":
+            logger.info(f"[AUTO_BACKUP] data={data_backup} ja_concluido=True")
+            return {"status": "ja_concluido"}
+        logger.info(
+            f"[AUTO_BACKUP] data={data_backup} executado=False motivo={motivo}"
+        )
+        return {"status": "adiado", "motivo": motivo}
+
+    resultado = processar_backup_admin(
+        "geral",
+        origem_chat_id=None,
+        automatico=True,
+    )
+
+    if resultado.get("ok"):
+        confirmado = _finalizar_backup_automatico_sucesso(
+            data_backup,
+            claim_token,
+            resultado.get("total"),
+        )
+        if not confirmado:
+            logger.warning(
+                f"[AUTO_BACKUP] data={data_backup} arquivo_enviado=True "
+                "estado_persistido=False"
+            )
+            safe_send_message(
+                ADMIN_ID,
+                "⚠️ O backup automático foi enviado, mas o bot não conseguiu "
+                "registrar a conclusão no banco. Pode haver nova tentativa depois.",
+            )
+            return {"status": "erro_confirmacao"}
+
+        logger.info(
+            f"[AUTO_BACKUP] data={data_backup} sucesso=True "
+            f"registros={int(resultado.get('total') or 0)}"
+        )
+        return {"status": "sucesso", "total": resultado.get("total", 0)}
+
+    erro = resultado.get("erro") or resultado.get("motivo") or "erro_desconhecido"
+    try:
+        proxima_tentativa = _finalizar_backup_automatico_falha(
+            data_backup, claim_token, erro
+        )
+    except Exception as e:
+        logger.error(
+            f"[AUTO_BACKUP_FALHA_PERSISTIR] erro={sanitizar_erro_log(e)}"
+        )
+        proxima_tentativa = agora_tz() + timedelta(
+            minutes=AUTO_BACKUP_RETRY_MINUTES
+        )
+
+    safe_send_message(
+        ADMIN_ID,
+        "⚠️ <b>Backup automático diário falhou</b>\n\n"
+        f"Nova tentativa prevista após: <b>{proxima_tentativa.strftime('%H:%M')}</b>.",
+        parse_mode="HTML",
+    )
+    return {"status": "falha", "motivo": str(erro)}
 
 
 def _vip_backup_ativo(vip_ate, hoje=None):
@@ -16589,12 +16909,19 @@ def encerrar_healthcheck():
 # MAIN
 # =========================================
 if __name__ == "__main__":
-    logger.info("[BOT_BUILD] bot_downloads_v4_etapa3_midia_720p_adaptativa")
+    logger.info("[BOT_BUILD] bot_downloads_v4_etapa3_midia_720p_adaptativa_auto_backup")
     logger.info("[VIP_SYNC_CONFIG] startup=True pos_pagamento=True bloqueio_removervip=True comando_syncvip=True")
     logger.info("[VIP_SYNC_FIX] projection_status=True formatacao_newline=True log_motivo=True")
     logger.info("[VIP_SYNC_POLICY] paid_sozinho_nao_reativa=True exige_vip_aplicado_ao_pedido=True respeita_bloqueio_admin=True")
     logger.info("[START_FIX] mongo_update_conflict=False tracking_nao_bloqueia_start=True vip_e_gratis=True")
     logger.info("[BACKUP_MENU_CONFIG] backupvips=True backupgeral=True")
+    logger.info(
+        f"[AUTO_BACKUP_CONFIG] enabled={AUTO_BACKUP_ENABLED} "
+        f"hour={AUTO_BACKUP_HOUR:02d}:00 timezone=America/Sao_Paulo "
+        f"retry_minutes={AUTO_BACKUP_RETRY_MINUTES} "
+        f"claim_minutes={AUTO_BACKUP_CLAIM_MINUTES} "
+        "mongo_idempotent=True validacao_dry_run=True"
+    )
     logger.info(
         f"[VIP_CONTINUIDADE_CONFIG] ativo=True heartbeat="
         f"{VIP_CONTINUIDADE_HEARTBEAT_SECONDS}s troca_bot_auto=True "
