@@ -1,4 +1,4 @@
-# BUILD_FILE: ETAPA3_MIDIA_720P_ADAPTATIVA_AUTO_BACKUP_20260904
+# BUILD_FILE: ETAPA7_MODULAR_CONFIG_20260905
 import os
 import re
 import glob
@@ -59,39 +59,11 @@ from telebot import types
 from pymongo import MongoClient, ReturnDocument, UpdateOne
 from pymongo.errors import DuplicateKeyError
 from requests.exceptions import RequestException, Timeout
+from config_utils import get_env_required, get_first_env, get_env_int
 
 # =========================================
 # CONFIGURAÇÕES
 # =========================================
-def get_env_required(name):
-    value = os.environ.get(name)
-    if value is None or str(value).strip() == "":
-        raise RuntimeError(f"Variável de ambiente obrigatória ausente: {name}")
-    return value.strip()
-
-
-def get_first_env(names, default=None):
-    for name in names:
-        value = os.environ.get(name)
-        if value is not None and str(value).strip() != "":
-            return value.strip()
-    return default
-
-
-def get_env_int(name, default, minimo=None, maximo=None):
-    value = os.environ.get(name, default)
-    try:
-        value = int(value)
-    except (TypeError, ValueError) as e:
-        raise RuntimeError(f"Variável {name} precisa ser um número inteiro") from e
-
-    if minimo is not None and value < minimo:
-        raise RuntimeError(f"Variável {name} precisa ser maior ou igual a {minimo}")
-    if maximo is not None and value > maximo:
-        raise RuntimeError(f"Variável {name} precisa ser menor ou igual a {maximo}")
-    return value
-
-
 TOKEN_TELEGRAM = get_env_required("TOKEN_TELEGRAM")
 MONGO_URI = get_env_required("MONGO_URI")
 MONGO_DB_NAME = get_env_required("MONGO_DB_NAME")
@@ -16911,7 +16883,7 @@ def encerrar_healthcheck():
 # MAIN
 # =========================================
 if __name__ == "__main__":
-    logger.info("[BOT_BUILD] bot_downloads_v4_etapa3_midia_720p_adaptativa_auto_backup")
+    logger.info("[BOT_BUILD] bot_downloads_v4_etapa7_modular_config")
     logger.info("[VIP_SYNC_CONFIG] startup=True pos_pagamento=True bloqueio_removervip=True comando_syncvip=True")
     logger.info("[VIP_SYNC_FIX] projection_status=True formatacao_newline=True log_motivo=True")
     logger.info("[VIP_SYNC_POLICY] paid_sozinho_nao_reativa=True exige_vip_aplicado_ao_pedido=True respeita_bloqueio_admin=True")
