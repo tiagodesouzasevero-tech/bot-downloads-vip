@@ -179,6 +179,7 @@ VIP_CONTINUIDADE_HEARTBEAT_SECONDS = get_env_int(
 )
 
 FREE_DAILY_LIMIT = 3
+VIP_LIMIT_OFFER_COOLDOWN_SECONDS = 30 * 60
 VIP_RENEWAL_WINDOW_DAYS = 7
 MAX_DURATION_SECONDS = 90
 MAX_URL_LENGTH = get_env_int("MAX_URL_LENGTH", 2048, 256, 8192)
@@ -379,6 +380,8 @@ PAYMENT_ORDER_LOCKS = [Lock() for _ in range(64)]
 EFI_TOKEN_LOCK = Lock()
 DOWNLOAD_PENDING_LOCK = Lock()
 DOWNLOAD_PENDING_USERS = set()
+VIP_LIMIT_OFFER_LOCK = Lock()
+VIP_LIMIT_OFFER_LAST_SHOWN = {}
 DOWNLOAD_QUEUE = PriorityQueue(maxsize=DOWNLOAD_QUEUE_MAX)
 DOWNLOAD_QUEUE_STATE_LOCK = Lock()
 DOWNLOAD_SEQUENCE = itertools.count()
@@ -6241,6 +6244,43 @@ def _atualizar_reserva_com_retentativas(filtro, atualizacao, operacao):
     return None
 
 
+
+def registrar_oferta_vip_limite(user_id):
+    """Marca em memória quando a oferta VIP completa foi exibida por limite diário."""
+    agora = time.monotonic()
+    chave = str(user_id)
+    with VIP_LIMIT_OFFER_LOCK:
+        VIP_LIMIT_OFFER_LAST_SHOWN[chave] = agora
+
+        # Proteção simples de memória: remove registros muito antigos apenas
+        # se o mapa crescer além do necessário para a operação normal.
+        if len(VIP_LIMIT_OFFER_LAST_SHOWN) > 4096:
+            corte = agora - (VIP_LIMIT_OFFER_COOLDOWN_SECONDS * 2)
+            expirados = [
+                uid
+                for uid, exibido_em in VIP_LIMIT_OFFER_LAST_SHOWN.items()
+                if exibido_em < corte
+            ]
+            for uid in expirados:
+                VIP_LIMIT_OFFER_LAST_SHOWN.pop(uid, None)
+
+
+def oferta_vip_limite_em_cooldown(user_id):
+    """Retorna True enquanto a oferta completa ainda estiver no cooldown."""
+    agora = time.monotonic()
+    chave = str(user_id)
+    with VIP_LIMIT_OFFER_LOCK:
+        exibido_em = VIP_LIMIT_OFFER_LAST_SHOWN.get(chave)
+        if exibido_em is None:
+            return False
+
+        decorrido = agora - exibido_em
+        if decorrido >= VIP_LIMIT_OFFER_COOLDOWN_SECONDS:
+            VIP_LIMIT_OFFER_LAST_SHOWN.pop(chave, None)
+            return False
+        return True
+
+
 def confirmar_download_gratis(
     reserva,
     user_id,
@@ -6296,6 +6336,7 @@ def confirmar_download_gratis(
             parse_mode="Markdown",
         )
         mostrar_planos_chat(chat_id, from_user_id)
+        registrar_oferta_vip_limite(user_id)
     return True
 
 
@@ -16224,13 +16265,24 @@ def handle_download(message):
                 DOWNLOAD_PENDING_USERS.discard(user_id)
 
             if erro_reserva == "limite":
-                safe_reply_to(
-                    message,
-                    f"⚠️ *Limite diário atingido ({FREE_DAILY_LIMIT}/{FREE_DAILY_LIMIT})!*\n"
-                    "Para continuar baixando sem limite diário, libere o VIP abaixo: 👇",
-                    parse_mode="Markdown",
-                )
-                mostrar_planos_chat(message.chat.id, message.from_user.id)
+                if oferta_vip_limite_em_cooldown(user_id):
+                    safe_reply_to(
+                        message,
+                        f"⚠️ *Seu limite grátis de hoje já foi atingido "
+                        f"({FREE_DAILY_LIMIT}/{FREE_DAILY_LIMIT}).*\n\n"
+                        "Tente novamente amanhã ou use /vip para liberar "
+                        "downloads sem limite diário.",
+                        parse_mode="Markdown",
+                    )
+                else:
+                    safe_reply_to(
+                        message,
+                        f"⚠️ *Limite diário atingido ({FREE_DAILY_LIMIT}/{FREE_DAILY_LIMIT})!*\n"
+                        "Para continuar baixando sem limite diário, libere o VIP abaixo: 👇",
+                        parse_mode="Markdown",
+                    )
+                    mostrar_planos_chat(message.chat.id, message.from_user.id)
+                    registrar_oferta_vip_limite(user_id)
             elif erro_reserva == "em_andamento":
                 safe_reply_to(
                     message,
@@ -16883,12 +16935,16 @@ def encerrar_healthcheck():
 # MAIN
 # =========================================
 if __name__ == "__main__":
-    logger.info("[BOT_BUILD] bot_downloads_v4_etapa7_modular_config")
+    logger.info("[BOT_BUILD] bot_downloads_v4_etapa8_cooldown_oferta_vip")
     logger.info("[VIP_SYNC_CONFIG] startup=True pos_pagamento=True bloqueio_removervip=True comando_syncvip=True")
     logger.info("[VIP_SYNC_FIX] projection_status=True formatacao_newline=True log_motivo=True")
     logger.info("[VIP_SYNC_POLICY] paid_sozinho_nao_reativa=True exige_vip_aplicado_ao_pedido=True respeita_bloqueio_admin=True")
     logger.info("[START_FIX] mongo_update_conflict=False tracking_nao_bloqueia_start=True vip_e_gratis=True")
     logger.info("[BACKUP_MENU_CONFIG] backupvips=True backupgeral=True")
+    logger.info(
+        f"[VIP_LIMIT_OFFER_CONFIG] cooldown={VIP_LIMIT_OFFER_COOLDOWN_SECONDS // 60}min "
+        "storage=memory mongo_writes=0"
+    )
     logger.info(
         f"[AUTO_BACKUP_CONFIG] enabled={AUTO_BACKUP_ENABLED} "
         f"hour={AUTO_BACKUP_HOUR:02d}:00 timezone=America/Sao_Paulo "
