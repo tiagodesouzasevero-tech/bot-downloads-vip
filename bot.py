@@ -9338,8 +9338,7 @@ def mostrar_planos_chat(chat_id, user_id):
             "✅ Prioridade no processamento\n"
             "✅ TikTok, Pinterest, Shopee Video, Mercado Livre Clips e RedNote\n"
             "✅ Pagamento exclusivamente via Pix\n"
-            "✅ Liberação automática após o pagamento\n\n"
-            f"Sua ID: `{user_id}`"
+            "✅ Liberação automática após o pagamento"
         )
 
     safe_send_message(chat_id, texto, parse_mode="Markdown", reply_markup=markup)
@@ -12172,12 +12171,25 @@ def start(message):
             f"{user.get('downloads_hoje', 0)} de {FREE_DAILY_LIMIT}"
         )
 
+    comando_recebido = (
+        str(message.text or "")
+        .split(maxsplit=1)[0]
+        .split("@", 1)[0]
+        .lower()
+    )
+    mostrar_id_usuario = comando_recebido == "/perfil"
+    linha_id_usuario = (
+        f"• ID de usuário: `{message.from_user.id}`\n"
+        if mostrar_id_usuario
+        else ""
+    )
+
     texto = (
         "📥 *Baixar Vídeos HD*\n\n"
         "Baixe vídeos do TikTok, Pinterest, Shopee Video, Mercado Livre Clips e RedNote.\n\n"
         "• Qualidade: até 720×1280\n"
         f"• Duração máxima: {MAX_DURATION_SECONDS} segundos\n"
-        f"• ID de usuário: `{message.from_user.id}`\n\n"
+        f"{linha_id_usuario}\n"
         f"{status}\n\n"
         "Envie o link de um vídeo para começar ou use o botão *Menu* "
         "para ver as opções."
@@ -16935,7 +16947,7 @@ def encerrar_healthcheck():
 # MAIN
 # =========================================
 if __name__ == "__main__":
-    logger.info("[BOT_BUILD] bot_downloads_v4_etapa8_cooldown_oferta_vip")
+    logger.info("[BOT_BUILD] bot_downloads_v4_etapa9_id_somente_perfil")
     logger.info("[VIP_SYNC_CONFIG] startup=True pos_pagamento=True bloqueio_removervip=True comando_syncvip=True")
     logger.info("[VIP_SYNC_FIX] projection_status=True formatacao_newline=True log_motivo=True")
     logger.info("[VIP_SYNC_POLICY] paid_sozinho_nao_reativa=True exige_vip_aplicado_ao_pedido=True respeita_bloqueio_admin=True")
@@ -16944,6 +16956,10 @@ if __name__ == "__main__":
     logger.info(
         f"[VIP_LIMIT_OFFER_CONFIG] cooldown={VIP_LIMIT_OFFER_COOLDOWN_SECONDS // 60}min "
         "storage=memory mongo_writes=0"
+    )
+    logger.info(
+        "[USER_ID_UX_CONFIG] start=False vip=False perfil=True "
+        "admin_commands_preserved=True"
     )
     logger.info(
         f"[AUTO_BACKUP_CONFIG] enabled={AUTO_BACKUP_ENABLED} "
