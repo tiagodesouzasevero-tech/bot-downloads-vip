@@ -9229,6 +9229,7 @@ def configurar_menu_comandos():
     """Configura o menu nativo do Telegram para usuários e administrador."""
     comandos_usuario = [
         types.BotCommand("start", "Início e status do plano"),
+        types.BotCommand("perfil", "Ver meu perfil e ID"),
         types.BotCommand("vip", "Conhecer os planos VIP"),
         types.BotCommand("suporte", "Falar com o suporte"),
     ]
@@ -16947,7 +16948,7 @@ def encerrar_healthcheck():
 # MAIN
 # =========================================
 if __name__ == "__main__":
-    logger.info("[BOT_BUILD] bot_downloads_v4_etapa9_id_somente_perfil")
+    logger.info("[BOT_BUILD] bot_downloads_v4_etapa9_menu_perfil")
     logger.info("[VIP_SYNC_CONFIG] startup=True pos_pagamento=True bloqueio_removervip=True comando_syncvip=True")
     logger.info("[VIP_SYNC_FIX] projection_status=True formatacao_newline=True log_motivo=True")
     logger.info("[VIP_SYNC_POLICY] paid_sozinho_nao_reativa=True exige_vip_aplicado_ao_pedido=True respeita_bloqueio_admin=True")
