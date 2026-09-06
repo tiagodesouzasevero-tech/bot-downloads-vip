@@ -16661,11 +16661,13 @@ class HealthRequestHandler(BaseHTTPRequestHandler):
             return self._enviar_resposta(200, b"ONLINE")
 
         if caminho == "/health":
+            # Liveness público minimalista: mantém a avaliação interna
+            # sem expor polling, worker, fila ou horários.
+            payload_health = montar_payload_health()
             corpo = json.dumps(
-                montar_payload_health(), ensure_ascii=False
+                {"status": payload_health.get("status", "degraded")},
+                ensure_ascii=False,
             ).encode("utf-8")
-            # O endpoint é de vida do contêiner. Polling ou worker degradados
-            # aparecem no JSON sem provocar ciclos automáticos de reinício.
             return self._enviar_resposta(
                 200,
                 corpo,
