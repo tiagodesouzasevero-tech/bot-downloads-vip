@@ -34,7 +34,6 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from io import BytesIO
 from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlparse, quote
-from zoneinfo import ZoneInfo
 
 import requests
 import qrcode
@@ -60,6 +59,7 @@ from pymongo import MongoClient, ReturnDocument, UpdateOne
 from pymongo.errors import DuplicateKeyError
 from requests.exceptions import RequestException, Timeout
 from config_utils import get_env_required, get_first_env, get_env_int
+from time_utils import TZ, agora_tz, hoje_str, formatar_validade_vip
 
 # =========================================
 # CONFIGURAÇÕES
@@ -106,7 +106,6 @@ DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", "downloads_temp")
 PRIVATE_DIR = os.path.join(DOWNLOAD_DIR, "private")
 PRIVATE_COOKIES_DIR = os.path.join(PRIVATE_DIR, "cookies")
 PRIVATE_BACKUPS_DIR = os.path.join(PRIVATE_DIR, "backups")
-TZ = ZoneInfo("America/Sao_Paulo")
 
 SERVICE_NAME = get_first_env(
     ["SERVICE_NAME", "RAILWAY_SERVICE_NAME"],
@@ -761,23 +760,6 @@ PLANOS_VENDA_ATIVOS = frozenset({"10.00"})
 # =========================================
 # FUNÇÕES AUXILIARES
 # =========================================
-def agora_tz():
-    return datetime.now(TZ)
-
-
-def hoje_str():
-    return agora_tz().strftime("%Y-%m-%d")
-
-
-def formatar_validade_vip(vip_ate):
-    if vip_ate == "Vitalício":
-        return "Vitalício"
-    try:
-        return datetime.strptime(str(vip_ate), "%Y-%m-%d").strftime("%d/%m/%Y")
-    except (TypeError, ValueError):
-        return str(vip_ate or "Ativo")
-
-
 def is_chat_privado(message):
     return getattr(getattr(message, "chat", None), "type", None) == "private"
 
@@ -16948,7 +16930,7 @@ def encerrar_healthcheck():
 # MAIN
 # =========================================
 if __name__ == "__main__":
-    logger.info("[BOT_BUILD] bot_downloads_v4_etapa9_menu_perfil")
+    logger.info("[BOT_BUILD] bot_downloads_v4_etapa12_time_utils")
     logger.info("[VIP_SYNC_CONFIG] startup=True pos_pagamento=True bloqueio_removervip=True comando_syncvip=True")
     logger.info("[VIP_SYNC_FIX] projection_status=True formatacao_newline=True log_motivo=True")
     logger.info("[VIP_SYNC_POLICY] paid_sozinho_nao_reativa=True exige_vip_aplicado_ao_pedido=True respeita_bloqueio_admin=True")
