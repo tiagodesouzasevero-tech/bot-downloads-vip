@@ -86,6 +86,12 @@ EFI_CLIENT_ID = get_env_required("EFI_CLIENT_ID")
 EFI_CLIENT_SECRET = get_env_required("EFI_CLIENT_SECRET")
 EFI_CERT_BASE64 = get_env_required("EFI_CERT_BASE64")
 EFI_PIX_KEY = get_env_required("EFI_PIX_KEY")
+
+# Segredo dedicado exclusivamente à autenticação do endpoint público do
+# webhook da Efí. Durante a migração ele é opcional para preservar o webhook
+# antigo até a Efí confirmar o novo endereço.
+EFI_WEBHOOK_SECRET = get_first_env(["EFI_WEBHOOK_SECRET"], default="")
+
 EFI_API_URL = "https://pix.api.efipay.com.br"
 EFI_PIX_EXPIRATION_SECONDS = 30 * 60
 EFI_PAYMENT_VERIFIABLE_STATUSES = frozenset(
@@ -6811,11 +6817,29 @@ def efi_api_request(
     return response
 
 
-def efi_webhook_hash():
+def efi_webhook_hash_legado():
+    """Hash usado pelo webhook antigo antes da chave dedicada."""
     material = (
         f"{EFI_CLIENT_SECRET}|{TOKEN_TELEGRAM}|downloads-efi-webhook"
     ).encode("utf-8")
     return hashlib.sha256(material).hexdigest()
+
+
+def efi_webhook_hash():
+    """Token público do webhook.
+
+    Quando EFI_WEBHOOK_SECRET está configurado, usa HMAC com uma chave
+    exclusiva do webhook. Sem a variável, mantém temporariamente o token
+    legado para uma implantação sem interrupção.
+    """
+    if not EFI_WEBHOOK_SECRET:
+        return efi_webhook_hash_legado()
+
+    return hmac.new(
+        EFI_WEBHOOK_SECRET.encode("utf-8"),
+        b"downloads-efi-webhook:v2",
+        hashlib.sha256,
+    ).hexdigest()
 
 
 def efi_webhook_url():
@@ -7306,8 +7330,21 @@ def validar_requisicao_webhook_efi(full_path):
     try:
         query = dict(parse_qsl(urlparse(full_path).query, keep_blank_values=True))
         recebido = str(query.get("hmac") or "")
+        if not recebido:
+            return False
+
         esperado = efi_webhook_hash()
-        return bool(recebido) and hmac.compare_digest(recebido, esperado)
+        if hmac.compare_digest(recebido, esperado):
+            return True
+
+        # Compatibilidade temporária: depois que confirmarmos que a Efí já
+        # registrou o webhook com EFI_WEBHOOK_SECRET, este fallback poderá ser
+        # removido numa etapa posterior.
+        if EFI_WEBHOOK_SECRET:
+            legado = efi_webhook_hash_legado()
+            return hmac.compare_digest(recebido, legado)
+
+        return False
     except Exception:
         return False
 
@@ -16930,7 +16967,12 @@ def encerrar_healthcheck():
 # MAIN
 # =========================================
 if __name__ == "__main__":
-    logger.info("[BOT_BUILD] bot_downloads_v4_etapa12_time_utils")
+    logger.info("[BOT_BUILD] bot_downloads_v4_etapa13_efi_webhook_secret")
+    logger.info(
+        "[EFI_WEBHOOK_SECURITY] dedicated_secret=%s legacy_acceptance=%s",
+        bool(EFI_WEBHOOK_SECRET),
+        bool(EFI_WEBHOOK_SECRET),
+    )
     logger.info("[VIP_SYNC_CONFIG] startup=True pos_pagamento=True bloqueio_removervip=True comando_syncvip=True")
     logger.info("[VIP_SYNC_FIX] projection_status=True formatacao_newline=True log_motivo=True")
     logger.info("[VIP_SYNC_POLICY] paid_sozinho_nao_reativa=True exige_vip_aplicado_ao_pedido=True respeita_bloqueio_admin=True")
