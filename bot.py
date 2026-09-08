@@ -10858,6 +10858,138 @@ def montar_html_landing_ads(payload, assinatura=None, auto_redirect=True):
 </html>"""
 
 
+
+def montar_html_tiktok_bio(username):
+    """Página leve para contornar o navegador interno do TikTok.
+
+    Mantém o deep-link orgânico `tiktok_bio`, tenta abrir o app do Telegram
+    com protocolo nativo e oferece fallback web/cópia sem redirecionamento
+    automático que possa ser bloqueado pelo WebView do TikTok.
+    """
+    username = str(username or "").strip().lstrip("@")
+    if not re.fullmatch(r"[A-Za-z0-9_]{5,64}", username):
+        raise RuntimeError("username público do bot indisponível")
+
+    payload = "tiktok_bio"
+    destino_web = f"https://t.me/{username}?start={payload}"
+    destino_tg = f"tg://resolve?domain={username}&start={payload}"
+    fallback_encoded = quote(destino_web, safe="")
+    destino_android = (
+        f"intent://resolve?domain={username}&start={payload}"
+        "#Intent;scheme=tg;"
+        f"S.browser_fallback_url={fallback_encoded};end"
+    )
+
+    return f"""<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="robots" content="noindex,nofollow">
+  <title>Baixar Vídeos HD</title>
+  <style>
+    *{{box-sizing:border-box}}
+    body{{
+      margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
+      padding:20px;font-family:Arial,Helvetica,sans-serif;color:#eef6ff;
+      background:radial-gradient(circle at 50% 20%,#10275d 0%,#07142f 42%,#030816 100%);
+    }}
+    .card{{
+      width:min(100%,430px);background:rgba(8,18,43,.94);border-radius:24px;
+      padding:27px 24px;box-shadow:0 18px 55px rgba(0,0,0,.38);
+      text-align:center;border:1px solid rgba(81,145,255,.20);
+    }}
+    .logo{{
+      width:88px;height:88px;border-radius:50%;margin:0 auto 15px;display:block;
+      object-fit:cover;box-shadow:0 10px 30px rgba(35,115,255,.30);
+    }}
+    h1{{font-size:27px;line-height:1.15;margin:0 0 8px}}
+    .lead{{font-size:16px;line-height:1.45;color:#bdcbea;margin:0 0 20px}}
+    .btn{{
+      display:block;width:100%;padding:17px 18px;border:0;border-radius:14px;
+      background:linear-gradient(90deg,#11b8ff,#7647ff);color:#fff;text-decoration:none;
+      font-weight:800;font-size:18px;cursor:pointer;box-shadow:0 9px 25px rgba(42,112,255,.28);
+    }}
+    .fallback{{
+      display:none;margin-top:16px;padding:15px;border-radius:14px;
+      background:rgba(255,255,255,.07);text-align:left;color:#d7e1f5;
+      font-size:14px;line-height:1.5;
+    }}
+    .fallback.show{{display:block}}
+    .web-link{{
+      display:block;margin-top:12px;padding:13px;border-radius:12px;
+      border:1px solid rgba(122,167,255,.35);color:#a9d9ff;text-decoration:none;
+      text-align:center;font-weight:700;
+    }}
+    .copy{{
+      width:100%;margin-top:10px;padding:12px;border-radius:12px;
+      border:1px solid rgba(122,167,255,.35);background:transparent;
+      color:#dbe9ff;font-weight:700;cursor:pointer;
+    }}
+    .tip{{
+      margin:17px 0 0;color:#9fb0cf;font-size:13px;line-height:1.5;
+    }}
+    .mini{{margin:13px 0 0;color:#7283a3;font-size:12px}}
+  </style>
+</head>
+<body>
+  <main class="card">
+    <img class="logo" src="{LANDING_LOGO_DATA_URI}" alt="Logo Baixar Vídeos HD">
+    <h1>Baixar Vídeos HD</h1>
+    <p class="lead">Toque no botão para abrir o bot diretamente no Telegram.</p>
+
+    <a id="abrirTelegram" class="btn" href="{html.escape(destino_tg)}">
+      ABRIR NO TELEGRAM
+    </a>
+
+    <div id="fallback" class="fallback">
+      <strong>Se o TikTok bloquear a abertura:</strong><br>
+      toque no menu <b>⋮</b> do navegador do TikTok e escolha
+      <b>Abrir no navegador</b>. Depois toque novamente no botão acima.
+
+      <a class="web-link" href="{html.escape(destino_web)}">
+        Abrir link web do Telegram
+      </a>
+
+      <button id="copiarLink" class="copy" type="button">
+        Copiar link do Telegram
+      </button>
+    </div>
+
+    <p class="tip">O teste é grátis e o link mantém a origem TikTok para o relatório do bot.</p>
+    <p class="mini">Nenhum download começa nesta página; ela apenas abre o Telegram.</p>
+  </main>
+
+  <script>
+    (() => {{
+      const web = {json.dumps(destino_web)};
+      const tg = {json.dumps(destino_tg)};
+      const androidIntent = {json.dumps(destino_android)};
+      const abrir = document.getElementById("abrirTelegram");
+      const fallback = document.getElementById("fallback");
+      const copiar = document.getElementById("copiarLink");
+
+      abrir.addEventListener("click", (event) => {{
+        event.preventDefault();
+        const ehAndroid = /android/i.test(navigator.userAgent || "");
+        window.location.href = ehAndroid ? androidIntent : tg;
+        window.setTimeout(() => fallback.classList.add("show"), 1200);
+      }});
+
+      copiar.addEventListener("click", async () => {{
+        try {{
+          await navigator.clipboard.writeText(web);
+          copiar.textContent = "Link copiado ✓";
+        }} catch (_erro) {{
+          copiar.textContent = "Copie: " + web;
+        }}
+      }});
+    }})();
+  </script>
+</body>
+</html>"""
+
+
 def montar_html_erro_landing():
     return """<!doctype html><html lang="pt-BR"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -16716,6 +16848,47 @@ class HealthRequestHandler(BaseHTTPRequestHandler):
                 "application/json; charset=utf-8",
             )
 
+        if caminho == "/tiktok":
+            user_agent = str(self.headers.get("User-Agent") or "").strip()
+            if _eh_crawler_landing(user_agent):
+                return self._enviar_resposta(
+                    200,
+                    montar_html_preview_crawler(),
+                    "text/html; charset=utf-8",
+                )
+
+            cliente_ref = _referencia_cliente_http(
+                self.headers,
+                self.client_address,
+            )
+            if not _permitir_requisicao_landing(cliente_ref):
+                return self._enviar_resposta(
+                    429,
+                    b"TOO MANY REQUESTS",
+                    headers_extras={"Retry-After": "60"},
+                )
+
+            try:
+                username = _obter_username_bot_publico()
+                corpo = montar_html_tiktok_bio(username)
+            except Exception as e:
+                logger.error(
+                    "[TIKTOK_BIO_LINK_ERRO] "
+                    f"erro={sanitizar_erro_log(e)}"
+                )
+                return self._enviar_resposta(
+                    503,
+                    "<h2>Telegram temporariamente indisponível</h2>"
+                    "<p>Tente novamente em alguns instantes.</p>",
+                    "text/html; charset=utf-8",
+                )
+
+            return self._enviar_resposta(
+                200,
+                corpo,
+                "text/html; charset=utf-8",
+            )
+
         if caminho.startswith("/go/"):
             payload = caminho[len("/go/"):].strip("/")
             parametros = dict(
@@ -16994,6 +17167,7 @@ if __name__ == "__main__":
         "checks=polling,download_worker,watchdog,maintenance,mongodb "
         f"mongo_ping_cache={MONGO_READINESS_CACHE_SECONDS}s healthcheck_recomendado=/health"
     )
+    logger.info("[TIKTOK_BIO_LINK] enabled=True route=/tiktok payload=tiktok_bio")
     logger.info("[VIP_PLAN_CONFIG] novos=mensal anual=historico_nao_vendavel validade_dias_completos=True")
     logger.info("[QUEUE_PRIORITY_CONFIG] admin=-1 vip=0 gratis=1 worker_compartilhado=True")
     logger.info("[ML_CLIPS_CONFIG] enabled=True login=False cookies=False token=False source=public_mobile_html_hls dns_guard=host_allowlist")
