@@ -10926,17 +10926,13 @@ def montar_html_tiktok_bio(username):
       border:1px solid rgba(122,167,255,.35);background:transparent;
       color:#dbe9ff;font-weight:700;cursor:pointer;
     }}
-    .tip{{
-      margin:17px 0 0;color:#9fb0cf;font-size:13px;line-height:1.5;
-    }}
-    .mini{{margin:13px 0 0;color:#7283a3;font-size:12px}}
   </style>
 </head>
 <body>
   <main class="card">
     <img class="logo" src="{LANDING_LOGO_DATA_URI}" alt="Logo Baixar Vídeos HD">
     <h1>Baixar Vídeos HD</h1>
-    <p class="lead">Toque no botão para abrir o bot diretamente no Telegram.</p>
+    <p class="lead">Abra o bot e envie o link do vídeo.</p>
 
     <a id="abrirTelegram" class="btn" href="{html.escape(destino_tg)}">
       ABRIR NO TELEGRAM
@@ -10956,8 +10952,6 @@ def montar_html_tiktok_bio(username):
       </button>
     </div>
 
-    <p class="tip">O teste é grátis e o link mantém a origem TikTok para o relatório do bot.</p>
-    <p class="mini">Nenhum download começa nesta página; ela apenas abre o Telegram.</p>
   </main>
 
   <script>
