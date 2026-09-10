@@ -60,6 +60,11 @@ from pymongo.errors import DuplicateKeyError
 from requests.exceptions import RequestException, Timeout
 from config_utils import get_env_required, get_first_env, get_env_int
 from time_utils import TZ, agora_tz, hoje_str, formatar_validade_vip
+from backup_crypto import (
+    criptografar_arquivo_backup,
+    descriptografar_bytes_backup,
+    validar_segredo_backup,
+)
 
 # =========================================
 # CONFIGURAÇÕES
@@ -331,6 +336,14 @@ AUTO_BACKUP_CLAIM_MINUTES = get_env_int(
     "AUTO_BACKUP_CLAIM_MINUTES", 20, 5, 120
 )
 AUTO_BACKUP_STATE_DOC_ID = "auto_backup_daily_v1"
+
+# Chave dedicada para proteger os arquivos de backup enviados pelo Telegram.
+# Se estiver ausente/fraca, o bot continua online, mas se recusa a enviar backup
+# em texto puro. Assim a segurança falha fechada sem derrubar downloads/Pix.
+BACKUP_ENCRYPTION_SECRET = get_first_env(
+    ["BACKUP_ENCRYPTION_SECRET"],
+    default="",
+)
 
 PIX_PENDING_PAGE_SIZE = 8
 TIKWM_REQUEST_TIMEOUT_SECONDS = get_env_int(
@@ -9519,6 +9532,7 @@ def processar_backup_admin(tipo, origem_chat_id=None, automatico=False):
         return {"ok": False, "motivo": "backup_em_andamento"}
 
     caminho_arquivo = None
+    caminho_criptografado = None
     try:
         resultado, nome_base, legenda = consultar_docs_backup(tipo)
 
@@ -9552,27 +9566,71 @@ def processar_backup_admin(tipo, origem_chat_id=None, automatico=False):
                     + ",".join((validacao.get("erros") or [])[:5])
                 )
 
+        # Segurança fail-closed: nunca envia JSON puro se a chave dedicada
+        # estiver ausente ou fraca. O restante do bot continua funcionando.
+        if not validar_segredo_backup(BACKUP_ENCRYPTION_SECRET):
+            raise RuntimeError("BACKUP_ENCRYPTION_SECRET_AUSENTE_OU_FRACO")
+
+        caminho_criptografado = os.path.splitext(caminho_arquivo)[0] + ".bdvbak"
+        criptografar_arquivo_backup(
+            caminho_arquivo,
+            caminho_criptografado,
+            BACKUP_ENCRYPTION_SECRET,
+        )
+        garantir_arquivo_privado(caminho_criptografado)
+
+        # Confere o round-trip antes de enviar: o arquivo criptografado deve
+        # descriptografar byte a byte para o JSON recém-validado.
+        with open(caminho_arquivo, "rb") as f:
+            original_bytes = f.read()
+        with open(caminho_criptografado, "rb") as f:
+            cifrado_bytes = f.read()
+        restaurado_bytes = descriptografar_bytes_backup(
+            cifrado_bytes,
+            BACKUP_ENCRYPTION_SECRET,
+        )
+        if not hmac.compare_digest(original_bytes, restaurado_bytes):
+            raise RuntimeError("BACKUP_CRIPTOGRAFADO_ROUNDTRIP_DIVERGENTE")
+
+        # Minimiza a janela de existência do JSON puro: depois do round-trip,
+        # ele é removido antes mesmo do upload ao Telegram.
+        os.remove(caminho_arquivo)
+        caminho_arquivo = None
+
         if automatico:
             legenda_envio = (
-                f"🤖 Backup automático diário | registros: {total} | "
+                f"🔐 Backup automático diário criptografado | registros: {total} | "
                 f"{agora_tz().strftime('%d/%m/%Y %H:%M')}"
             )
         else:
-            legenda_envio = f"{legenda} | registros: {total}"
+            legenda_envio = f"🔐 {legenda} | criptografado | registros: {total}"
 
-        enviar_documento_privado_admin(caminho_arquivo, legenda=legenda_envio)
+        enviar_documento_privado_admin(
+            caminho_criptografado,
+            legenda=legenda_envio,
+        )
 
         if not automatico:
-            mensagem_ok = f"✅ {legenda} e enviado no seu privado. Registros: {total}"
+            mensagem_ok = (
+                f"✅ {legenda} e enviado criptografado no seu privado. "
+                f"Registros: {total}"
+            )
             safe_send_message(ADMIN_ID, mensagem_ok)
 
             if origem_chat_id and origem_chat_id != ADMIN_ID:
                 safe_send_message(
                     origem_chat_id,
-                    "✅ Backup gerado e enviado no privado do ADM.",
+                    "✅ Backup criptografado gerado e enviado no privado do ADM.",
                 )
 
-        return {"ok": True, "total": total}
+        logger.info(
+            "[BACKUP_ENCRYPTED] tipo=%s automatico=%s registros=%s "
+            "formato=bdvbak plaintext_sent=False roundtrip=True",
+            tipo,
+            bool(automatico),
+            total,
+        )
+        return {"ok": True, "total": total, "encrypted": True}
     except Exception as e:
         logger.error(
             f"[{'AUTO_BACKUP' if automatico else 'BACKUP_ADMIN'}] "
@@ -9588,17 +9646,17 @@ def processar_backup_admin(tipo, origem_chat_id=None, automatico=False):
                 safe_send_message(origem_chat_id, "❌ Erro ao gerar backup do ADM.")
         return {"ok": False, "motivo": "erro", "erro": sanitizar_erro_log(e)}
     finally:
-        if caminho_arquivo and os.path.exists(caminho_arquivo):
-            try:
-                os.remove(caminho_arquivo)
-            except Exception as e:
-                logger.warning(
-                    "[BACKUP_ADMIN_CLEANUP] "
-                    f"arquivo_ref={referencia_arquivo_log(caminho_arquivo)} "
-                    f"erro={sanitizar_erro_log(e)}"
-                )
+        for caminho_cleanup in (caminho_arquivo, caminho_criptografado):
+            if caminho_cleanup and os.path.exists(caminho_cleanup):
+                try:
+                    os.remove(caminho_cleanup)
+                except Exception as e:
+                    logger.warning(
+                        "[BACKUP_ADMIN_CLEANUP] "
+                        f"arquivo_ref={referencia_arquivo_log(caminho_cleanup)} "
+                        f"erro={sanitizar_erro_log(e)}"
+                    )
         BACKUP_ADMIN_LOCK.release()
-
 
 def _inicializar_estado_backup_automatico():
     agora = agora_tz()
@@ -10048,6 +10106,7 @@ def executar_verificacao_backup_admin(chat_id):
         return
 
     caminho = None
+    caminho_criptografado = None
     try:
         payload, _, _ = consultar_docs_backup("geral")
 
@@ -10062,7 +10121,28 @@ def executar_verificacao_backup_admin(chat_id):
         # 3) Validação + restauração simulada apenas em memória.
         resultado = validar_payload_backup_geral(relido)
 
-        # 4) Compara contagens com o banco atual. É somente leitura.
+        # 4) Testa também a proteção usada no envio real: criptografa,
+        # descriptografa e exige o mesmo JSON antes de seguir.
+        if not validar_segredo_backup(BACKUP_ENCRYPTION_SECRET):
+            raise RuntimeError("BACKUP_ENCRYPTION_SECRET_AUSENTE_OU_FRACO")
+        caminho_criptografado = os.path.splitext(caminho)[0] + ".bdvbak"
+        criptografar_arquivo_backup(
+            caminho,
+            caminho_criptografado,
+            BACKUP_ENCRYPTION_SECRET,
+        )
+        garantir_arquivo_privado(caminho_criptografado)
+        with open(caminho_criptografado, "rb") as f:
+            restaurado_bytes = descriptografar_bytes_backup(
+                f.read(),
+                BACKUP_ENCRYPTION_SECRET,
+            )
+        relido_criptografado = json.loads(restaurado_bytes.decode("utf-8"))
+        if relido_criptografado != relido:
+            raise RuntimeError("BACKUP_CRIPTOGRAFADO_CONTEUDO_DIVERGENTE")
+        resultado["criptografia_ok"] = True
+
+        # 5) Compara contagens com o banco atual. É somente leitura.
         hoje = hoje_str()
         banco = {
             "usuarios": usuarios_col.count_documents({}),
@@ -10096,6 +10176,7 @@ def executar_verificacao_backup_admin(chat_id):
             f"{status} *Verificação do backup*",
             "",
             f"📄 JSON: `{'válido' if resultado['ok'] else 'com problema'}`",
+            f"🔐 Criptografia: `{'AES-256-GCM OK' if resultado.get('criptografia_ok') else 'FALHOU'}`",
             f"🧪 Restauração simulada: `{'OK' if resultado['dry_run'] else 'FALHOU'}`",
             "🔒 Produção alterada: `NÃO`",
             "",
@@ -10134,6 +10215,7 @@ def executar_verificacao_backup_admin(chat_id):
         logger.info(
             "[BACKUP_VERIFY] "
             f"ok={resultado['ok']} dry_run={resultado['dry_run']} "
+            f"encryption={bool(resultado.get('criptografia_ok'))} "
             f"usuarios={resultado['contagens'].get('usuarios', 0)} "
             f"vips={resultado['contagens'].get('vips_ativos', 0)} "
             f"pedidos={resultado['contagens'].get('pedidos', 0)} "
@@ -10152,15 +10234,16 @@ def executar_verificacao_backup_admin(chat_id):
             "A produção não foi alterada.",
         )
     finally:
-        if caminho and os.path.exists(caminho):
-            try:
-                os.remove(caminho)
-            except Exception as e:
-                logger.warning(
-                    "[BACKUP_VERIFY_CLEANUP] "
-                    f"arquivo_ref={referencia_arquivo_log(caminho)} "
-                    f"erro={sanitizar_erro_log(e)}"
-                )
+        for caminho_cleanup in (caminho, caminho_criptografado):
+            if caminho_cleanup and os.path.exists(caminho_cleanup):
+                try:
+                    os.remove(caminho_cleanup)
+                except Exception as e:
+                    logger.warning(
+                        "[BACKUP_VERIFY_CLEANUP] "
+                        f"arquivo_ref={referencia_arquivo_log(caminho_cleanup)} "
+                        f"erro={sanitizar_erro_log(e)}"
+                    )
         BACKUP_ADMIN_LOCK.release()
 
 
@@ -17144,7 +17227,7 @@ def encerrar_healthcheck():
 # MAIN
 # =========================================
 if __name__ == "__main__":
-    logger.info("[BOT_BUILD] bot_downloads_v4_etapa15_efi_webhook_ip_allowlist")
+    logger.info("[BOT_BUILD] bot_downloads_v4_etapa17_backup_encryption")
     logger.info(
         "[EFI_WEBHOOK_SECURITY] dedicated_secret=%s legacy_acceptance=False "
         "ip_allowlist=True allowed_ips=%s",
@@ -17170,6 +17253,11 @@ if __name__ == "__main__":
         f"retry_minutes={AUTO_BACKUP_RETRY_MINUTES} "
         f"claim_minutes={AUTO_BACKUP_CLAIM_MINUTES} "
         "mongo_idempotent=True validacao_dry_run=True"
+    )
+    logger.info(
+        "[BACKUP_ENCRYPTION_CONFIG] configured=%s format=bdvbak "
+        "cipher=AES-256-GCM kdf=scrypt plaintext_send=False",
+        validar_segredo_backup(BACKUP_ENCRYPTION_SECRET),
     )
     logger.info(
         f"[VIP_CONTINUIDADE_CONFIG] ativo=True heartbeat="
