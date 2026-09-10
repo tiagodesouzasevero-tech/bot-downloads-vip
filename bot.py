@@ -92,6 +92,10 @@ EFI_PIX_KEY = get_env_required("EFI_PIX_KEY")
 # antigo até a Efí confirmar o novo endereço.
 EFI_WEBHOOK_SECRET = get_env_required("EFI_WEBHOOK_SECRET")
 
+# IP atualmente informado pela documentação oficial da Efí para os callbacks Pix.
+# A validação usa X-Real-IP, header definido pela borda pública da Railway.
+EFI_WEBHOOK_ALLOWED_IPS = frozenset({"34.193.116.226"})
+
 EFI_API_URL = "https://pix.api.efipay.com.br"
 EFI_PIX_EXPIRATION_SECONDS = 30 * 60
 EFI_PAYMENT_VERIFIABLE_STATUSES = frozenset(
@@ -7308,6 +7312,18 @@ def confirmar_pedido_efi_pago(pedido, cobranca=None):
             "vip_ate": vip_ate,
             "motivo": "confirmado",
         }
+
+
+def validar_ip_webhook_efi(headers):
+    """Aceita callback Pix somente do IP oficial da Efí visto pela Railway."""
+    try:
+        recebido = str(headers.get("X-Real-IP") or "").strip()
+        if not recebido:
+            return False
+        endereco = ipaddress.ip_address(recebido)
+        return str(endereco) in EFI_WEBHOOK_ALLOWED_IPS
+    except (ValueError, TypeError):
+        return False
 
 
 def validar_requisicao_webhook_efi(full_path):
@@ -17063,6 +17079,17 @@ class HealthRequestHandler(BaseHTTPRequestHandler):
         caminho = parsed.path
 
         if caminho == "/efi/webhook":
+            if not validar_ip_webhook_efi(self.headers):
+                logger.warning(
+                    "[EFI_WEBHOOK_SECURITY] ip_valid=False x_real_ip_present=%s",
+                    bool(str(self.headers.get("X-Real-IP") or "").strip()),
+                )
+                return self._enviar_resposta(
+                    403,
+                    json.dumps({"ok": False, "error": "origem não autorizada"}),
+                    "application/json; charset=utf-8",
+                )
+
             try:
                 tamanho = int(self.headers.get("Content-Length") or 0)
             except Exception:
@@ -17117,10 +17144,12 @@ def encerrar_healthcheck():
 # MAIN
 # =========================================
 if __name__ == "__main__":
-    logger.info("[BOT_BUILD] bot_downloads_v4_etapa13_efi_webhook_secret_final")
+    logger.info("[BOT_BUILD] bot_downloads_v4_etapa15_efi_webhook_ip_allowlist")
     logger.info(
-        "[EFI_WEBHOOK_SECURITY] dedicated_secret=%s legacy_acceptance=False",
+        "[EFI_WEBHOOK_SECURITY] dedicated_secret=%s legacy_acceptance=False "
+        "ip_allowlist=True allowed_ips=%s",
         bool(EFI_WEBHOOK_SECRET),
+        len(EFI_WEBHOOK_ALLOWED_IPS),
     )
     logger.info("[VIP_SYNC_CONFIG] startup=True pos_pagamento=True bloqueio_removervip=True comando_syncvip=True")
     logger.info("[VIP_SYNC_FIX] projection_status=True formatacao_newline=True log_motivo=True")
