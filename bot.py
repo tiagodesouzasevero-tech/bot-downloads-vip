@@ -7360,9 +7360,12 @@ def processar_webhook_efi(raw_body, full_path):
     return 200, {"ok": True}
 
 
+EFI_PAYMENT_RECOVERY_WINDOW_DAYS = 30
+
+
 def recuperar_pagamentos_efi_interrompidos():
     try:
-        limite = agora_tz() - timedelta(days=2)
+        limite = agora_tz() - timedelta(days=EFI_PAYMENT_RECOVERY_WINDOW_DAYS)
         pedidos = list(
             pedidos_col.find(
                 {
@@ -7444,8 +7447,14 @@ def recuperar_pagamentos_efi_interrompidos():
                 referencia_pedido_log(pedido.get("order_nsu")),
                 sanitizar_erro_log(exc),
             )
-    if recuperados or falhas:
-        logger.info("[EFI_RECUPERACAO] recuperados=%s falhas=%s", recuperados, falhas)
+    if pedidos or recuperados or falhas:
+        logger.info(
+            "[EFI_RECUPERACAO] janela_dias=%s analisados=%s recuperados=%s falhas=%s",
+            EFI_PAYMENT_RECOVERY_WINDOW_DAYS,
+            len(pedidos),
+            recuperados,
+            falhas,
+        )
     return recuperados, falhas
 
 
