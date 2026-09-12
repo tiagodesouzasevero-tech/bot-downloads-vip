@@ -47,6 +47,21 @@ class RestoreRealSafetyIntegrationTests(unittest.TestCase):
         self.assertIn("descriptografar_bytes_backup(", self.bot)
         self.assertIn("loads_backup_bytes(restaurado_bytes)", self.bot)
 
+    def test_payload_e_comparado_em_extended_json_canonico(self):
+        self.assertNotIn("if payload_restaurado != payload:", self.bot)
+        self.assertIn(
+            "restaurado_canonico = dumps_backup_payload(",
+            self.bot,
+        )
+        self.assertIn(
+            "hmac.compare_digest(json_bytes, restaurado_canonico)",
+            self.bot,
+        )
+        self.assertIn(
+            "RESTORE_TEST_PAYLOAD_CANONICO_DIVERGENTE",
+            self.bot,
+        )
+
     def test_log_afirma_zero_escritas_em_producao(self):
         self.assertIn("production_writes=0", self.bot)
 
