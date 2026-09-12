@@ -65,6 +65,13 @@ from backup_crypto import (
     descriptografar_bytes_backup,
     validar_segredo_backup,
 )
+from backup_format import (
+    BACKUP_SCHEMA_VERSION,
+    BACKUP_SERIALIZATION,
+    dumps_backup_payload,
+    loads_backup_text,
+    loads_backup_bytes,
+)
 
 # =========================================
 # CONFIGURAÇÕES
@@ -9377,35 +9384,17 @@ def mostrar_planos_chat(chat_id, user_id):
 
 
 
-def serializar_para_json(valor):
-    if isinstance(valor, datetime):
-        return valor.isoformat()
-
-    if isinstance(valor, dict):
-        return {str(k): serializar_para_json(v) for k, v in valor.items()}
-
-    if isinstance(valor, list):
-        return [serializar_para_json(v) for v in valor]
-
-    if isinstance(valor, tuple):
-        return [serializar_para_json(v) for v in valor]
-
-    if isinstance(valor, (str, int, float, bool)) or valor is None:
-        return valor
-
-    return str(valor)
-
-
 def construir_payload_backup(nome, documentos):
-    docs_serializados = [serializar_para_json(doc) for doc in documentos]
+    documentos = list(documentos)
     return {
-        "schema_version": 2,
-        "generated_at": agora_tz().isoformat(),
+        "schema_version": BACKUP_SCHEMA_VERSION,
+        "serialization": BACKUP_SERIALIZATION,
+        "generated_at": agora_tz(),
         "service": SERVICE_NAME,
         "environment": ENVIRONMENT_NAME,
         "backup_type": nome,
-        "count": len(docs_serializados),
-        "documents": docs_serializados,
+        "count": len(documentos),
+        "documents": documentos,
     }
 
 
@@ -9420,8 +9409,9 @@ def salvar_backup_json(nome_arquivo_base, payload):
         f"{nome_arquivo_base}_{timestamp}.json",
     )
 
+    texto_backup = dumps_backup_payload(payload)
     with abrir_arquivo_privado_para_escrita(caminho) as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
+        f.write(texto_backup)
         f.flush()
 
     garantir_arquivo_privado(caminho)
@@ -9493,8 +9483,9 @@ def consultar_docs_backup(tipo):
         )
 
         payload = {
-            "schema_version": 2,
-            "generated_at": agora_tz().isoformat(),
+            "schema_version": BACKUP_SCHEMA_VERSION,
+            "serialization": BACKUP_SERIALIZATION,
+            "generated_at": agora_tz(),
             "service": SERVICE_NAME,
             "environment": ENVIRONMENT_NAME,
             "backup_type": "geral",
@@ -9504,16 +9495,12 @@ def consultar_docs_backup(tipo):
             "metricas_diarias_count": len(metricas_docs),
             "auditoria_admin_count": len(auditoria_admin_docs),
             "auditoria_sistema_count": len(auditoria_sistema_docs),
-            "usuarios": [serializar_para_json(doc) for doc in usuarios_docs],
-            "vips_ativos": [serializar_para_json(doc) for doc in vips_docs],
-            "pedidos": [serializar_para_json(doc) for doc in pedidos_docs],
-            "metricas_diarias": [serializar_para_json(doc) for doc in metricas_docs],
-            "auditoria_admin": [
-                serializar_para_json(doc) for doc in auditoria_admin_docs
-            ],
-            "auditoria_sistema": [
-                serializar_para_json(doc) for doc in auditoria_sistema_docs
-            ],
+            "usuarios": usuarios_docs,
+            "vips_ativos": vips_docs,
+            "pedidos": pedidos_docs,
+            "metricas_diarias": metricas_docs,
+            "auditoria_admin": auditoria_admin_docs,
+            "auditoria_sistema": auditoria_sistema_docs,
         }
         return payload, "backup_geral", "🗂 Backup geral gerado"
 
@@ -9558,7 +9545,7 @@ def processar_backup_admin(tipo, origem_chat_id=None, automatico=False):
         if automatico and tipo == "geral":
             garantir_arquivo_privado(caminho_arquivo)
             with open(caminho_arquivo, "r", encoding="utf-8") as f:
-                payload_relido = json.load(f)
+                payload_relido = loads_backup_text(f.read())
             validacao = validar_payload_backup_geral(payload_relido)
             if not validacao.get("ok"):
                 raise RuntimeError(
@@ -9904,6 +9891,20 @@ def validar_payload_backup_geral(payload):
             "dry_run": False,
         }
 
+    try:
+        schema_version = int(payload.get("schema_version") or 0)
+    except (TypeError, ValueError):
+        schema_version = 0
+
+    if schema_version not in (2, BACKUP_SCHEMA_VERSION):
+        erros.append(f"schema_version_nao_suportada_{schema_version}")
+    elif schema_version == 2:
+        avisos.append(
+            "backup schema 2 legado: campos BSON podem ter sido convertidos para texto"
+        )
+    elif payload.get("serialization") != BACKUP_SERIALIZATION:
+        erros.append("serialization_extended_json_invalida")
+
     if payload.get("backup_type") != "geral":
         erros.append("backup_type_invalido")
 
@@ -10113,10 +10114,10 @@ def executar_verificacao_backup_admin(chat_id):
         # 1) Serializa em arquivo real.
         caminho = salvar_backup_json("verificacao_backup_geral", payload)
 
-        # 2) Relê o JSON do disco. Se estiver truncado/corrompido, json.load falha.
+        # 2) Relê o JSON do disco preservando tipos BSON no schema atual.
         garantir_arquivo_privado(caminho)
         with open(caminho, "r", encoding="utf-8") as f:
-            relido = json.load(f)
+            relido = loads_backup_text(f.read())
 
         # 3) Validação + restauração simulada apenas em memória.
         resultado = validar_payload_backup_geral(relido)
@@ -10137,7 +10138,7 @@ def executar_verificacao_backup_admin(chat_id):
                 f.read(),
                 BACKUP_ENCRYPTION_SECRET,
             )
-        relido_criptografado = json.loads(restaurado_bytes.decode("utf-8"))
+        relido_criptografado = loads_backup_bytes(restaurado_bytes)
         if relido_criptografado != relido:
             raise RuntimeError("BACKUP_CRIPTOGRAFADO_CONTEUDO_DIVERGENTE")
         resultado["criptografia_ok"] = True
@@ -12047,7 +12048,7 @@ def verificar_backup_admin(message):
 
     safe_reply_to(
         message,
-        "🧪 Verificando JSON e simulando restauração sem alterar a produção...",
+        "🧪 Verificando backup schema v3 e simulando restauração sem alterar a produção...",
     )
 
 
