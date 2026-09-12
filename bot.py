@@ -62,6 +62,7 @@ from config_utils import get_env_required, get_first_env, get_env_int
 from time_utils import TZ, agora_tz, hoje_str, formatar_validade_vip
 from backup_crypto import (
     criptografar_arquivo_backup,
+    criptografar_bytes_backup,
     descriptografar_bytes_backup,
     validar_segredo_backup,
 )
@@ -72,6 +73,7 @@ from backup_format import (
     loads_backup_text,
     loads_backup_bytes,
 )
+from restore_test_utils import restaurar_em_banco_temporario
 
 # =========================================
 # CONFIGURAÇÕES
@@ -9287,6 +9289,7 @@ def configurar_menu_comandos():
         types.BotCommand("backupvips", "Gerar backup dos VIPs ativos"),
         types.BotCommand("backupgeral", "Gerar backup completo"),
         types.BotCommand("verificarbackup", "Testar backup sem alterar produção"),
+        types.BotCommand("testarrestore", "Testar restauração real isolada"),
     ]
 
     try:
@@ -10247,6 +10250,97 @@ def executar_verificacao_backup_admin(chat_id):
                     )
         BACKUP_ADMIN_LOCK.release()
 
+
+
+
+def executar_teste_restore_real_admin(chat_id):
+    """Restaura um backup v3 em DB temporário e o remove ao final."""
+    if not BACKUP_ADMIN_LOCK.acquire(blocking=False):
+        safe_send_message(
+            chat_id,
+            "⚠️ Já existe uma operação de backup em andamento. Tente novamente em instantes.",
+        )
+        return
+
+    try:
+        payload, _, _ = consultar_docs_backup("geral")
+
+        validacao = validar_payload_backup_geral(payload)
+        if not validacao.get("ok"):
+            raise RuntimeError(
+                "BACKUP_RESTORE_VALIDACAO_FALHOU "
+                + ",".join((validacao.get("erros") or [])[:5])
+            )
+
+        if not validar_segredo_backup(BACKUP_ENCRYPTION_SECRET):
+            raise RuntimeError("BACKUP_ENCRYPTION_SECRET_AUSENTE_OU_FRACO")
+
+        # Exercita o mesmo formato e a mesma criptografia do backup real,
+        # porém em memória para não criar JSON puro extra no disco.
+        json_bytes = dumps_backup_payload(payload).encode("utf-8")
+        blob = criptografar_bytes_backup(
+            json_bytes,
+            BACKUP_ENCRYPTION_SECRET,
+        )
+        restaurado_bytes = descriptografar_bytes_backup(
+            blob,
+            BACKUP_ENCRYPTION_SECRET,
+        )
+        if not hmac.compare_digest(json_bytes, restaurado_bytes):
+            raise RuntimeError("RESTORE_TEST_ROUNDTRIP_CRIPTO_DIVERGENTE")
+
+        payload_restaurado = loads_backup_bytes(restaurado_bytes)
+        if payload_restaurado != payload:
+            raise RuntimeError("RESTORE_TEST_PAYLOAD_DIVERGENTE")
+
+        relatorio = restaurar_em_banco_temporario(
+            client,
+            MONGO_DB_NAME,
+            payload_restaurado,
+        )
+
+        contagens = relatorio.get("contagens") or {}
+        safe_send_message(
+            chat_id,
+            "✅ *Teste real de restauração concluído*\n\n"
+            "🔐 Criptografia: `OK`\n"
+            "🧬 Tipos BSON/documentos: `OK`\n"
+            "🗂 Índices essenciais: `OK`\n"
+            "🧪 Banco temporário: `CRIADO E APAGADO`\n"
+            "🔒 Banco de produção alterado: `NÃO`\n\n"
+            f"👥 Usuários restaurados: `{contagens.get('usuarios', 0)}`\n"
+            f"💎 VIPs conferidos: `{relatorio.get('vips_ativos', 0)}`\n"
+            f"🧾 Pedidos restaurados: `{contagens.get('pedidos', 0)}`\n"
+            f"📊 Métricas restauradas: `{contagens.get('metricas_diarias', 0)}`\n"
+            f"🛡 Auditoria ADM: `{contagens.get('auditoria_admin', 0)}`\n"
+            f"⚙️ Auditoria sistema: `{contagens.get('auditoria_sistema', 0)}`",
+            parse_mode="Markdown",
+        )
+
+        logger.info(
+            "[BACKUP_RESTORE_REAL] ok=True schema=%s "
+            "usuarios=%s vips=%s pedidos=%s metricas=%s "
+            "aud_admin=%s aud_sistema=%s temp_db_dropped=True production_writes=0",
+            BACKUP_SCHEMA_VERSION,
+            contagens.get("usuarios", 0),
+            relatorio.get("vips_ativos", 0),
+            contagens.get("pedidos", 0),
+            contagens.get("metricas_diarias", 0),
+            contagens.get("auditoria_admin", 0),
+            contagens.get("auditoria_sistema", 0),
+        )
+    except Exception as e:
+        logger.error(
+            "[BACKUP_RESTORE_REAL_ERRO] erro=%s production_writes=0",
+            sanitizar_erro_log(e),
+        )
+        safe_send_message(
+            chat_id,
+            "❌ O teste real de restauração falhou.\n"
+            "🔒 O banco de produção não foi usado como destino.",
+        )
+    finally:
+        BACKUP_ADMIN_LOCK.release()
 
 
 def montar_relatorio_diagnostico():
@@ -12049,6 +12143,24 @@ def verificar_backup_admin(message):
     safe_reply_to(
         message,
         "🧪 Verificando backup schema v3 e simulando restauração sem alterar a produção...",
+    )
+
+
+@bot.message_handler(commands=["testarrestore"])
+def testar_restore_real_admin(message):
+    if not exigir_admin_privado(message):
+        return
+
+    Thread(
+        target=executar_teste_restore_real_admin,
+        args=(message.chat.id,),
+        daemon=True,
+    ).start()
+
+    safe_reply_to(
+        message,
+        "🧪 Iniciando restauração real em banco temporário isolado. "
+        "O banco de produção não será usado como destino.",
     )
 
 
