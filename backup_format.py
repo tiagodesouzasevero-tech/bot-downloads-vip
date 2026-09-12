@@ -32,27 +32,36 @@ def loads_backup_text(texto: str):
     if not isinstance(texto, str) or not texto.strip():
         raise BackupFormatError("Backup JSON vazio ou inválido.")
 
-    # Primeiro lê somente a estrutura JSON para descobrir a versão.
+    # Faz uma leitura JSON simples apenas para identificar o formato.
+    # No Canonical Extended JSON, até inteiros como schema_version são
+    # envolvidos por marcadores BSON (ex.: {"$numberInt": "3"}), então a
+    # versão não pode ser convertida com int() antes da decodificação BSON.
     bruto = json.loads(texto)
     if not isinstance(bruto, dict):
         raise BackupFormatError("Payload de backup não é um objeto.")
 
-    try:
-        versao = int(bruto.get("schema_version") or 0)
-    except (TypeError, ValueError):
-        versao = 0
-
-    # Schema 3+: Extended JSON canônico, que recupera datetime/ObjectId/Binary.
-    if versao >= BACKUP_SCHEMA_VERSION:
-        if bruto.get("serialization") != BACKUP_SERIALIZATION:
-            raise BackupFormatError("Serialização Extended JSON ausente ou inválida.")
-        return json_util.loads(
+    if bruto.get("serialization") == BACKUP_SERIALIZATION:
+        decodificado = json_util.loads(
             texto,
             json_options=CANONICAL_JSON_OPTIONS,
         )
+        if not isinstance(decodificado, dict):
+            raise BackupFormatError("Payload Extended JSON inválido.")
+        if decodificado.get("schema_version") != BACKUP_SCHEMA_VERSION:
+            raise BackupFormatError("Schema Extended JSON não suportado.")
+        return decodificado
 
-    # Compatibilidade de leitura com backups antigos schema 2.
-    return bruto
+    # Compatibilidade de leitura com backups antigos schema 2, que eram JSON
+    # comum e não possuíam o marcador de serialização Extended JSON.
+    try:
+        versao_legada = int(bruto.get("schema_version") or 0)
+    except (TypeError, ValueError):
+        versao_legada = 0
+
+    if versao_legada == 2:
+        return bruto
+
+    raise BackupFormatError("Schema de backup não suportado.")
 
 
 def loads_backup_bytes(dados: bytes):
