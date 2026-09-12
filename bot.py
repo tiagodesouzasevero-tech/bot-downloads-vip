@@ -10290,8 +10290,16 @@ def executar_teste_restore_real_admin(chat_id):
             raise RuntimeError("RESTORE_TEST_ROUNDTRIP_CRIPTO_DIVERGENTE")
 
         payload_restaurado = loads_backup_bytes(restaurado_bytes)
-        if payload_restaurado != payload:
-            raise RuntimeError("RESTORE_TEST_PAYLOAD_DIVERGENTE")
+
+        # A comparação não deve usar igualdade direta entre objetos Python:
+        # o Extended JSON/BSON pode normalizar datas para a precisão do MongoDB.
+        # Re-serializar ambos para Canonical Extended JSON compara exatamente
+        # o conteúdo persistível que será usado na restauração.
+        restaurado_canonico = dumps_backup_payload(
+            payload_restaurado
+        ).encode("utf-8")
+        if not hmac.compare_digest(json_bytes, restaurado_canonico):
+            raise RuntimeError("RESTORE_TEST_PAYLOAD_CANONICO_DIVERGENTE")
 
         relatorio = restaurar_em_banco_temporario(
             client,
