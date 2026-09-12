@@ -30,8 +30,13 @@ class BackupSchemaV3IntegrationTests(unittest.TestCase):
         )
 
     def test_formato_mantem_compatibilidade_schema2(self):
+        self.assertIn(
+            'if bruto.get("serialization") == BACKUP_SERIALIZATION:',
+            self.formato,
+        )
+        self.assertIn("versao_legada = int(", self.formato)
+        self.assertIn("if versao_legada == 2:", self.formato)
         self.assertIn("return bruto", self.formato)
-        self.assertIn("versao >= BACKUP_SCHEMA_VERSION", self.formato)
 
 
 if __name__ == "__main__":
